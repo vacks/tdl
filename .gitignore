@@ -1,0 +1,9 @@
+.env
+.upstream/
+.DS_Store
+data/
+downloads/
+web/node_modules/
+web/dist/
+internal/httpapi/static/*
+!internal/httpapi/static/.gitkeep

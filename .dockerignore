@@ -1,0 +1,6 @@
+.git
+.upstream
+data
+downloads
+web/node_modules
+web/dist

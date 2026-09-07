@@ -1,0 +1,173 @@
+--- a/app/dl/dl.go
++++ b/app/dl/dl.go
+@@ -42,11 +42,37 @@
+ 	// resume opts
+ 	Continue, Restart bool
++	// Quiet suppresses upstream terminal rendering while keeping callbacks active.
++	Quiet bool
+ 
++	// ProgressCallback receives byte-level progress for one media message.
++	// It is optional and does not change CLI behavior when unset.
++	ProgressCallback func(ProgressUpdate)
++	// FileCompletedCallback receives a media file only after its temporary file
++	// has been closed and its per-file post-processing has succeeded.
++	FileCompletedCallback func(FileCompletedUpdate)
++
+ 	// serve
+ 	Serve bool
+ 	Port  int
+ }
+ 
++// ProgressUpdate is an individual media file's current byte progress.
++// Completed is set when the file reaches its media byte total.
++// Callbacks must return quickly; they run in the download worker path.
++type ProgressUpdate struct {
++	DialogID, Downloaded, Total int64
++	MessageID                  int
++	Completed                  bool
++}
++
++// FileCompletedUpdate identifies a media file that is safe for consumers to
++// publish. Path is the finished upstream file path, without the .tmp suffix.
++type FileCompletedUpdate struct {
++	DialogID  int64
++	MessageID int
++	Path      string
++}
++
+ type parser struct {
+ 	Data   []string
+ 	Parser tmessage.ParseSource
+--- a/app/dl/dl.go
++++ b/app/dl/dl.go
+@@ -99,8 +99,10 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opt
+ 	if !opts.Restart {
+ 		// resume download and ask user to continue
+-		if err = resume(ctx, kvd, it, !opts.Continue); err != nil {
++		if err = resume(ctx, kvd, it, !opts.Continue, opts.Quiet); err != nil {
+ 			return err
+ 		}
+ 	} else {
+-		color.Yellow("Restart download by 'restart' flag")
++		if !opts.Quiet {
++			color.Yellow("Restart download by 'restart' flag")
++		}
+ 	}
+@@ -138,7 +140,11 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opt
+ 		zap.Int("limit", limit))
+ 
+-	color.Green("All files will be downloaded to '%s' dir", opts.Dir)
+-
+-	go dlProgress.Render()
++	if !opts.Quiet {
++		color.Green("All files will be downloaded to '%s' dir", opts.Dir)
++		go dlProgress.Render()
++	}
+ 	defer func() {
++		if opts.Quiet {
++			return
++		}
+ 		prog.Wait(ctx, dlProgress)
+@@ -157 +165 @@
+-func resume(ctx context.Context, kvd storage.Storage, iter *iter, ask bool) error {
++func resume(ctx context.Context, kvd storage.Storage, iter *iter, ask, quiet bool) error {
+@@ -187,5 +195,7 @@ func resume(ctx context.Context, kvd storage.Storage, it *iter, ask bool) error
+ 		}
+ 	} else {
+-		color.Yellow(resumeStr)
++		if !quiet {
++			color.Yellow(resumeStr)
++		}
+ 		confirm = true
+ 	}
+--- a/app/dl/progress.go
++++ b/app/dl/progress.go
+@@ -51,6 +51,17 @@
+ 	t := tracker.(*pw.Tracker)
+ 	t.UpdateTotal(state.Total)
+ 	t.SetValue(state.Downloaded)
++
++	if p.opts.ProgressCallback != nil {
++		e := elem.(*iterElem)
++		p.opts.ProgressCallback(ProgressUpdate{
++			DialogID:   e.from.ID(),
++			MessageID:  e.fromMsg.ID,
++			Downloaded: state.Downloaded,
++			Total:      state.Total,
++			Completed:  state.Total > 0 && state.Downloaded >= state.Total,
++		})
++	}
+ }
+ 
+ func (p *progress) OnDone(elem downloader.Elem, err error) {
+@@ -77,19 +88,27 @@
+ 
+ 	p.it.Finish(e.logicalPos)
+ 
+-	if err := p.donePost(e); err != nil {
++	path, err := p.donePost(e)
++	if err != nil {
+ 		p.fail(t, elem, errors.Wrap(err, "post file"))
+ 		return
+ 	}
++	if p.opts.FileCompletedCallback != nil {
++		p.opts.FileCompletedCallback(FileCompletedUpdate{
++			DialogID:  e.from.ID(),
++			MessageID: e.fromMsg.ID,
++			Path:      path,
++		})
++	}
+ }
+ 
+-func (p *progress) donePost(elem *iterElem) error {
++func (p *progress) donePost(elem *iterElem) (string, error) {
+ 	newfile := strings.TrimSuffix(filepath.Base(elem.to.Name()), tempExt)
+ 
+ 	if p.opts.RewriteExt {
+ 		mime, err := mimetype.DetectFile(elem.to.Name())
+ 		if err != nil {
+-			return errors.Wrap(err, "detect mime")
++			return "", errors.Wrap(err, "detect mime")
+ 		}
+ 		ext := mime.Extension()
+ 		if ext != "" && (filepath.Ext(newfile) != ext) {
+@@ -99,18 +118,18 @@
+ 
+ 	newpath := filepath.Join(filepath.Dir(elem.to.Name()), newfile)
+ 	if err := os.Rename(elem.to.Name(), newpath); err != nil {
+-		return errors.Wrap(err, "rename file")
++		return "", errors.Wrap(err, "rename file")
+ 	}
+ 
+ 	// Set file modification time to message date if available
+ 	if elem.file.Date > 0 {
+ 		fileTime := time.Unix(elem.file.Date, 0)
+ 		if err := os.Chtimes(newpath, fileTime, fileTime); err != nil {
+-			return errors.Wrap(err, "set file time")
++			return "", errors.Wrap(err, "set file time")
+ 		}
+ 	}
+ 
+-	return nil
++	return newpath, nil
+ }
+ 
+ func (p *progress) fail(t *pw.Tracker, elem downloader.Elem, err error) {
+--- a/app/dl/dl.go
++++ b/app/dl/dl.go
+@@ -38,6 +38,8 @@ type Options struct {
+ 	Desc       bool
+ 	Takeout    bool
+ 	Group      bool // auto detect grouped message
++	// DirectDialogs bypass URL parsing for messages in private dialogs.
++	DirectDialogs [][]*tmessage.Dialog
+ 
+ 	// resume opts
+ 	Continue, Restart bool
+@@ -66,6 +68,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opt
+ 	if err != nil {
+ 		return err
+ 	}
++	dialogs = append(dialogs, opts.DirectDialogs...)
+ 	logctx.From(ctx).Debug("Collect dialogs",
+ 		zap.Any("dialogs", dialogs))

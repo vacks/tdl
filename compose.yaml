@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      TDL_DATA_DIR: /data
+      TDL_DOWNLOAD_DIR: /downloads
+      TDL_LISTEN_ADDR: :8080
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    networks: [internal]
+    restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge

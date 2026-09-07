@@ -1,0 +1,19 @@
+{
+  "name": "tdl development",
+  "build": { "dockerfile": "Dockerfile" },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "forwardPorts": [5173],
+  "portsAttributes": {
+    "5173": { "label": "Vue development server", "onAutoForward": "openBrowser" }
+  },
+  "postCreateCommand": "sh ./scripts/prepare-upstream-progress.sh && go mod download && cd web && npm install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.Go", "Vue.volar", "dbaeumer.vscode-eslint", "ms-azuretools.vscode-docker"],
+      "settings": { "go.toolsManagement.autoUpdate": true }
+    }
+  }
+}
