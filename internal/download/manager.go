@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -82,6 +83,7 @@ type Job struct {
 	DirectPeerType string
 	DirectPeerID   int64
 	DirectPeerHash int64
+	ConfigJSON     string
 	Items          []Item `json:"items"`
 }
 
@@ -140,6 +142,7 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	// selecting whichever account happens to be current could download under the
 	// wrong Telegram identity. Keep their records visible, but require a new job.
 	_, _ = m.db.Exec(`UPDATE download_jobs SET status = 'failed', error = '旧任务缺少 Telegram 账户绑定，无法安全重试，请重新创建下载任务', updated_at = ? WHERE status NOT IN ('completed', 'cancelled') AND account_id = ''`, time.Now().UTC().Format(time.RFC3339))
+	_, _ = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing' AND updated_at < ?`, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339Nano))
 	go m.worker()
 	return m, nil
 }
@@ -147,7 +150,7 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 func (m *Manager) migrate() error {
 	_, err := m.db.Exec(`
 CREATE TABLE IF NOT EXISTS download_jobs (
- id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, config_json TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS download_items (
  id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, grouped_id INTEGER NOT NULL DEFAULT 0,
@@ -194,6 +197,17 @@ CREATE INDEX IF NOT EXISTS download_events_job_id ON download_events(job_id, id)
 	if err != nil {
 		return err
 	}
+	_, err = m.db.Exec(`
+CREATE TABLE IF NOT EXISTS reaction_inbox (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id INTEGER NOT NULL DEFAULT 0, message_id INTEGER NOT NULL,
+ source_url TEXT NOT NULL DEFAULT '', peer_type TEXT NOT NULL, peer_id INTEGER NOT NULL DEFAULT 0, peer_hash INTEGER NOT NULL DEFAULT 0, emoji TEXT NOT NULL,
+ status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(account_id, dialog_key, message_id, emoji)
+);
+CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id);`)
+	if err != nil {
+		return err
+	}
 	// Existing development databases get the same new columns without a data reset.
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`)
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_name TEXT NOT NULL DEFAULT ''`)
@@ -203,6 +217,7 @@ CREATE INDEX IF NOT EXISTS download_events_job_id ON download_events(job_id, id)
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_hash INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`)
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`)
+	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN config_json TEXT NOT NULL DEFAULT ''`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN started_at TEXT NOT NULL DEFAULT ''`)
@@ -445,6 +460,10 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	trigger := triggerJSON(intent.Trigger)
+	configJSON, err := json.Marshal(m.settings.Get().Download)
+	if err != nil {
+		return Submission{}, err
+	}
 	tx, err := m.db.Begin()
 	if err != nil {
 		return Submission{}, err
@@ -478,7 +497,7 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 		m.emit(existingID, requestID, "request_attached", job.Status)
 		return Submission{RequestID: requestID, Job: job, Duplicate: true}, nil
 	}
-	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, now, now); err != nil {
+	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, string(configJSON), now, now); err != nil {
 		return Submission{}, err
 	}
 	for _, item := range sources {
@@ -493,7 +512,7 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 		return Submission{}, err
 	}
 	m.touch()
-	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: string(configJSON), Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
 	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
 	return Submission{RequestID: requestID, Job: job, Created: true}, nil
@@ -515,7 +534,7 @@ func (m *Manager) worker() {
 
 func (m *Manager) nextQueued() (Job, []source, error) {
 	var job Job
-	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, attempts, status, error, created_at, updated_at FROM download_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1`).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.DirectPeerType, &job.DirectPeerID, &job.DirectPeerHash, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, attempts, status, error, created_at, updated_at FROM download_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1`).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.DirectPeerType, &job.DirectPeerID, &job.DirectPeerHash, &job.ConfigJSON, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, nil, nil
 	}
@@ -563,6 +582,14 @@ func (m *Manager) run(job Job, sources []source) {
 		return
 	}
 	config := m.settings.Get()
+	if job.ConfigJSON != "" {
+		var snapshot settings.Download
+		if err := json.Unmarshal([]byte(job.ConfigJSON), &snapshot); err != nil {
+			m.fail(job.ID, pending, fmt.Errorf("任务下载配置快照无效: %w", err))
+			return
+		}
+		config.Download = snapshot
+	}
 	// One upstream invocation resolves exactly one dialog, so MessageID is
 	// sufficient for callback correlation here. Do not use its numeric dialog
 	// ID: Telegram represents some dialogs (notably "Saved Messages") with a

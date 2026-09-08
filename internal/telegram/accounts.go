@@ -250,7 +250,7 @@ func (m *Manager) CurrentID() (string, error) {
 // and reports only reactions Telegram marks as sent by that account (My).
 // Download operations remain short-lived and use their existing connection;
 // this listener must never hold the account operation mutex for its lifetime.
-func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(context.Context, ReactionEvent)) error {
+func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(context.Context, ReactionEvent), onReady func()) error {
 	m.mu.RLock()
 	account, ok := m.accountLocked(id)
 	proxyURL := m.proxyURL
@@ -300,6 +300,9 @@ func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(c
 		if _, err := client.Self(runCtx); err != nil {
 			applog.Error("reaction", "listener_authorization_check_failed", "account_id", id, "error", err.Error())
 			return err
+		}
+		if onReady != nil {
+			onReady()
 		}
 		<-runCtx.Done()
 		return nil

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/vacks/tdl/internal/settings"
 )
 
 func TestMigrateItemIdentitySeparatesDialogNamespaces(t *testing.T) {
@@ -84,7 +85,11 @@ func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, wake: make(chan struct{}, 1), events: newEventBus()}
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{db: db, settings: store, wake: make(chan struct{}, 1), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +114,51 @@ func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("request count = %d, want 2", requests)
+	}
+	var snapshot string
+	if err := db.QueryRow(`SELECT config_json FROM download_jobs WHERE id = ?`, first.Job.ID).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(snapshot, "tempFilenameTemplate") || !strings.Contains(snapshot, "finalFilenameTemplate") {
+		t.Fatalf("download configuration snapshot missing expected templates: %s", snapshot)
+	}
+}
+
+func TestReactionInboxPersistsAndLeasesEvent(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, wake: make(chan struct{}, 1), events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	intent := DownloadIntent{Source: SourceReaction, AccountID: "account-a", Message: &MessageRef{DialogName: "private", DialogID: 42, MessageID: 7, InputPeer: &tg.InputPeerUser{UserID: 42, AccessHash: 99}}}
+	queued, err := m.QueueReaction(intent, "👍")
+	if err != nil || !queued {
+		t.Fatalf("QueueReaction() = (%v, %v), want (true, nil)", queued, err)
+	}
+	queued, err = m.QueueReaction(intent, "👍")
+	if err != nil || queued {
+		t.Fatalf("duplicate QueueReaction() = (%v, %v), want (false, nil)", queued, err)
+	}
+	events, err := m.ClaimReactionInbox(1)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ClaimReactionInbox() = (%d, %v), want one event", len(events), err)
+	}
+	if events[0].Intent.Message == nil || events[0].Intent.Message.MessageID != 7 || events[0].Attempts != 1 {
+		t.Fatalf("leased event = %#v", events[0])
+	}
+	if err := m.CompleteReactionInbox(events[0].ID, "job-a"); err != nil {
+		t.Fatal(err)
+	}
+	var status, jobID string
+	if err := db.QueryRow(`SELECT status, job_id FROM reaction_inbox WHERE id = ?`, events[0].ID).Scan(&status, &jobID); err != nil {
+		t.Fatal(err)
+	}
+	if status != "done" || jobID != "job-a" {
+		t.Fatalf("inbox status = (%q, %q), want (done, job-a)", status, jobID)
 	}
 }
 

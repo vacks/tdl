@@ -173,7 +173,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dashboard(w http.ResponseWriter, _ *http.Request) {
 	active, completedItems, failedItems := s.downloads.Summary()
 	current, trend := s.monitor.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "downloads": map[string]int{"active": active, "completedItems": completedItems, "failedItems": failedItems}, "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
+	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "reactions": s.reactions.Health(), "downloads": map[string]int{"active": active, "completedItems": completedItems, "failedItems": failedItems}, "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
 }
 
 func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
