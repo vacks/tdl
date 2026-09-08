@@ -77,6 +77,41 @@ func TestDialogIdentityUsesPeerNamespaces(t *testing.T) {
 	}
 }
 
+func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tdl.db")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, wake: make(chan struct{}, 1), events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	sources := []source{{DialogName: "test", Item: Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 7, OriginalName: "file.bin", Status: "queued"}}}
+	first, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account-a", URL: "https://t.me/example/7"}, sources, directPeer{})
+	if err != nil {
+		t.Fatalf("first enqueueIntent(): %v", err)
+	}
+	if !first.Created || first.Duplicate || first.Job.ID == "" {
+		t.Fatalf("first submission = %#v, want created job", first)
+	}
+	second, err := m.enqueueIntent(DownloadIntent{Source: SourceBot, AccountID: "account-a", URL: "https://t.me/example/7"}, sources, directPeer{})
+	if err != nil {
+		t.Fatalf("duplicate enqueueIntent(): %v", err)
+	}
+	if second.Created || !second.Duplicate || second.Job.ID != first.Job.ID {
+		t.Fatalf("duplicate submission = %#v, want attachment to %q", second, first.Job.ID)
+	}
+	var requests int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM download_requests WHERE job_id = ?`, first.Job.ID).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("request count = %d, want 2", requests)
+	}
+}
+
 func TestIsPublicMessageLink(t *testing.T) {
 	for value, want := range map[string]bool{
 		"https://t.me/example/1":     true,

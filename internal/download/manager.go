@@ -112,6 +112,7 @@ type Manager struct {
 	cancels     map[string]context.CancelFunc
 	wake        chan struct{}
 	progress    *progressStore
+	events      *eventBus
 	revision    atomic.Uint64
 }
 
@@ -127,7 +128,7 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, 1), progress: newProgressStore()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -173,6 +174,23 @@ CREATE TABLE IF NOT EXISTS bot_lifecycle_messages (
  account_id TEXT NOT NULL, source_url TEXT NOT NULL,
  PRIMARY KEY(account_id, source_url)
 )`)
+	if err != nil {
+		return err
+	}
+	_, err = m.db.Exec(`
+CREATE TABLE IF NOT EXISTS download_requests (
+ id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source_kind TEXT NOT NULL, account_id TEXT NOT NULL,
+ source_url TEXT NOT NULL DEFAULT '', dialog_key TEXT NOT NULL DEFAULT '', message_id INTEGER NOT NULL DEFAULT 0,
+ trigger_json TEXT NOT NULL DEFAULT '{}', outcome TEXT NOT NULL, created_at TEXT NOT NULL,
+ FOREIGN KEY(job_id) REFERENCES download_jobs(id)
+);
+CREATE INDEX IF NOT EXISTS download_requests_job_id ON download_requests(job_id);
+CREATE TABLE IF NOT EXISTS download_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '',
+ kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+ FOREIGN KEY(job_id) REFERENCES download_jobs(id)
+);
+CREATE INDEX IF NOT EXISTS download_events_job_id ON download_events(job_id, id);`)
 	if err != nil {
 		return err
 	}
@@ -381,48 +399,28 @@ func (m *Manager) Revision() uint64 { return m.revision.Load() }
 func (m *Manager) touch()           { m.revision.Add(1) }
 
 func (m *Manager) Enqueue(ctx context.Context, sourceURL string) (Job, error) {
-	accountID, err := m.accounts.CurrentID()
+	submission, err := m.Submit(ctx, DownloadIntent{Source: SourceWeb, URL: sourceURL})
 	if err != nil {
 		return Job{}, err
 	}
-	// Resolve with the same account that will own the job. This avoids a UI
-	// account switch between selecting the current account and parsing the URL.
-	sources, err := m.resolve(ctx, accountID, sourceURL)
-	if err != nil {
-		return Job{}, err
+	if submission.Duplicate {
+		return submission.Job, ErrDuplicate
 	}
-	if len(sources) == 0 {
-		return Job{}, errors.New("消息中没有可下载的媒体")
-	}
-	job, err := m.enqueueResolved(sourceURL, accountID, sources, directPeer{})
-	if err != nil {
-		applog.Error("download", "task_create_failed", "source_url", sourceURL, "error", err.Error())
-	} else {
-		names := taskLogFiles(sources)
-		applog.Info("download", "task_created", "job_id", job.ID, "account_id", accountID, "item_count", job.TotalItems, "source", "web_or_bot", "files", names)
-	}
-	return job, err
+	return submission.Job, nil
 }
 
 // EnqueueReaction creates a normal download job from a reaction update. The
 // message is resolved with the exact InputPeer supplied by Telegram, so private
 // chats and channels work without requiring a shareable public message link.
 func (m *Manager) EnqueueReaction(ctx context.Context, accountID, sourceURL, dialogName string, dialogID int64, peer tg.InputPeerClass, messageID int) (Job, error) {
-	sources, err := m.resolvePeer(ctx, accountID, peer, dialogID, messageID, dialogName)
+	submission, err := m.Submit(ctx, DownloadIntent{Source: SourceReaction, AccountID: accountID, Message: &MessageRef{SourceURL: sourceURL, DialogName: dialogName, DialogID: dialogID, InputPeer: peer, MessageID: messageID}})
 	if err != nil {
 		return Job{}, err
 	}
-	if len(sources) == 0 {
-		return Job{}, errors.New("消息中没有可下载的媒体")
+	if submission.Duplicate {
+		return submission.Job, ErrDuplicate
 	}
-	job, err := m.enqueueResolved(sourceURL, accountID, sources, makeDirectPeer(peer))
-	if err != nil {
-		applog.Error("download", "reaction_task_create_failed", "account_id", accountID, "dialog_id", dialogID, "message_id", messageID, "error", err.Error())
-	} else {
-		names := taskLogFiles(sources)
-		applog.Info("download", "reaction_task_created", "job_id", job.ID, "account_id", accountID, "dialog_id", dialogID, "message_id", messageID, "item_count", job.TotalItems, "files", names)
-	}
-	return job, err
+	return submission.Job, nil
 }
 
 // taskLogFiles adds useful creation context without exposing final paths.
@@ -436,42 +434,69 @@ func taskLogFiles(sources []source) []string {
 	return names
 }
 
-func (m *Manager) enqueueResolved(sourceURL, accountID string, sources []source, direct directPeer) (Job, error) {
+func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct directPeer) (Submission, error) {
 	id, err := randomID()
 	if err != nil {
-		return Job{}, err
+		return Submission{}, err
+	}
+	requestID, err := randomID()
+	if err != nil {
+		return Submission{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	trigger := triggerJSON(intent.Trigger)
 	tx, err := m.db.Begin()
 	if err != nil {
-		return Job{}, err
+		return Submission{}, err
 	}
 	defer tx.Rollback()
+	var existingID string
 	for _, item := range sources {
-		var exists int
-		err = tx.QueryRow(`SELECT COUNT(1) FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&exists)
-		if err != nil {
-			return Job{}, err
+		var jobID string
+		err = tx.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ? LIMIT 1`, item.DialogKey, item.MessageID).Scan(&jobID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Submission{}, err
 		}
-		if exists > 0 {
-			return Job{}, fmt.Errorf("%w：%s/%d", ErrDuplicate, item.DialogKey, item.MessageID)
+		if jobID != "" {
+			if existingID != "" && existingID != jobID {
+				return Submission{}, errors.New("消息组中的媒体已关联到不同下载任务，无法安全合并")
+			}
+			existingID = jobID
 		}
 	}
-	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, sourceURL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, accountID, direct.kind, direct.id, direct.hash, now, now); err != nil {
-		return Job{}, err
+	if existingID != "" {
+		if _, err = tx.Exec(`INSERT INTO download_requests(id, job_id, source_kind, account_id, source_url, dialog_key, message_id, trigger_json, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'duplicate', ?)`, requestID, existingID, intent.Source, intent.AccountID, intent.URL, sources[0].DialogKey, sources[0].MessageID, trigger, now); err != nil {
+			return Submission{}, err
+		}
+		if err = tx.Commit(); err != nil {
+			return Submission{}, err
+		}
+		job, err := m.Get(existingID)
+		if err != nil {
+			return Submission{}, err
+		}
+		m.emit(existingID, requestID, "request_attached", job.Status)
+		return Submission{RequestID: requestID, Job: job, Duplicate: true}, nil
+	}
+	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, now, now); err != nil {
+		return Submission{}, err
 	}
 	for _, item := range sources {
 		if _, err = tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`, id, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginalName, item.Size); err != nil {
-			return Job{}, err
+			return Submission{}, err
 		}
 	}
+	if _, err = tx.Exec(`INSERT INTO download_requests(id, job_id, source_kind, account_id, source_url, dialog_key, message_id, trigger_json, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'created', ?)`, requestID, id, intent.Source, intent.AccountID, intent.URL, sources[0].DialogKey, sources[0].MessageID, trigger, now); err != nil {
+		return Submission{}, err
+	}
 	if err = tx.Commit(); err != nil {
-		return Job{}, err
+		return Submission{}, err
 	}
 	m.touch()
-	job := Job{ID: id, SourceURL: sourceURL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(sourceURL), AccountID: accountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
-	return job, nil
+	return Submission{RequestID: requestID, Job: job, Created: true}, nil
 }
 
 func (m *Manager) worker() {
@@ -511,6 +536,7 @@ func (m *Manager) run(job Job, sources []source) {
 		return
 	}
 	m.touch()
+	m.emit(job.ID, "", "job_status_changed", "running")
 	applog.Info("download", "task_started", "job_id", job.ID, "account_id", job.AccountID, "item_count", len(sources))
 	pending := make([]source, 0, len(sources))
 	for _, item := range sources {
@@ -896,6 +922,7 @@ func (m *Manager) Retry(id string) error {
 	_, _ = m.db.Exec(`UPDATE download_jobs SET status = 'queued', error = '', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), id)
 	_, _ = m.db.Exec(`UPDATE download_items SET status = 'queued', error = '' WHERE job_id = ? AND status != 'completed'`, id)
 	m.touch()
+	m.emit(id, "", "job_status_changed", "queued")
 	m.signal()
 	return nil
 }
@@ -975,6 +1002,7 @@ func (m *Manager) consumeRestart(accountID, sourceURL string) bool {
 func (m *Manager) setJob(id, status, message string) {
 	_, _ = m.db.Exec(`UPDATE download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, status, message, time.Now().UTC().Format(time.RFC3339), id)
 	m.touch()
+	m.emit(id, "", "job_status_changed", status)
 }
 func (m *Manager) setItem(item source, status, path, message string) {
 	finishedAt := ""

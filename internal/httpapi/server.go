@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/adapter/upstream"
+	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/auth"
 	"github.com/vacks/tdl/internal/bot"
 	"github.com/vacks/tdl/internal/config"
@@ -81,7 +81,10 @@ type responseRecorder struct {
 	status int
 }
 
-func (w *responseRecorder) WriteHeader(status int) { w.status = status; w.ResponseWriter.WriteHeader(status) }
+func (w *responseRecorder) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
 func (w *responseRecorder) Flush() {
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
@@ -288,12 +291,12 @@ func (s *Server) downloadsAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请输入 Telegram 消息链接"})
 			return
 		}
-		job, err := s.downloads.Enqueue(r.Context(), strings.TrimSpace(input.URL))
+		submission, err := s.downloads.Submit(r.Context(), download.DownloadIntent{Source: download.SourceWeb, URL: strings.TrimSpace(input.URL)})
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusAccepted, job)
+		writeJSON(w, http.StatusAccepted, submission)
 	default:
 		methodNotAllowed(w, "GET, POST")
 	}
@@ -314,8 +317,10 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	write := func() bool {
-		data, err := json.Marshal(map[string]any{"files": s.downloads.LiveProgress(), "revision": s.downloads.Revision()})
+	events, unsubscribe := s.downloads.SubscribeEvents()
+	defer unsubscribe()
+	write := func(event *download.Event) bool {
+		data, err := json.Marshal(map[string]any{"files": s.downloads.LiveProgress(), "revision": s.downloads.Revision(), "event": event})
 		if err != nil {
 			return false
 		}
@@ -331,7 +336,7 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return true
 	}
-	if !write() {
+	if !write(nil) {
 		return
 	}
 	ticker := time.NewTicker(750 * time.Millisecond)
@@ -340,8 +345,12 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case event, ok := <-events:
+			if !ok || !write(&event) {
+				return
+			}
 		case <-ticker.C:
-			if !write() {
+			if !write(nil) {
 				return
 			}
 		}

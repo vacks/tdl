@@ -99,9 +99,10 @@ func (s *Service) handle(ctx context.Context, event telegram.ReactionEvent) {
 	for _, emoji := range event.Emojis {
 		canonicalEmoji := settings.CanonicalReactionEmoji(emoji)
 		if _, ok := allowed[canonicalEmoji]; ok {
-			_, err := s.downloads.EnqueueReaction(ctx, event.AccountID, event.SourceURL, event.DialogName, event.DialogID, event.InputPeer, event.MessageID)
-			// Duplicate delivery or an already existing task is intentional.
-			if errors.Is(err, download.ErrDuplicate) {
+			submission, err := s.downloads.Submit(ctx, download.DownloadIntent{Source: download.SourceReaction, AccountID: event.AccountID, Message: &download.MessageRef{SourceURL: event.SourceURL, DialogName: event.DialogName, DialogID: event.DialogID, InputPeer: event.InputPeer, MessageID: event.MessageID}, Trigger: map[string]string{"emoji": canonicalEmoji}})
+			// Duplicate delivery or an already existing task is intentional and is
+			// recorded as a request attached to the original job.
+			if err == nil && submission.Duplicate {
 				applog.Info("reaction", "task_skipped_duplicate", "account_id", event.AccountID, "dialog_id", event.DialogID, "message_id", event.MessageID, "emoji", canonicalEmoji)
 				return
 			}

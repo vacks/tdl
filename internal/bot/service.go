@@ -49,6 +49,9 @@ type Service struct {
 	deleted   map[string]struct{}
 	ready     bool
 	helpSent  bool
+	// downloadWake receives coalesced domain events. It shortens lifecycle
+	// updates without making the Bot poll the task table more aggressively.
+	downloadWake chan struct{}
 }
 
 type updateCursor struct {
@@ -66,15 +69,26 @@ type trackedRef struct {
 }
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, client: &http.Client{Timeout: 12 * time.Second}, cursorPath: filepath.Join(dataDir, "bot-updates.json"), known: map[string]string{}, tracked: map[string]trackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}}
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, client: &http.Client{Timeout: 12 * time.Second}, cursorPath: filepath.Join(dataDir, "bot-updates.json"), known: map[string]string{}, tracked: map[string]trackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, downloadWake: make(chan struct{}, 1)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
 		}
 	}
 	applog.Info("bot", "service_started")
+	events, _ := downloads.SubscribeEvents()
+	go s.watchDownloadEvents(events)
 	go s.loop()
 	return s
+}
+
+func (s *Service) watchDownloadEvents(events <-chan download.Event) {
+	for range events {
+		select {
+		case s.downloadWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Service) loop() {
@@ -110,7 +124,10 @@ func (s *Service) loop() {
 			applog.Error("bot", "updates_fetch_failed", "error", err.Error())
 		}
 		s.refresh(cfg)
-		time.Sleep(2 * time.Second)
+		select {
+		case <-s.downloadWake:
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -239,11 +256,15 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) {
 			os.Exit(0)
 		}()
 	case isTelegramLink(text):
-		job, err := s.downloads.Enqueue(context.Background(), text)
+		submission, err := s.downloads.Submit(context.Background(), download.DownloadIntent{Source: download.SourceBot, URL: text})
 		if err != nil {
 			applog.Error("bot", "task_create_failed", "user_id", msg.From.ID, "error", err.Error())
 			s.send(cfg.Token, msg.Chat.ID, "❌ 创建下载任务失败："+html.EscapeString(err.Error()), nil)
 			return
+		}
+		job := submission.Job
+		if submission.Duplicate {
+			applog.Info("bot", "task_request_attached", "user_id", msg.From.ID, "job_id", job.ID)
 		}
 		applog.Info("bot", "task_created", "user_id", msg.From.ID, "job_id", job.ID, "item_count", job.TotalItems)
 		s.mu.Lock()
