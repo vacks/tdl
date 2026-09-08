@@ -11,6 +11,8 @@ import (
 // FileProgress is live, non-persistent download state. It intentionally stays
 // out of SQLite: upstream invokes the callback for every completed chunk.
 type FileProgress struct {
+	DialogType string  `json:"dialogType"`
+	DialogKey  string  `json:"dialogKey"`
 	DialogID   int64   `json:"dialogId"`
 	MessageID  int     `json:"messageId"`
 	Downloaded int64   `json:"downloaded"`
@@ -35,13 +37,13 @@ func newProgressStore() *progressStore {
 	return &progressStore{files: make(map[string]liveFileProgress)}
 }
 
-func progressKey(dialogID int64, messageID int) string {
-	return fmt.Sprintf("%d:%d", dialogID, messageID)
+func progressKey(dialogKey string, messageID int) string {
+	return fmt.Sprintf("%s:%d", dialogKey, messageID)
 }
 
-func (p *progressStore) Update(jobID string, update upstreamDL.ProgressUpdate) (started, completed bool) {
+func (p *progressStore) Update(jobID string, item Item, update upstreamDL.ProgressUpdate) (started, completed bool) {
 	now := time.Now()
-	key := progressKey(update.DialogID, update.MessageID)
+	key := progressKey(item.DialogKey, update.MessageID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	previous, exists := p.files[key]
@@ -64,7 +66,7 @@ func (p *progressStore) Update(jobID string, update upstreamDL.ProgressUpdate) (
 		previous.lastMeasuredAt = now
 		previous.lastMeasuredByte = update.Downloaded
 	}
-	previous.FileProgress = FileProgress{DialogID: update.DialogID, MessageID: update.MessageID, Downloaded: update.Downloaded, Total: update.Total, SpeedBPS: speed, UpdatedAt: now.UTC().Format(time.RFC3339Nano)}
+	previous.FileProgress = FileProgress{DialogType: item.DialogType, DialogKey: item.DialogKey, DialogID: update.DialogID, MessageID: update.MessageID, Downloaded: update.Downloaded, Total: update.Total, SpeedBPS: speed, UpdatedAt: now.UTC().Format(time.RFC3339Nano)}
 	p.files[key] = previous
 	return started, update.Completed
 }

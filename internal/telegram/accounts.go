@@ -262,6 +262,17 @@ func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(c
 	store := m.accountStore(id)
 	dispatcher := tg.NewUpdateDispatcher()
 	var client *gotd.Client
+	// Telegram sends reaction changes for different cloud dialog types through
+	// different update constructors. Private chats commonly arrive as edited
+	// messages; channels can use either constructor. Both are normalized below.
+	dispatcher.OnEditMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditMessage) error {
+		m.dispatchEditedReaction(updateCtx, id, "edit_message", entities, update.Message, client, onEvent)
+		return nil
+	})
+	dispatcher.OnEditChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditChannelMessage) error {
+		m.dispatchEditedReaction(updateCtx, id, "edit_channel_message", entities, update.Message, client, onEvent)
+		return nil
+	})
 	dispatcher.OnMessageReactions(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateMessageReactions) error {
 		reactions := &update.Reactions
 		emojis := ownReactionEmojis(reactions)
@@ -269,31 +280,12 @@ func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(c
 			applog.Info("reaction", "update_ignored_not_own", "account_id", id, "message_id", update.MsgID, "summary", reactions.Min)
 			return nil
 		}
-		inputPeer, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(update.Peer)
-		if err != nil {
-			applog.Error("reaction", "peer_extract_failed", "account_id", id, "message_id", update.MsgID, "error", err.Error())
+		event, ok := m.reactionEvent(updateCtx, id, entities, update.Peer, update.MsgID, emojis, client)
+		if !ok {
 			return nil
 		}
-		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
-		peer, err := manager.ResolvePeer(updateCtx, update.Peer)
-		if err != nil {
-			applog.Info("reaction", "peer_name_unavailable", "account_id", id, "message_id", update.MsgID, "error", err.Error())
-		}
-		dialogID, dialogName := inputPeerInfo(inputPeer)
-		sourceURL := fmt.Sprintf("tg://reaction/%d/%d", dialogID, update.MsgID)
-		if err == nil {
-			dialogID, dialogName = peer.ID(), peer.VisibleName()
-			sourceURL = reactionSourceURL(peer, update.MsgID)
-		}
-		event := ReactionEvent{AccountID: id, DialogID: dialogID, DialogName: dialogName, MessageID: update.MsgID, SourceURL: sourceURL, InputPeer: inputPeer, Emojis: emojis}
-		applog.Info("reaction", "own_reaction_received", "account_id", id, "dialog_id", peer.ID(), "message_id", update.MsgID, "emojis", emojis, "summary", reactions.Min)
-		// Update dispatch must stay responsive. Task parsing is independent and
-		// is bounded so a temporary Telegram/API error cannot block later updates.
-		go func() {
-			workCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
-			onEvent(workCtx, event)
-		}()
+		applog.Info("reaction", "own_reaction_received", "account_id", id, "dialog_id", event.DialogID, "message_id", update.MsgID, "emojis", emojis, "summary", reactions.Min)
+		dispatchReactionEvent(onEvent, event)
 		return nil
 	})
 
@@ -314,8 +306,117 @@ func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(c
 	})
 }
 
+func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateType string, entities tg.Entities, raw tg.MessageClass, client *gotd.Client, onEvent func(context.Context, ReactionEvent)) {
+	logReactionEditUpdate(accountID, updateType, raw)
+	message, ok := raw.(*tg.Message)
+	if !ok {
+		return
+	}
+	reactions, ok := message.GetReactions()
+	if !ok {
+		return
+	}
+	emojis := ownReactionEmojis(&reactions)
+	if len(emojis) == 0 {
+		return
+	}
+	event, ok := m.reactionEvent(ctx, accountID, entities, message.PeerID, message.ID, emojis, client)
+	if !ok {
+		return
+	}
+	applog.Info("reaction", "own_reaction_received", "account_id", accountID, "update_type", updateType, "dialog_id", event.DialogID, "message_id", event.MessageID, "emojis", emojis, "summary", reactions.Min)
+	dispatchReactionEvent(onEvent, event)
+}
+
+// reactionEvent turns a Telegram peer into a direct-download event. A public
+// t.me URL is optional metadata only; the InputPeer is authoritative and works
+// for private dialogs as well.
+func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities tg.Entities, rawPeer tg.PeerClass, messageID int, emojis []string, client *gotd.Client) (ReactionEvent, bool) {
+	inputPeer, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(rawPeer)
+	if err != nil {
+		peerType, peerID := peerIdentity(rawPeer)
+		applog.Error("reaction", "peer_extract_failed", "account_id", accountID, "peer_type", peerType, "dialog_id", peerID, "message_id", messageID, "error", err.Error())
+		return ReactionEvent{}, false
+	}
+	dialogID, dialogName := inputPeerInfo(inputPeer)
+	sourceURL := reactionFallbackURL(inputPeer, accountID, messageID)
+	manager := peers.Options{Storage: storage.NewPeers(m.accountStore(accountID))}.Build(client.API())
+	peer, resolveErr := manager.ResolvePeer(ctx, rawPeer)
+	if resolveErr != nil {
+		applog.Info("reaction", "peer_name_unavailable", "account_id", accountID, "dialog_id", dialogID, "message_id", messageID, "error", resolveErr.Error())
+	} else {
+		// peers.User maps the current user to InputPeerSelf, which preserves the
+		// special identity of Saved Messages.
+		inputPeer = peer.InputPeer()
+		dialogID, dialogName = peer.ID(), peer.VisibleName()
+		sourceURL = reactionSourceURL(peer, accountID, messageID)
+	}
+	return ReactionEvent{AccountID: accountID, DialogID: dialogID, DialogName: dialogName, MessageID: messageID, SourceURL: sourceURL, InputPeer: inputPeer, Emojis: emojis}, true
+}
+
+func dispatchReactionEvent(onEvent func(context.Context, ReactionEvent), event ReactionEvent) {
+	// Update dispatch must stay responsive. Task parsing is independent and is
+	// bounded so a temporary Telegram/API error cannot block later updates.
+	go func() {
+		workCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		onEvent(workCtx, event)
+	}()
+}
+
+// logReactionEditUpdate emits a privacy-safe diagnostic only when an edited
+// message actually contains reaction state. It intentionally excludes message
+// text, captions, usernames and media names.
+func logReactionEditUpdate(accountID, updateType string, raw tg.MessageClass) {
+	message, ok := raw.(*tg.Message)
+	if !ok {
+		return
+	}
+	reactions, ok := message.GetReactions()
+	if !ok {
+		return
+	}
+	chosen := 0
+	standard := 0
+	for _, reaction := range reactions.Results {
+		if _, ok := reaction.Reaction.(*tg.ReactionEmoji); ok {
+			standard++
+		}
+		if _, ok := reaction.GetChosenOrder(); ok {
+			chosen++
+		}
+	}
+	peerType, peerID := peerIdentity(message.PeerID)
+	applog.Info("reaction", "reaction_edit_update_received",
+		"account_id", accountID,
+		"update_type", updateType,
+		"peer_type", peerType,
+		"peer_id", peerID,
+		"message_id", message.ID,
+		"reaction_count", len(reactions.Results),
+		"standard_reaction_count", standard,
+		"chosen_reaction_count", chosen,
+		"summary", reactions.Min,
+	)
+}
+
+func peerIdentity(peer tg.PeerClass) (string, int64) {
+	switch value := peer.(type) {
+	case *tg.PeerUser:
+		return "user", value.UserID
+	case *tg.PeerChat:
+		return "chat", value.ChatID
+	case *tg.PeerChannel:
+		return "channel", value.ChannelID
+	default:
+		return "unknown", 0
+	}
+}
+
 func inputPeerInfo(input tg.InputPeerClass) (int64, string) {
 	switch peer := input.(type) {
+	case *tg.InputPeerSelf:
+		return 0, "收藏消息"
 	case *tg.InputPeerUser:
 		return peer.UserID, "私聊"
 	case *tg.InputPeerChat:
@@ -364,14 +465,27 @@ func ownReactionEmojis(reactions *tg.MessageReactions) []string {
 	return result
 }
 
-func reactionSourceURL(peer peers.Peer, messageID int) string {
+func reactionSourceURL(peer peers.Peer, accountID string, messageID int) string {
 	if username, ok := peer.Username(); ok && username != "" {
 		return fmt.Sprintf("https://t.me/%s/%d", username, messageID)
 	}
-	if channel, ok := peer.(peers.Channel); ok {
-		return fmt.Sprintf("https://t.me/c/%d/%d", channel.ID(), messageID)
+	return reactionFallbackURL(peer.InputPeer(), accountID, messageID)
+}
+
+func reactionFallbackURL(peer tg.InputPeerClass, accountID string, messageID int) string {
+	if _, ok := peer.(*tg.InputPeerSelf); ok {
+		return fmt.Sprintf("tg://reaction/self/%s/%d", accountID, messageID)
 	}
-	return fmt.Sprintf("tg://reaction/%d/%d", peer.ID(), messageID)
+	switch value := peer.(type) {
+	case *tg.InputPeerUser:
+		return fmt.Sprintf("tg://reaction/user/%d/%d", value.UserID, messageID)
+	case *tg.InputPeerChat:
+		return fmt.Sprintf("tg://reaction/chat/%d/%d", value.ChatID, messageID)
+	case *tg.InputPeerChannel:
+		return fmt.Sprintf("tg://reaction/channel/%d/%d", value.ChannelID, messageID)
+	default:
+		return fmt.Sprintf("tg://reaction/unknown/0/%d", messageID)
+	}
 }
 
 // Run executes an operation with one specific authorized account. Download
@@ -562,7 +676,10 @@ func (m *Manager) setState(id, state, message string) {
 		}
 	})
 }
-func (m *Manager) setError(id string, err error) { applog.Error("telegram", "account_error", "account_id", id, "error", err.Error()); m.setState(id, "error", err.Error()) }
+func (m *Manager) setError(id string, err error) {
+	applog.Error("telegram", "account_error", "account_id", id, "error", err.Error())
+	m.setState(id, "error", err.Error())
+}
 func (m *Manager) authorize(id string, user *tg.User) {
 	m.update(id, func(a *Account) {
 		a.TelegramID, a.FirstName, a.LastName, a.Username = user.ID, user.FirstName, user.LastName, user.Username

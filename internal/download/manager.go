@@ -46,6 +46,8 @@ const (
 
 type Item struct {
 	ID           int64  `json:"id"`
+	DialogType   string `json:"dialogType"`
+	DialogKey    string `json:"dialogKey"`
 	DialogID     int64  `json:"dialogId"`
 	MessageID    int    `json:"messageId"`
 	GroupedID    int64  `json:"groupedId,omitempty"`
@@ -64,7 +66,10 @@ type Item struct {
 type Job struct {
 	ID             string `json:"id"`
 	SourceURL      string `json:"sourceUrl"`
+	DialogType     string `json:"dialogType"`
+	DialogKey      string `json:"dialogKey"`
 	DialogName     string `json:"dialogName"`
+	HasPublicLink  bool   `json:"hasPublicLink"`
 	MessageText    string `json:"messageText,omitempty"`
 	AccountID      string `json:"accountId"`
 	Status         string `json:"status"`
@@ -93,7 +98,10 @@ type source struct {
 	Item
 	DialogName string
 }
-type directPeer struct{ kind string; id, hash int64 }
+type directPeer struct {
+	kind     string
+	id, hash int64
+}
 
 type Manager struct {
 	db          *sql.DB
@@ -138,12 +146,12 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 func (m *Manager) migrate() error {
 	_, err := m.db.Exec(`
 CREATE TABLE IF NOT EXISTS download_jobs (
- id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS download_items (
- id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, grouped_id INTEGER NOT NULL DEFAULT 0,
+ id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, grouped_id INTEGER NOT NULL DEFAULT 0,
  message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
- UNIQUE(dialog_id, message_id), FOREIGN KEY(job_id) REFERENCES download_jobs(id)
+ UNIQUE(dialog_key, message_id), FOREIGN KEY(job_id) REFERENCES download_jobs(id)
 );
 CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id);`)
 	if err != nil {
@@ -175,13 +183,71 @@ CREATE TABLE IF NOT EXISTS bot_lifecycle_messages (
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_type TEXT NOT NULL DEFAULT ''`)
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_id INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_hash INTEGER NOT NULL DEFAULT 0`)
+	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`)
+	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN started_at TEXT NOT NULL DEFAULT ''`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''`)
 	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0`)
 	_, _ = m.db.Exec(`ALTER TABLE bot_lifecycle_messages ADD COLUMN message_text TEXT NOT NULL DEFAULT ''`)
+	if err := m.migrateItemIdentity(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// migrateItemIdentity replaces the old numeric-only unique key. Telegram user,
+// basic-chat and channel IDs live in different namespaces, so dialog_id alone
+// is not a safe cross-dialog identity.
+func (m *Manager) migrateItemIdentity() error {
+	rows, err := m.db.Query(`PRAGMA table_info(download_items)`)
+	if err != nil {
+		return err
+	}
+	hasDialogKey := false
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, primary int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primary); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "dialog_key" {
+			hasDialogKey = true
+		}
+	}
+	if err := rows.Close(); err != nil || hasDialogKey {
+		return err
+	}
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`CREATE TABLE download_items_v2 (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, grouped_id INTEGER NOT NULL DEFAULT 0,
+ message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+ UNIQUE(dialog_key, message_id), FOREIGN KEY(job_id) REFERENCES download_jobs(id)
+)`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO download_items_v2(id, job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error)
+ SELECT id, job_id, 'legacy', 'legacy:' || dialog_id, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DROP TABLE download_items`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`ALTER TABLE download_items_v2 RENAME TO download_items`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`CREATE INDEX download_items_job_id ON download_items(job_id)`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SaveBotLifecycleMessage stores the one lifecycle card shown to a Bot user.
@@ -217,13 +283,14 @@ func (m *Manager) List() ([]Job, error) {
 // refresh one displayed task without repeatedly loading unrelated task pages.
 func (m *Manager) Get(id string) (Job, error) {
 	var job Job
-	err := m.db.QueryRow(`SELECT id, source_url, dialog_name, account_id, attempts, status, error, created_at, updated_at FROM download_jobs WHERE id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, attempts, status, error, created_at, updated_at FROM download_jobs WHERE id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, errors.New("下载任务不存在")
 	}
 	if err != nil {
 		return Job{}, err
 	}
+	job.HasPublicLink = isPublicMessageLink(job.SourceURL)
 	items, err := m.items(id)
 	if err != nil {
 		return Job{}, err
@@ -257,14 +324,14 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := m.db.Query(`SELECT id, source_url, dialog_name, account_id, attempts, status, error, created_at, updated_at FROM download_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?`, pageSize, (page-1)*pageSize)
+	rows, err := m.db.Query(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, attempts, status, error, created_at, updated_at FROM download_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?`, pageSize, (page-1)*pageSize)
 	if err != nil {
 		return nil, 0, err
 	}
 	jobs := make([]Job, 0)
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.SourceURL, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt); err != nil {
 			_ = rows.Close()
 			return nil, 0, err
 		}
@@ -278,6 +345,7 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 		return nil, 0, err
 	}
 	for index := range jobs {
+		jobs[index].HasPublicLink = isPublicMessageLink(jobs[index].SourceURL)
 		items, err := m.items(jobs[index].ID)
 		if err != nil {
 			return nil, 0, err
@@ -381,19 +449,19 @@ func (m *Manager) enqueueResolved(sourceURL, accountID string, sources []source,
 	defer tx.Rollback()
 	for _, item := range sources {
 		var exists int
-		err = tx.QueryRow(`SELECT COUNT(1) FROM download_items WHERE dialog_id = ? AND message_id = ?`, item.DialogID, item.MessageID).Scan(&exists)
+		err = tx.QueryRow(`SELECT COUNT(1) FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&exists)
 		if err != nil {
 			return Job{}, err
 		}
 		if exists > 0 {
-			return Job{}, fmt.Errorf("%w：%d/%d", ErrDuplicate, item.DialogID, item.MessageID)
+			return Job{}, fmt.Errorf("%w：%s/%d", ErrDuplicate, item.DialogKey, item.MessageID)
 		}
 	}
-	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, sourceURL, sources[0].DialogName, accountID, direct.kind, direct.id, direct.hash, now, now); err != nil {
+	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, sourceURL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, accountID, direct.kind, direct.id, direct.hash, now, now); err != nil {
 		return Job{}, err
 	}
 	for _, item := range sources {
-		if _, err = tx.Exec(`INSERT INTO download_items(job_id, dialog_id, message_id, grouped_id, message_text, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')`, id, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginalName, item.Size); err != nil {
+		if _, err = tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')`, id, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginalName, item.Size); err != nil {
 			return Job{}, err
 		}
 	}
@@ -401,7 +469,7 @@ func (m *Manager) enqueueResolved(sourceURL, accountID string, sources []source,
 		return Job{}, err
 	}
 	m.touch()
-	job := Job{ID: id, SourceURL: sourceURL, DialogName: sources[0].DialogName, AccountID: accountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: sourceURL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(sourceURL), AccountID: accountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
 	m.signal()
 	return job, nil
 }
@@ -422,7 +490,7 @@ func (m *Manager) worker() {
 
 func (m *Manager) nextQueued() (Job, []source, error) {
 	var job Job
-	err := m.db.QueryRow(`SELECT id, source_url, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, attempts, status, error, created_at, updated_at FROM download_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1`).Scan(&job.ID, &job.SourceURL, &job.DialogName, &job.AccountID, &job.DirectPeerType, &job.DirectPeerID, &job.DirectPeerHash, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, attempts, status, error, created_at, updated_at FROM download_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1`).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.DirectPeerType, &job.DirectPeerID, &job.DirectPeerHash, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, nil, nil
 	}
@@ -469,9 +537,13 @@ func (m *Manager) run(job Job, sources []source) {
 		return
 	}
 	config := m.settings.Get()
-	pendingByMessage := make(map[string]source, len(pending))
+	// One upstream invocation resolves exactly one dialog, so MessageID is
+	// sufficient for callback correlation here. Do not use its numeric dialog
+	// ID: Telegram represents some dialogs (notably "Saved Messages") with a
+	// different peer form in download callbacks than in the update stream.
+	pendingByMessage := make(map[int]source, len(pending))
 	for _, item := range pending {
-		pendingByMessage[messageKey(item.DialogID, item.MessageID)] = item
+		pendingByMessage[item.MessageID] = item
 	}
 	var publishWG sync.WaitGroup
 	// A deleted task may have left an upstream resume key. Consume this one-shot
@@ -484,16 +556,20 @@ func (m *Manager) run(job Job, sources []source) {
 		viper.Set(consts.FlagDelay, time.Duration(config.Download.DelayMS)*time.Millisecond)
 		viper.Set(consts.FlagDisableProgressPS, true)
 		opts := upstreamDL.Options{URLs: []string{job.SourceURL}, Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Restart: restart, Quiet: true, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
-			started, _ := m.progress.Update(job.ID, update)
-			if started {
-				m.markItemStarted(update.DialogID, update.MessageID)
-			}
-		}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
-			item, ok := pendingByMessage[messageKey(update.DialogID, update.MessageID)]
+			item, ok := pendingByMessage[update.MessageID]
 			if !ok {
 				return
 			}
-			m.markItemFinished(update.DialogID, update.MessageID)
+			started, _ := m.progress.Update(job.ID, item.Item, update)
+			if started {
+				m.markItemStarted(item)
+			}
+		}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
+			item, ok := pendingByMessage[update.MessageID]
+			if !ok {
+				return
+			}
+			m.markItemFinished(item)
 			publishWG.Add(1)
 			go func() {
 				defer publishWG.Done()
@@ -552,6 +628,8 @@ func (m *Manager) run(job Job, sources []source) {
 
 func makeDirectPeer(peer tg.InputPeerClass) directPeer {
 	switch value := peer.(type) {
+	case *tg.InputPeerSelf:
+		return directPeer{kind: "self"}
 	case *tg.InputPeerUser:
 		return directPeer{kind: "user", id: value.UserID, hash: value.AccessHash}
 	case *tg.InputPeerChat:
@@ -565,6 +643,8 @@ func makeDirectPeer(peer tg.InputPeerClass) directPeer {
 
 func (j Job) directInputPeer() tg.InputPeerClass {
 	switch j.DirectPeerType {
+	case "self":
+		return &tg.InputPeerSelf{}
 	case "user":
 		return &tg.InputPeerUser{UserID: j.DirectPeerID, AccessHash: j.DirectPeerHash}
 	case "chat":
@@ -574,6 +654,25 @@ func (j Job) directInputPeer() tg.InputPeerClass {
 	default:
 		return nil
 	}
+}
+
+func dialogIdentity(peer tg.InputPeerClass, accountID string) (kind, key string, id int64) {
+	switch value := peer.(type) {
+	case *tg.InputPeerSelf:
+		return "self", "self:" + accountID, 0
+	case *tg.InputPeerUser:
+		return "user", fmt.Sprintf("user:%d", value.UserID), value.UserID
+	case *tg.InputPeerChat:
+		return "chat", fmt.Sprintf("chat:%d", value.ChatID), value.ChatID
+	case *tg.InputPeerChannel:
+		return "channel", fmt.Sprintf("channel:%d", value.ChannelID), value.ChannelID
+	default:
+		return "unknown", "unknown:0", 0
+	}
+}
+
+func isPublicMessageLink(value string) bool {
+	return strings.HasPrefix(value, "https://t.me/") || strings.HasPrefix(value, "http://t.me/")
 }
 
 func (m *Manager) allItemsCompleted(jobID string) bool {
@@ -632,12 +731,13 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			}
 		}
 		messageText := groupDisplayText(messages)
+		dialogType, dialogKey, dialogID := dialogIdentity(peer.InputPeer(), accountID)
 		for _, msg := range messages {
 			media, ok := tmedia.GetMedia(msg)
 			if !ok {
 				continue
 			}
-			result = append(result, source{Item: Item{DialogID: peer.ID(), MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: peer.VisibleName()})
+			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: peer.VisibleName()})
 		}
 		return nil
 	})
@@ -661,12 +761,16 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 			}
 		}
 		messageText := groupDisplayText(messages)
+		dialogType, dialogKey, resolvedDialogID := dialogIdentity(inputPeer, accountID)
+		if resolvedDialogID == 0 && dialogID != 0 {
+			resolvedDialogID = dialogID
+		}
 		for _, msg := range messages {
 			media, ok := tmedia.GetMedia(msg)
 			if !ok {
 				continue
 			}
-			result = append(result, source{Item: Item{DialogID: dialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: dialogName})
+			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: dialogName})
 		}
 		return nil
 	})
@@ -689,7 +793,7 @@ func groupDisplayText(messages []*tg.Message) string {
 }
 
 func (m *Manager) items(jobID string) ([]Item, error) {
-	rows, err := m.db.Query(`SELECT id, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items WHERE job_id = ? ORDER BY id`, jobID)
+	rows, err := m.db.Query(`SELECT id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -697,7 +801,7 @@ func (m *Manager) items(jobID string) ([]Item, error) {
 	items := make([]Item, 0)
 	for rows.Next() {
 		var item Item
-		if err := rows.Scan(&item.ID, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginalName, &item.Size, &item.FinalPath, &item.StartedAt, &item.FinishedAt, &item.ElapsedMS, &item.Attempts, &item.Status, &item.Error); err != nil {
+		if err := rows.Scan(&item.ID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginalName, &item.Size, &item.FinalPath, &item.StartedAt, &item.FinishedAt, &item.ElapsedMS, &item.Attempts, &item.Status, &item.Error); err != nil {
 			return nil, err
 		}
 		// Older records predate the size column. When their final file still
@@ -737,9 +841,9 @@ func (m *Manager) status(id string) string {
 	_ = m.db.QueryRow(`SELECT status FROM download_jobs WHERE id = ?`, id).Scan(&status)
 	return status
 }
-func (m *Manager) itemStatus(dialogID int64, messageID int) string {
+func (m *Manager) itemStatus(dialogKey string, messageID int) string {
 	var status string
-	_ = m.db.QueryRow(`SELECT status FROM download_items WHERE dialog_id = ? AND message_id = ?`, dialogID, messageID).Scan(&status)
+	_ = m.db.QueryRow(`SELECT status FROM download_items WHERE dialog_key = ? AND message_id = ?`, dialogKey, messageID).Scan(&status)
 	return status
 }
 
@@ -877,32 +981,32 @@ func (m *Manager) setItem(item source, status, path, message string) {
 	if status == "completed" || status == "failed" || status == "cancelled" {
 		finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, _ = m.db.Exec(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_id = ? AND message_id = ?`, status, path, message, finishedAt, finishedAt, item.DialogID, item.MessageID)
+	_, _ = m.db.Exec(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ?`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID)
 	m.touch()
 }
 func (m *Manager) beginItemAttempt(item source) {
 	// A task may be running while this particular file is still waiting for an
 	// upstream worker slot. It becomes "running" only on its first byte-level
 	// progress callback.
-	_, _ = m.db.Exec(`UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_id = ? AND message_id = ?`, item.DialogID, item.MessageID)
+	_, _ = m.db.Exec(`UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID)
 	m.touch()
 }
 func (m *Manager) pauseItem(item source) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE dialog_id = ? AND message_id = ? AND status IN ('queued', 'running')`, now, item.DialogID, item.MessageID)
+	_, _ = m.db.Exec(`UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ? AND status IN ('queued', 'running')`, now, item.DialogKey, item.MessageID)
 	m.touch()
 }
-func (m *Manager) markItemStarted(dialogID int64, messageID int) {
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_id = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), dialogID, messageID)
+func (m *Manager) markItemStarted(item source) {
+	_, _ = m.db.Exec(`UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
 	m.touch()
 }
-func (m *Manager) markItemFinished(dialogID int64, messageID int) {
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'downloaded', finished_at = ? WHERE dialog_id = ? AND message_id = ? AND status = 'running' AND started_at != '' AND finished_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), dialogID, messageID)
+func (m *Manager) markItemFinished(item source) {
+	_, _ = m.db.Exec(`UPDATE download_items SET status = 'downloaded', finished_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'running' AND started_at != '' AND finished_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
 	m.touch()
 }
 func (m *Manager) fail(id string, sources []source, err error) {
 	for _, item := range sources {
-		if m.itemStatus(item.DialogID, item.MessageID) == "completed" {
+		if m.itemStatus(item.DialogKey, item.MessageID) == "completed" {
 			continue
 		}
 		m.setItem(item, "failed", "", err.Error())
@@ -914,10 +1018,6 @@ func (m *Manager) fail(id string, sources []source, err error) {
 		return
 	}
 	m.setJob(id, "failed", err.Error())
-}
-
-func messageKey(dialogID int64, messageID int) string {
-	return fmt.Sprintf("%d:%d", dialogID, messageID)
 }
 
 func renderName(pattern string, item source) (string, error) {

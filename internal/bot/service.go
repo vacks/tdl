@@ -25,23 +25,23 @@ import (
 // Service is intentionally a small Telegram Bot API client. It is separate
 // from the user-account MTProto client used by tdl downloads.
 type Service struct {
-	settings  *settings.Store
-	downloads *download.Manager
-	telegram  *telegram.Manager
-	monitor   *monitor.Monitor
-	client    *http.Client
+	settings   *settings.Store
+	downloads  *download.Manager
+	telegram   *telegram.Manager
+	monitor    *monitor.Monitor
+	client     *http.Client
 	cursorPath string
 	cursor     updateCursor
 
-	mu      sync.Mutex
+	mu sync.Mutex
 	// lifecycleMu serializes a status refresh with deletion. Without it a
 	// refresh holding an old completed snapshot could overwrite a later
 	// "task deleted" card or send a replacement notification.
 	lifecycleMu sync.Mutex
-	offset  int64
-	token   string
-	known   map[string]string
-	tracked map[string]trackedRef
+	offset      int64
+	token       string
+	known       map[string]string
+	tracked     map[string]trackedRef
 	// lifecycle keeps the one notification card for a job in each authorized
 	// chat. The card is edited as the job advances instead of sending a new
 	// Bot message for every state transition.
@@ -627,12 +627,12 @@ func lifecycleText(job download.Job) string {
 
 func lifecycleTitle(status string) string {
 	return map[string]string{
-		"queued": "下载任务已创建",
-		"running": "下载进行中",
-		"paused": "下载已暂停",
+		"queued":    "下载任务已创建",
+		"running":   "下载进行中",
+		"paused":    "下载已暂停",
 		"completed": "下载完成",
-		"partial": "部分完成",
-		"failed": "下载失败",
+		"partial":   "部分完成",
+		"failed":    "下载失败",
 		"cancelled": "下载已取消",
 	}[status]
 }
@@ -686,11 +686,11 @@ func taskKeyboard(job download.Job, listPage int) [][]button {
 func taskText(job download.Job, progress []download.FileProgress) string {
 	byID := map[string]download.FileProgress{}
 	for _, p := range progress {
-		byID[fmt.Sprintf("%d:%d", p.DialogID, p.MessageID)] = p
+		byID[fmt.Sprintf("%s:%d", p.DialogKey, p.MessageID)] = p
 	}
 	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), "<b>对话：</b>" + html.EscapeString(short(job.DialogName, 36)), fmt.Sprintf("<b>进度：</b>%d/%d 文件", job.CompletedItems, job.TotalItems)}
 	for _, item := range job.Items {
-		p := byID[fmt.Sprintf("%d:%d", item.DialogID, item.MessageID)]
+		p := byID[fmt.Sprintf("%s:%d", item.DialogKey, item.MessageID)]
 		percent := "—"
 		speed := ""
 		if item.Status == "completed" {

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/gotd/td/tg"
 )
 
 func TestAccountStoreSeparatesSessionAndUpstreamState(t *testing.T) {
@@ -39,5 +41,42 @@ func TestAccountStoreSeparatesSessionAndUpstreamState(t *testing.T) {
 	}
 	if store.path("session") == store.path("resume:download-fingerprint") {
 		t.Fatal("session and resume state use the same file")
+	}
+}
+
+func TestReactionFallbackURLKeepsDialogType(t *testing.T) {
+	tests := []struct {
+		peer tg.InputPeerClass
+		want string
+	}{
+		{&tg.InputPeerUser{UserID: 9}, "tg://reaction/user/9/7"},
+		{&tg.InputPeerChat{ChatID: 9}, "tg://reaction/chat/9/7"},
+		{&tg.InputPeerChannel{ChannelID: 9}, "tg://reaction/channel/9/7"},
+		{&tg.InputPeerSelf{}, "tg://reaction/self/account/7"},
+	}
+	for _, test := range tests {
+		if got := reactionFallbackURL(test.peer, "account", 7); got != test.want {
+			t.Errorf("reactionFallbackURL() = %q, want %q", got, test.want)
+		}
+	}
+}
+
+func TestOwnReactionEmojisOnlyReturnsCurrentAccountStandardEmoji(t *testing.T) {
+	chosen := tg.ReactionCount{Reaction: &tg.ReactionEmoji{Emoticon: "❤️"}, Count: 1}
+	chosen.SetChosenOrder(1)
+	reactions := &tg.MessageReactions{
+		RecentReactions: []tg.MessagePeerReaction{
+			{My: true, Reaction: &tg.ReactionEmoji{Emoticon: "👍"}},
+			{My: false, Reaction: &tg.ReactionEmoji{Emoticon: "👎"}},
+			{My: true, Reaction: &tg.ReactionCustomEmoji{}},
+		},
+		Results: []tg.ReactionCount{
+			chosen,
+			{Reaction: &tg.ReactionEmoji{Emoticon: "🔥"}, Count: 10},
+		},
+	}
+	got := ownReactionEmojis(reactions)
+	if len(got) != 2 || got[0] != "👍" || got[1] != "❤️" {
+		t.Fatalf("ownReactionEmojis() = %#v, want [👍 ❤️]", got)
 	}
 }

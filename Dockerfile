@@ -8,9 +8,14 @@ RUN npm run build
 FROM golang:1.25-bookworm AS backend
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends patch && rm -rf /var/lib/apt/lists/*
-COPY go.mod ./
-COPY . ./
+# Keep the dependency and upstream-patch layer independent from application
+# source. A UI or handler edit must not force a full Go module download again.
+COPY go.mod go.sum go.work ./
+COPY scripts/prepare-upstream-progress.sh ./scripts/prepare-upstream-progress.sh
+COPY patches/tdl-progress-0.20.4.patch ./patches/tdl-progress-0.20.4.patch
 RUN sh ./scripts/prepare-upstream-progress.sh && go mod download
+COPY . ./
+RUN go test ./internal/download ./internal/telegram
 COPY --from=frontend /src/web/dist ./internal/httpapi/static
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tdl ./cmd/tdl
 
