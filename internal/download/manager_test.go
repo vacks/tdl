@@ -191,6 +191,49 @@ func TestCleanupHistoryRemovesTerminalChatIndexes(t *testing.T) {
 	}
 }
 
+func TestDeleteChatPreservesChildReferencedByAnotherChat(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, id := range []string{"chat-a", "chat-b"} {
+		if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES (?, 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'completed', 'completed', ?, ?)`, id, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, parent_chat_id, created_at, updated_at) VALUES ('child', 'tg://chat/chat-a/1', 'completed', 'chat-a', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('child', 'channel', 'channel:9', 9, 1, 'file.bin', 'completed')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"chat-a", "chat-b"} {
+		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, discovered_at) VALUES (?, 'channel:9', 1, 'child', ?)`, id, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.DeleteChat("chat-a"); err != nil {
+		t.Fatalf("DeleteChat(): %v", err)
+	}
+	var children, linked int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE id = 'child'`).Scan(&children); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = 'chat-b' AND child_job_id = 'child'`).Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	if children != 1 || linked != 1 {
+		t.Fatalf("shared child was removed: children=%d linked=%d", children, linked)
+	}
+}
+
 func TestChatSourceBatchesDoNotSplitAlbums(t *testing.T) {
 	items := []source{
 		{Item: Item{MessageID: 1}},

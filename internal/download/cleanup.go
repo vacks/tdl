@@ -117,20 +117,12 @@ func (m *Manager) cleanupChatJobsBatch(cutoff string) (int64, error) {
 		return 0, nil
 	}
 	marks, args := placeholders(chatIDs)
-	childRows, err := tx.Query(`SELECT id FROM download_jobs WHERE parent_chat_id IN (`+marks+`)`, args...)
+	// A retained overlapping chat task may still reference a child created by
+	// a parent selected for cleanup. Only remove children that have no such
+	// external reference; the parent-row cascade below removes this task's
+	// index rows either way.
+	childIDs, err := chatExclusiveChildJobIDs(tx, chatIDs)
 	if err != nil {
-		return 0, err
-	}
-	childIDs := make([]string, 0)
-	for childRows.Next() {
-		var id string
-		if err := childRows.Scan(&id); err != nil {
-			_ = childRows.Close()
-			return 0, err
-		}
-		childIDs = append(childIDs, id)
-	}
-	if err := childRows.Close(); err != nil {
 		return 0, err
 	}
 	if len(childIDs) > 0 {

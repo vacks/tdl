@@ -792,7 +792,10 @@ func chatTaskKeyboard(job download.ChatJob, page int) [][]button {
 		buttons = append(buttons, []button{{Text: "恢复", CallbackData: fmt.Sprintf("c:t:%s:resume:%d", job.ID, page)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel:%d", job.ID, page)}})
 	}
 	if job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" || job.Failed > 0 {
-		buttons = append(buttons, []button{{Text: "重新开始", CallbackData: fmt.Sprintf("c:t:%s:retry:%d", job.ID, page)}, {Text: "删除", CallbackData: fmt.Sprintf("c:t:%s:delete:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: "重新开始", CallbackData: fmt.Sprintf("c:t:%s:retry:%d", job.ID, page)}})
+	}
+	if job.Status == "completed" || job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" {
+		buttons = append(buttons, []button{{Text: "删除", CallbackData: fmt.Sprintf("c:t:%s:delete:%d", job.ID, page)}})
 	}
 	buttons = append(buttons, []button{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}})
 	return buttons

@@ -86,13 +86,21 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	job.ID, job.Status, job.ScanState, job.CreatedAt, job.UpdatedAt = id, ChatStatusQueued, chatScanPending, now, now
-	if _, err := m.db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, start_message_id, upper_message_id, listen_new, status, scan_state, error, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`, job.ID, job.SourceURL, job.DialogType, job.DialogKey, job.DialogID, job.DialogName, job.AccountID, direct.kind, direct.id, direct.hash, job.StartMessageID, job.UpperMessageID, boolInt(job.ListenNew), job.Status, job.ScanState, configJSON, now, now); err != nil {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return ChatJob{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, start_message_id, upper_message_id, listen_new, status, scan_state, error, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`, job.ID, job.SourceURL, job.DialogType, job.DialogKey, job.DialogID, job.DialogName, job.AccountID, direct.kind, direct.id, direct.hash, job.StartMessageID, job.UpperMessageID, boolInt(job.ListenNew), job.Status, job.ScanState, configJSON, now, now); err != nil {
 		return ChatJob{}, err
 	}
 	for _, kind := range []string{"photo_video", "document"} {
-		if _, err := m.db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind) VALUES (?, ?)`, job.ID, kind); err != nil {
+		if _, err := tx.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind) VALUES (?, ?)`, job.ID, kind); err != nil {
 			return ChatJob{}, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ChatJob{}, err
 	}
 	m.touch()
 	return job, nil
@@ -822,12 +830,18 @@ func (m *Manager) DeleteChat(id string) error {
 	if target.Status != ChatStatusCompleted && target.Status != ChatStatusFailed && target.Status != ChatStatusPartial && target.Status != ChatStatusCancelled {
 		return errors.New("请先取消或等待会话任务结束后再删除")
 	}
-	children := m.chatChildJobIDs(id)
 	tx, err := m.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// Overlapping chat ranges may deliberately share a child task. Preserve a
+	// child while another parent still references it, otherwise deleting one
+	// history record would also erase the other's progress and retry handle.
+	children, err := chatExclusiveChildJobIDs(tx, []string{id})
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id = ?`, id); err != nil {
 		return err
 	}
@@ -844,6 +858,43 @@ func (m *Manager) DeleteChat(id string) error {
 	}
 	m.touch()
 	return nil
+}
+
+// chatExclusiveChildJobIDs returns parent-owned child jobs that are not also
+// referenced by another chat parent. Standalone jobs are excluded because
+// they have no parent_chat_id.
+func chatExclusiveChildJobIDs(tx *sql.Tx, chatIDs []string) ([]string, error) {
+	if len(chatIDs) == 0 {
+		return nil, nil
+	}
+	marks := strings.TrimRight(strings.Repeat("?,", len(chatIDs)), ",")
+	args := make([]any, 0, len(chatIDs)*2)
+	for _, id := range chatIDs {
+		args = append(args, id)
+	}
+	for _, id := range chatIDs {
+		args = append(args, id)
+	}
+	rows, err := tx.Query(`SELECT DISTINCT j.id
+ FROM download_jobs j
+ WHERE j.parent_chat_id IN (`+marks+`)
+   AND NOT EXISTS (
+     SELECT 1 FROM chat_download_items i
+     WHERE i.child_job_id = j.id AND i.chat_job_id NOT IN (`+marks+`)
+   )`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (m *Manager) chatChildJobIDs(chatID string) []string {
