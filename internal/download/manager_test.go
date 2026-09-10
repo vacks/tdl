@@ -124,6 +124,40 @@ func TestChatJobsAreStoredSeparatelyFromMessageJobs(t *testing.T) {
 	}
 }
 
+func TestMigrateQueuesCompletedChatWhenNewMediaStreamIsAdded(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES ('old-chat', 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'listening', 'completed', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// Mimic a database created before the two newer media streams existed.
+	if _, err := db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind, completed) VALUES ('old-chat', 'photo_video', 1), ('old-chat', 'document', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.migrate(); err != nil {
+		t.Fatalf("upgrade migrate(): %v", err)
+	}
+	var status, scan string
+	var streams int
+	if err := db.QueryRow(`SELECT status, scan_state FROM chat_download_jobs WHERE id = 'old-chat'`).Scan(&status, &scan); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_streams WHERE chat_job_id = 'old-chat'`).Scan(&streams); err != nil {
+		t.Fatal(err)
+	}
+	if status != ChatStatusQueued || scan != chatScanPending || streams != len(chatStreamKinds) {
+		t.Fatalf("upgraded chat = status:%q scan:%q streams:%d", status, scan, streams)
+	}
+}
+
 func TestQueueIndexedChatMediaKeepsNonDuplicateMembers(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tdl.db")
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(ON)")

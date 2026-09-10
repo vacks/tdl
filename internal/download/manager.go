@@ -333,8 +333,24 @@ CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_j
 	// media stream was introduced. Add the missing durable cursors without
 	// disturbing streams that have already completed.
 	for _, kind := range chatStreamKinds {
-		if _, err := m.db.Exec(`INSERT OR IGNORE INTO chat_download_streams(chat_job_id, stream_kind) SELECT id, ? FROM chat_download_jobs`, kind); err != nil {
+		result, err := m.db.Exec(`INSERT OR IGNORE INTO chat_download_streams(chat_job_id, stream_kind) SELECT id, ? FROM chat_download_jobs`, kind)
+		if err != nil {
 			return err
+		}
+		// Only a schema upgrade can insert a new stream for an already-complete
+		// chat. Queue that parent again so the newly supported media class is
+		// actually indexed; paused/cancelled/failed tasks retain their explicit
+		// user state and will pick it up on resume/retry instead.
+		if added, _ := result.RowsAffected(); added > 0 {
+			if _, err := m.db.Exec(`UPDATE chat_download_jobs
+ SET scan_state = ?, status = CASE WHEN status IN (?, ?, ?) THEN status ELSE ? END,
+     error = CASE WHEN status IN (?, ?, ?) THEN error ELSE '' END,
+     updated_at = ?
+ WHERE scan_state = ? AND id IN (
+   SELECT chat_job_id FROM chat_download_streams WHERE stream_kind = ? AND completed = 0
+ )`, chatScanPending, ChatStatusPaused, ChatStatusCancelled, ChatStatusFailed, ChatStatusQueued, ChatStatusPaused, ChatStatusCancelled, ChatStatusFailed, time.Now().UTC().Format(time.RFC3339Nano), chatScanCompleted, kind); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
