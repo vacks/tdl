@@ -99,10 +99,70 @@ type BotMessageRef struct {
 type source struct {
 	Item
 	DialogName string
+	MediaType  string
 }
 type directPeer struct {
 	kind     string
 	id, hash int64
+}
+
+const bytesPerMiB int64 = 1024 * 1024
+
+// filterSources applies the global download policy before any task or chat
+// index row is created. An empty allowed-type list and zero size limits mean
+// unrestricted, preserving the default behavior.
+func filterSources(sources []source, config settings.Download) []source {
+	allowed := make(map[string]struct{}, len(config.FileTypes))
+	for _, kind := range config.FileTypes {
+		allowed[kind] = struct{}{}
+	}
+	minBytes := config.MinFileSizeMB * bytesPerMiB
+	maxBytes := config.MaxFileSizeMB * bytesPerMiB
+	filtered := make([]source, 0, len(sources))
+	for _, item := range sources {
+		if minBytes > 0 && item.Size < minBytes {
+			continue
+		}
+		if maxBytes > 0 && item.Size > maxBytes {
+			continue
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[item.MediaType]; !ok {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func messageMediaType(message *tg.Message) string {
+	media, ok := message.GetMedia()
+	if !ok {
+		return "document"
+	}
+	switch value := media.(type) {
+	case *tg.MessageMediaPhoto:
+		return "image"
+	case *tg.MessageMediaDocument:
+		document, ok := value.Document.(*tg.Document)
+		if !ok {
+			return "document"
+		}
+		mime := strings.ToLower(document.MimeType)
+		switch {
+		case strings.HasPrefix(mime, "image/"):
+			return "image"
+		case strings.HasPrefix(mime, "video/"):
+			return "video"
+		case strings.HasPrefix(mime, "audio/"):
+			return "audio"
+		default:
+			return "document"
+		}
+	default:
+		return "document"
+	}
 }
 
 type Manager struct {
@@ -1170,7 +1230,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			if !ok {
 				continue
 			}
-			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: peer.VisibleName()})
+			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: peer.VisibleName(), MediaType: messageMediaType(msg)})
 		}
 		return nil
 	})
@@ -1203,7 +1263,7 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 			if !ok {
 				continue
 			}
-			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: dialogName})
+			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: dialogName, MediaType: messageMediaType(msg)})
 		}
 		return nil
 	})

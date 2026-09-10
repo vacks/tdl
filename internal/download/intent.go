@@ -135,8 +135,9 @@ func (m *Manager) Submit(ctx context.Context, intent DownloadIntent) (Submission
 	if err != nil {
 		return Submission{}, err
 	}
+	sources = filterSources(sources, m.settings.Get().Download)
 	if len(sources) == 0 {
-		return Submission{}, errors.New("消息中没有可下载的媒体")
+		return Submission{}, errors.New("消息中的媒体均不符合当前文件体积或类型筛选条件")
 	}
 	// A direct Telegram update may not have a public link. Keep a stable,
 	// non-public source value for audit and upstream resume bookkeeping rather

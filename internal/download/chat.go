@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
 
@@ -279,6 +281,16 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		return err
 	}
 	if target.Status == ChatStatusPaused || target.Status == ChatStatusCancelled {
+		return nil
+	}
+	var config settings.Download
+	if target.configJSON != "" {
+		if err := json.Unmarshal([]byte(target.configJSON), &config); err != nil {
+			return fmt.Errorf("会话下载配置快照无效: %w", err)
+		}
+	}
+	candidates = filterSources(candidates, config)
+	if len(candidates) == 0 {
 		return nil
 	}
 	newSources := make([]source, 0, len(candidates))
@@ -670,7 +682,7 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 				continue
 			}
 			groupedID, _ := message.GetGroupedID()
-			candidates = append(candidates, source{Item: Item{DialogType: target.DialogType, DialogKey: target.DialogKey, DialogID: target.DialogID, MessageID: message.ID, GroupedID: groupedID, MessageText: message.Message, OriginalName: media.Name, Size: media.Size}, DialogName: target.DialogName})
+			candidates = append(candidates, source{Item: Item{DialogType: target.DialogType, DialogKey: target.DialogKey, DialogID: target.DialogID, MessageID: message.ID, GroupedID: groupedID, MessageText: message.Message, OriginalName: media.Name, Size: media.Size}, DialogName: target.DialogName, MediaType: messageMediaType(message)})
 		}
 		if err := m.registerChatMedia(target.ID, candidates, false); err != nil {
 			return err

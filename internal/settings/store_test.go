@@ -31,3 +31,24 @@ func TestValidateFilenameTemplatesBeforeSaving(t *testing.T) {
 		t.Fatal("temporary template with an unknown variable was accepted")
 	}
 }
+
+func TestValidateDownloadFilters(t *testing.T) {
+	values := Defaults()
+	values.Download.MinFileSizeMB = 20
+	values.Download.MaxFileSizeMB = 10
+	if err := Validate(values); err == nil {
+		t.Fatal("inverted file size range was accepted")
+	}
+	values = Defaults()
+	values.Download.FileTypes = []string{"video", "unknown"}
+	if err := Validate(values); err == nil {
+		t.Fatal("unknown file type was accepted")
+	}
+	values = Defaults()
+	values.Download.MinFileSizeMB = 1
+	values.Download.MaxFileSizeMB = 100
+	values.Download.FileTypes = []string{"image", "audio"}
+	if err := Validate(values); err != nil {
+		t.Fatalf("valid filters rejected: %v", err)
+	}
+}

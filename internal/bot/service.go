@@ -1275,7 +1275,29 @@ func configText(cfg settings.Values) string {
 	if cfg.Reaction.Enabled {
 		reactionState = "已启用"
 	}
-	return fmt.Sprintf("<b>当前配置</b>\n代理：%s\n下载：线程 %d · 单任务文件并发 %d · 任务并发 %d · 连接池 %d · 间隔 %dms\nBot：%s\n表情监听：%s（%s）\n临时命名模板：<code>%s</code>\n最终命名模板：<code>%s</code>", html.EscapeString(proxy), cfg.Download.Threads, cfg.Download.TaskLimit, cfg.Download.ConcurrentJobs, cfg.Download.PoolSize, cfg.Download.DelayMS, botState, reactionState, html.EscapeString(strings.Join(cfg.Reaction.Emojis, " ")), html.EscapeString(short(cfg.Download.TempFilenameTemplate, 180)), html.EscapeString(short(cfg.Download.FinalFilenameTemplate, 180)))
+	return fmt.Sprintf("<b>当前配置</b>\n代理：%s\n下载：线程 %d · 单任务文件并发 %d · 任务并发 %d · 连接池 %d · 间隔 %dms\n文件筛选：%s\nBot：%s\n表情监听：%s（%s）\n临时命名模板：<code>%s</code>\n最终命名模板：<code>%s</code>", html.EscapeString(proxy), cfg.Download.Threads, cfg.Download.TaskLimit, cfg.Download.ConcurrentJobs, cfg.Download.PoolSize, cfg.Download.DelayMS, html.EscapeString(downloadFilterText(cfg.Download)), botState, reactionState, html.EscapeString(strings.Join(cfg.Reaction.Emojis, " ")), html.EscapeString(short(cfg.Download.TempFilenameTemplate, 180)), html.EscapeString(short(cfg.Download.FinalFilenameTemplate, 180)))
+}
+
+func downloadFilterText(cfg settings.Download) string {
+	parts := make([]string, 0, 3)
+	if cfg.MinFileSizeMB > 0 {
+		parts = append(parts, fmt.Sprintf("≥ %d MB", cfg.MinFileSizeMB))
+	}
+	if cfg.MaxFileSizeMB > 0 {
+		parts = append(parts, fmt.Sprintf("≤ %d MB", cfg.MaxFileSizeMB))
+	}
+	if len(cfg.FileTypes) > 0 {
+		names := map[string]string{"image": "图片", "video": "视频", "audio": "音频", "document": "文档"}
+		labels := make([]string, 0, len(cfg.FileTypes))
+		for _, kind := range cfg.FileTypes {
+			labels = append(labels, names[kind])
+		}
+		parts = append(parts, strings.Join(labels, "、"))
+	}
+	if len(parts) == 0 {
+		return "不限"
+	}
+	return strings.Join(parts, "；")
 }
 
 func safeProxyLabel(raw string) string {

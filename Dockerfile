@@ -16,7 +16,7 @@ COPY patches/tdl-progress-0.20.4.patch ./patches/tdl-progress-0.20.4.patch
 COPY patches/tdl-runtime-options-0.20.4.patch ./patches/tdl-runtime-options-0.20.4.patch
 RUN sh ./scripts/prepare-upstream-progress.sh && go mod download
 COPY . ./
-RUN go test ./internal/download ./internal/telegram
+RUN go test ./...
 COPY --from=frontend /src/web/dist ./internal/httpapi/static
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tdl ./cmd/tdl
 

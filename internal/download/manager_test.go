@@ -433,6 +433,22 @@ func TestChatSourceBatchesDoNotSplitAlbums(t *testing.T) {
 	}
 }
 
+func TestFilterSourcesAppliesSizeAndMediaType(t *testing.T) {
+	sources := []source{
+		{MediaType: "image", Item: Item{OriginalName: "small.jpg", Size: 512 * 1024}},
+		{MediaType: "video", Item: Item{OriginalName: "clip.mp4", Size: 2 * 1024 * 1024}},
+		{MediaType: "audio", Item: Item{OriginalName: "sound.ogg", Size: 2 * 1024 * 1024}},
+		{MediaType: "document", Item: Item{OriginalName: "archive.zip", Size: 4 * 1024 * 1024}},
+	}
+	filtered := filterSources(sources, settings.Download{MinFileSizeMB: 1, MaxFileSizeMB: 3, FileTypes: []string{"video", "audio"}})
+	if len(filtered) != 2 || filtered[0].MediaType != "video" || filtered[1].MediaType != "audio" {
+		t.Fatalf("filtered sources = %#v", filtered)
+	}
+	if got := filterSources(sources, settings.Download{}); len(got) != len(sources) {
+		t.Fatalf("unrestricted filter retained %d sources, want %d", len(got), len(sources))
+	}
+}
+
 func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tdl.db")
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(ON)")

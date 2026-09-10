@@ -26,6 +26,11 @@ type Download struct {
 	DelayMS               int    `json:"delayMs"`
 	TempFilenameTemplate  string `json:"tempFilenameTemplate"`
 	FinalFilenameTemplate string `json:"finalFilenameTemplate"`
+	// Zero means unrestricted. Values are stored in MiB so the Web and Bot can
+	// present them without exposing implementation-level byte counts.
+	MinFileSizeMB int64    `json:"minFileSizeMB"`
+	MaxFileSizeMB int64    `json:"maxFileSizeMB"`
+	FileTypes     []string `json:"fileTypes"`
 }
 
 type BotNotifications struct {
@@ -164,6 +169,19 @@ func Validate(values Values) error {
 	if d.DelayMS < 0 || d.DelayMS > 60000 {
 		return errors.New("下载间隔需在 0 至 60000 毫秒之间")
 	}
+	if d.MinFileSizeMB < 0 || d.MinFileSizeMB > 1048576 || d.MaxFileSizeMB < 0 || d.MaxFileSizeMB > 1048576 {
+		return errors.New("文件体积筛选需在 0 至 1048576 MB 之间")
+	}
+	if d.MinFileSizeMB > 0 && d.MaxFileSizeMB > 0 && d.MinFileSizeMB > d.MaxFileSizeMB {
+		return errors.New("最小文件体积不能大于最大文件体积")
+	}
+	for _, kind := range d.FileTypes {
+		switch kind {
+		case "image", "video", "audio", "document":
+		default:
+			return errors.New("文件类型筛选仅支持图片、视频、音频或文档")
+		}
+	}
 	if strings.TrimSpace(d.TempFilenameTemplate) == "" {
 		return errors.New("临时文件命名模板不能为空")
 	}
@@ -234,6 +252,20 @@ func normalizeDownload(download *Download) {
 	if download.ConcurrentJobs == 0 {
 		download.ConcurrentJobs = Defaults().Download.ConcurrentJobs
 	}
+	seen := make(map[string]struct{}, len(download.FileTypes))
+	types := make([]string, 0, len(download.FileTypes))
+	for _, kind := range download.FileTypes {
+		kind = strings.ToLower(strings.TrimSpace(kind))
+		if kind == "" {
+			continue
+		}
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		types = append(types, kind)
+	}
+	download.FileTypes = types
 }
 
 func normalizeCleanup(cleanup *Cleanup) {

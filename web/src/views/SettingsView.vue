@@ -6,14 +6,14 @@ import { api } from '@/api'
 
 type Settings = {
   proxyUrl: string
-  download: { threads: number; taskLimit: number; concurrentJobs: number; poolSize: number; delayMs: number; tempFilenameTemplate: string; finalFilenameTemplate: string }
+  download: { threads: number; taskLimit: number; concurrentJobs: number; poolSize: number; delayMs: number; tempFilenameTemplate: string; finalFilenameTemplate: string; minFileSizeMB: number; maxFileSizeMB: number; fileTypes: string[] }
   bot: { enabled: boolean; token: string; controlUserIds: number[]; notifications: { taskCreated: boolean; taskCompleted: boolean; taskPartial: boolean; taskFailed: boolean } }
   reaction: { enabled: boolean; emojis: string[] }
   cleanup: { retentionDays: number }
 }
 type ConfigResponse = { settings: Settings; downloadDir: string; upstreamVersion: string }
 const router = useRouter()
-const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, tempFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}', finalFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ if .MessageText }}{{ .MessageText }}_{{ end }}{{ .FileName }}' }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] }, cleanup: { retentionDays: 90 } })
+const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, tempFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}', finalFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ if .MessageText }}{{ .MessageText }}_{{ end }}{{ .FileName }}', minFileSizeMB: 0, maxFileSizeMB: 0, fileTypes: [] }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] }, cleanup: { retentionDays: 90 } })
 const downloadDir = ref('')
 const saving = ref(false)
 const userIDs = ref<string[]>([])
@@ -75,6 +75,11 @@ onMounted(async () => { try { const session = await api<{ authenticated: boolean
             <ul><li><code>.DialogID</code>：Telegram 对话 ID</li><li><code>.DialogName</code>：对话显示名称</li><li><code>.MessageID</code>：媒体所在消息 ID</li><li><code>.GroupedID</code>：Telegram 媒体组 ID；非媒体组消息为 <code>0</code></li><li><code>.MessageText</code>：按 Telegram 客户端显示逻辑取得的消息正文</li><li><code>.FileName</code>：Telegram 媒体原始文件名</li><li><code>.FileExt</code>：从原始文件名提取的扩展名，包含点，例如 <code>.mp4</code></li><li><code>.DownloadDate</code>：生成最终路径时的当前 Unix 时间戳（秒），可写成 <code>formatDate .DownloadDate "2006-01-02"</code> 取得指定格式的日期</li></ul>
             <p v-pre><strong>条件语法 <code>if</code>：</strong><code>{{ if .MessageText }}{{ .MessageText }}_{{ end }}</code> 是一个完整区块：消息正文不为空时输出“正文和下划线”，为空时整段不输出。也可写成 <code>{{ if .MessageText }}有正文{{ else }}无正文{{ end }}</code>。</p>
           </div>
+	  <el-divider />
+	  <el-form-item label="文件体积筛选"><div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center"><span>最小</span><el-input-number v-model="form.download.minFileSizeMB" :min="0" :max="1048576" /><span>MB</span><span>最大</span><el-input-number v-model="form.download.maxFileSizeMB" :min="0" :max="1048576" /><span>MB</span></div></el-form-item>
+	  <p class="field-help">设为 0 表示不限制；最小值以下或最大值以上的文件不会创建下载任务。筛选会在解析消息和会话历史时生效。</p>
+	  <el-form-item label="文件类型筛选"><el-checkbox-group v-model="form.download.fileTypes"><el-checkbox label="image">图片</el-checkbox><el-checkbox label="video">视频</el-checkbox><el-checkbox label="audio">音频</el-checkbox><el-checkbox label="document">文档</el-checkbox></el-checkbox-group></el-form-item>
+	  <p class="field-help">不勾选表示下载全部类型；勾选后仅下载选中的类型。语音消息归入音频，圆形视频归入视频。</p>
         </el-form></el-card>
         <el-card shadow="never" class="settings-card"><template #header><strong>历史数据清理</strong></template><el-form label-position="top" @submit.prevent><el-form-item label="历史保留天数"><el-input-number v-model="form.cleanup.retentionDays" :min="1" :max="3650" /></el-form-item><p class="field-help">清理完成、失败、部分完成或已取消的任务记录，以及对应请求、状态事件和表情收件箱历史；不会删除已下载的最终文件。保存后策略生效，可随时立即执行一次清理。</p><el-button @click="cleanupNow">立即清理</el-button></el-form></el-card>
       </el-main>
