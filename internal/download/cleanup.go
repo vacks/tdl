@@ -161,7 +161,15 @@ func (m *Manager) cleanupJobsBatch(cutoff string) (CleanupResult, error) {
 		return CleanupResult{}, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT id FROM download_jobs WHERE status IN ('completed', 'failed', 'partial', 'cancelled') AND updated_at < ? ORDER BY updated_at, id LIMIT ?`, cutoff, cleanupBatchSize)
+	// A normal job can be attached to one or more chat histories through global
+	// message de-duplication.  Keep it until the chat cleanup pass decides
+	// whether every referencing parent has expired; otherwise the retained chat
+	// would be left pointing at a missing child and lose its progress state.
+	rows, err := tx.Query(`SELECT j.id FROM download_jobs j
+ WHERE j.status IN ('completed', 'failed', 'partial', 'cancelled')
+   AND j.updated_at < ?
+   AND NOT EXISTS (SELECT 1 FROM chat_download_items i WHERE i.child_job_id = j.id)
+ ORDER BY j.updated_at, j.id LIMIT ?`, cutoff, cleanupBatchSize)
 	if err != nil {
 		return CleanupResult{}, err
 	}

@@ -273,6 +273,54 @@ func TestChatControlsPropagateToOwnedDownloadJobs(t *testing.T) {
 	assertTaskStatuses(t, db, "downloading", "queued")
 }
 
+func TestCleanupHistoryPreservesChildReferencedByRetainedChat(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339Nano)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, job := range []struct{ id, stamp string }{{"chat-old", old}, {"chat-kept", now}} {
+		if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES (?, 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'completed', 'completed', ?, ?)`, job.id, job.stamp, job.stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, parent_chat_id, created_at, updated_at) VALUES ('shared-child', 'tg://chat/chat-old/1', 'completed', 'chat-old', ?, ?)`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('shared-child', 'channel', 'channel:9', 9, 1, 'file.bin', 'completed')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"chat-old", "chat-kept"} {
+		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, discovered_at) VALUES (?, 'channel:9', 1, 'shared-child', ?)`, id, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := m.CleanupHistory(1)
+	if err != nil {
+		t.Fatalf("CleanupHistory(): %v", err)
+	}
+	if result.ChatJobs != 1 {
+		t.Fatalf("cleaned chat jobs = %d, want 1", result.ChatJobs)
+	}
+	var child, linked int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE id = 'shared-child'`).Scan(&child); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = 'chat-kept' AND child_job_id = 'shared-child'`).Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	if child != 1 || linked != 1 {
+		t.Fatalf("shared child was cleaned: child=%d linked=%d", child, linked)
+	}
+}
+
 func assertTaskStatuses(t *testing.T, db *sql.DB, wantChat, wantChild string) {
 	t.Helper()
 	var chat, child string
