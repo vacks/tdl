@@ -72,6 +72,14 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 	if job.DialogKey == "" || job.AccountID == "" || job.UpperMessageID < job.StartMessageID {
 		return ChatJob{}, errors.New("会话下载目标不完整")
 	}
+	var existing string
+	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND start_message_id = ? AND status IN (?, ?, ?, ?, ?) LIMIT 1`, job.AccountID, job.DialogKey, job.StartMessageID, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&existing)
+	if err == nil {
+		return ChatJob{}, errors.New("该会话下载任务已存在，请在会话下载列表中管理")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return ChatJob{}, err
+	}
 	id, err := randomID()
 	if err != nil {
 		return ChatJob{}, err
@@ -288,31 +296,14 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		m.touch()
 		return nil
 	}
-	input := target.inputPeer()
-	if input == nil {
+	if target.inputPeer() == nil {
 		return errors.New("会话下载任务缺少 Telegram 会话引用")
 	}
 	// Bound batches keep upstream's iterator and resume metadata small while
 	// avoiding one visible task per media file. Grouped albums are collapsed by
 	// the scanner before reaching this point.
-	for start := 0; start < len(newSources); start += 64 {
-		end := start + 64
-		if end > len(newSources) {
-			end = len(newSources)
-		}
-		batch := newSources[start:end]
-		intent := DownloadIntent{Source: SourceAPI, AccountID: target.AccountID, URL: fmt.Sprintf("tg://chat/%s/%d", chatID, batch[0].MessageID)}
-		submission, err := m.enqueueIntentParentSnapshot(intent, batch, target.direct, chatID, targetConfigJSON(target))
-		if err != nil {
-			return err
-		}
-		if !submission.Created {
-			// A concurrent manual/reaction request won the global media identity.
-			// Relate every already-existing message; remaining media will be found
-			// again by the durable scan cursor rather than being silently dropped.
-			continue
-		}
-		if _, err := m.db.Exec(`UPDATE chat_download_items SET child_job_id = ? WHERE chat_job_id = ? AND child_job_id = '' AND dialog_key = ? AND message_id IN (`+chatPlaceholders(len(batch))+`)`, append([]any{submission.Job.ID, chatID, batch[0].DialogKey}, messageIDs(batch)...)...); err != nil {
+	for _, batch := range chatSourceBatches(newSources, 64) {
+		if err := m.enqueueChatBatch(target, chatID, batch); err != nil {
 			return err
 		}
 	}
@@ -462,6 +453,15 @@ func (m *Manager) scanOneChat() error {
 		m.touch()
 		return err
 	}
+	current, err := m.chatTarget(id)
+	if err != nil {
+		return err
+	}
+	if current.Status != ChatStatusScanning {
+		// Pause/cancel may race the network request. Do not enqueue the
+		// remaining indexed media after the parent has stopped accepting work.
+		return nil
+	}
 	if err := m.queueIndexedChatMedia(id); err != nil {
 		_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, ChatStatusFailed, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id)
 		m.touch()
@@ -502,26 +502,105 @@ func (m *Manager) queueIndexedChatMedia(chatID string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for start := 0; start < len(candidates); start += 64 {
-		end := start + 64
-		if end > len(candidates) {
-			end = len(candidates)
-		}
-		batch := candidates[start:end]
-		intent := DownloadIntent{Source: SourceAPI, AccountID: target.AccountID, URL: fmt.Sprintf("tg://chat/%s/%d", chatID, batch[0].MessageID)}
-		submission, err := m.enqueueIntentParentSnapshot(intent, batch, target.direct, chatID, targetConfigJSON(target))
-		if err != nil {
-			return err
-		}
-		if !submission.Created {
-			continue
-		}
-		args := append([]any{submission.Job.ID, chatID, batch[0].DialogKey}, messageIDs(batch)...)
-		if _, err := m.db.Exec(`UPDATE chat_download_items SET child_job_id = ? WHERE chat_job_id = ? AND child_job_id = '' AND dialog_key = ? AND message_id IN (`+chatPlaceholders(len(batch))+`)`, args...); err != nil {
+	for _, batch := range chatSourceBatches(candidates, 64) {
+		if err := m.enqueueChatBatch(target, chatID, batch); err != nil {
 			return err
 		}
 	}
 	m.signal()
+	return nil
+}
+
+// chatSourceBatches keeps every Telegram album in exactly one upstream
+// invocation. The upstream downloader expands grouped media itself; splitting
+// an album across two 64-item batches would otherwise request it twice.
+func chatSourceBatches(items []source, limit int) [][]source {
+	if limit < 1 {
+		limit = 64
+	}
+	batches := make([][]source, 0, (len(items)+limit-1)/limit)
+	current := make([]source, 0, limit)
+	for index := 0; index < len(items); {
+		end := index + 1
+		if group := items[index].GroupedID; group != 0 {
+			for end < len(items) && items[end].GroupedID == group {
+				end++
+			}
+		}
+		group := items[index:end]
+		if len(current) > 0 && len(current)+len(group) > limit {
+			batches = append(batches, current)
+			current = make([]source, 0, limit)
+		}
+		current = append(current, group...)
+		index = end
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
+}
+
+// enqueueChatBatch never silently drops the non-conflicting members of a
+// batch when another entry point (Web, Bot or a reaction) wins one media
+// identity concurrently. A duplicate batch is reconciled and any still
+// unmapped media is retried individually, preserving global message de-dupe.
+func (m *Manager) enqueueChatBatch(target storedChatTarget, chatID string, batch []source) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	intent := DownloadIntent{Source: SourceAPI, AccountID: target.AccountID, URL: fmt.Sprintf("tg://chat/%s/%d", chatID, batch[0].MessageID)}
+	submission, err := m.enqueueIntentParentSnapshot(intent, batch, target.direct, chatID, targetConfigJSON(target))
+	if err != nil {
+		return err
+	}
+	if submission.Created {
+		return m.linkChatItems(chatID, submission.Job.ID, batch)
+	}
+	remaining := make([]source, 0, len(batch))
+	for _, item := range batch {
+		var jobID string
+		err := m.db.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&jobID)
+		if err == nil && jobID != "" {
+			if err := m.linkChatItems(chatID, jobID, []source{item}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		remaining = append(remaining, item)
+	}
+	for _, item := range remaining {
+		oneIntent := DownloadIntent{Source: SourceAPI, AccountID: target.AccountID, URL: fmt.Sprintf("tg://chat/%s/%d", chatID, item.MessageID)}
+		one, err := m.enqueueIntentParentSnapshot(oneIntent, []source{item}, target.direct, chatID, targetConfigJSON(target))
+		if err != nil {
+			return err
+		}
+		if one.Created {
+			if err := m.linkChatItems(chatID, one.Job.ID, []source{item}); err != nil {
+				return err
+			}
+			continue
+		}
+		var jobID string
+		if err := m.db.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&jobID); err != nil || jobID == "" {
+			return errors.New("并发去重后无法关联会话媒体")
+		}
+		if err := m.linkChatItems(chatID, jobID, []source{item}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) linkChatItems(chatID, childID string, items []source) error {
+	for _, item := range items {
+		if _, err := m.db.Exec(`UPDATE chat_download_items SET child_job_id = ? WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND child_job_id = ''`, childID, chatID, item.DialogKey, item.MessageID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -628,10 +707,10 @@ func (m *Manager) refreshChatStates() {
 		next := ChatStatusCompleted
 		if active > 0 {
 			next = ChatStatusDownloading
-		} else if failed > 0 {
-			next = ChatStatusPartial
 		} else if listen != 0 {
 			next = ChatStatusListening
+		} else if failed > 0 {
+			next = ChatStatusPartial
 		}
 		if next != status {
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id)
@@ -694,7 +773,7 @@ func (m *Manager) RetryChat(id string) error {
 	if err != nil {
 		return err
 	}
-	if target.Status != ChatStatusFailed && target.Status != ChatStatusPartial && target.Status != ChatStatusCancelled && target.Status != ChatStatusCompleted {
+	if target.Status != ChatStatusFailed && target.Status != ChatStatusPartial && target.Status != ChatStatusCancelled && target.Status != ChatStatusListening {
 		return errors.New("当前会话任务不能重新开始")
 	}
 	next := ChatStatusQueued
@@ -791,20 +870,4 @@ func (m *Manager) IsChatChild(jobID string) bool {
 		return false
 	}
 	return parent != ""
-}
-
-func chatPlaceholders(count int) string {
-	parts := make([]string, count)
-	for index := range parts {
-		parts[index] = "?"
-	}
-	return strings.Join(parts, ",")
-}
-
-func messageIDs(items []source) []any {
-	values := make([]any, 0, len(items))
-	for _, item := range items {
-		values = append(values, item.MessageID)
-	}
-	return values
 }

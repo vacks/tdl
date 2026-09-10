@@ -51,6 +51,7 @@ type Service struct {
 	token       string
 	known       map[string]string
 	tracked     map[string]trackedRef
+	chatTracked map[string]chatTrackedRef
 	// lifecycle keeps the one notification card for a job in each authorized
 	// chat. The card is edited as the job advances instead of sending a new
 	// Bot message for every state transition.
@@ -88,6 +89,11 @@ type trackedRef struct {
 	JobID string
 	messageRef
 }
+type chatTrackedRef struct {
+	JobID string
+	Page  int
+	messageRef
+}
 type helpRetry struct {
 	next     time.Time
 	attempts int
@@ -95,7 +101,7 @@ type helpRetry struct {
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -154,6 +160,7 @@ func (s *Service) loop() {
 				s.offset = 0
 			}
 			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[int64]int{}, time.Time{}
+			s.chatTracked = map[string]chatTrackedRef{}
 			commandsChanged = true
 		}
 		s.mu.Unlock()
@@ -620,7 +627,10 @@ func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
 		return
 	}
 	applog.Info("bot", "chat_task_created", "user_id", msg.From.ID, "chat_job_id", job.ID)
-	s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, 1))
+	messageID, err := s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, 1))
+	if err == nil && active(job.Status) {
+		s.trackChat(job.ID, 1, messageRef{ChatID: msg.Chat.ID, MessageID: messageID})
+	}
 }
 
 func (s *Service) sendChatList(cfg settings.Bot, chatID int64, page int) {
@@ -690,6 +700,7 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 			s.answer(cfg.Token, query.ID, "页码无效")
 			return
 		}
+		s.untrackChatMessage(query.Message.Chat.ID, query.Message.MessageID)
 		s.editChatList(cfg, query.Message.Chat.ID, query.Message.MessageID, page)
 		s.answer(cfg.Token, query.ID, "")
 		return
@@ -732,6 +743,7 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 	}
 	s.answer(cfg.Token, query.ID, "操作成功")
 	if action == "delete" {
+		s.untrackChatMessage(query.Message.Chat.ID, query.Message.MessageID)
 		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, "会话任务已删除。", [][]button{{{Text: "返回会话列表", CallbackData: "c:l:1"}}})
 		return
 	}
@@ -745,6 +757,9 @@ func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id str
 		return
 	}
 	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, page))
+	if active(job.Status) {
+		s.trackChat(job.ID, page, messageRef{ChatID: chatID, MessageID: messageID})
+	}
 }
 
 func chatTaskText(job download.ChatJob) string {
@@ -776,7 +791,7 @@ func chatTaskKeyboard(job download.ChatJob, page int) [][]button {
 	if job.Status == "paused" {
 		buttons = append(buttons, []button{{Text: "恢复", CallbackData: fmt.Sprintf("c:t:%s:resume:%d", job.ID, page)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel:%d", job.ID, page)}})
 	}
-	if job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" || job.Status == "completed" {
+	if job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" || job.Failed > 0 {
 		buttons = append(buttons, []button{{Text: "重新开始", CallbackData: fmt.Sprintf("c:t:%s:retry:%d", job.ID, page)}, {Text: "删除", CallbackData: fmt.Sprintf("c:t:%s:delete:%d", job.ID, page)}})
 	}
 	buttons = append(buttons, []button{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}})
@@ -812,6 +827,12 @@ func (s *Service) editTask(cfg settings.Bot, chatID, messageID int64, id string,
 
 func (s *Service) refresh(cfg settings.Bot) {
 	ids, tracked := s.refreshIDs()
+	s.mu.Lock()
+	chatTracked := make(map[string]chatTrackedRef, len(s.chatTracked))
+	for key, ref := range s.chatTracked {
+		chatTracked[key] = ref
+	}
+	s.mu.Unlock()
 	for _, id := range ids {
 		job, err := s.downloads.Get(id)
 		if err != nil {
@@ -857,6 +878,23 @@ func (s *Service) refresh(cfg settings.Bot) {
 			s.untrack(key)
 		}
 	}
+	// A viewed chat card is refreshed at the same restrained cadence as an
+	// ordinary task card. It is not a lifecycle notification, so it stops once
+	// the history has settled and no new-media listener remains active.
+	for key, ref := range chatTracked {
+		job, err := s.downloads.GetChat(ref.JobID)
+		if err != nil {
+			s.untrackChat(key)
+			continue
+		}
+		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, chatTaskText(job), chatTaskKeyboard(job, ref.Page)) {
+			s.untrackChat(key)
+			continue
+		}
+		if !active(job.Status) {
+			s.untrackChat(key)
+		}
+	}
 }
 
 func (s *Service) refreshIDs() ([]string, map[string]trackedRef) {
@@ -895,6 +933,22 @@ func (s *Service) untrackMessage(chatID, messageID int64) {
 	for key, ref := range s.tracked {
 		if ref.ChatID == chatID && ref.MessageID == messageID {
 			delete(s.tracked, key)
+		}
+	}
+}
+
+func (s *Service) trackChat(id string, page int, ref messageRef) {
+	s.mu.Lock()
+	s.chatTracked[id+":"+fmt.Sprint(ref.ChatID)] = chatTrackedRef{JobID: id, Page: page, messageRef: ref}
+	s.mu.Unlock()
+}
+func (s *Service) untrackChat(key string) { s.mu.Lock(); delete(s.chatTracked, key); s.mu.Unlock() }
+func (s *Service) untrackChatMessage(chatID, messageID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, ref := range s.chatTracked {
+		if ref.ChatID == chatID && ref.MessageID == messageID {
+			delete(s.chatTracked, key)
 		}
 	}
 }
@@ -1406,7 +1460,10 @@ func (s *Service) send(token string, chatID int64, text string, keyboard [][]but
 
 // edit returns true only when Telegram confirms that the message no longer exists.
 func (s *Service) edit(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
-	var result apiResponse[bool]
+	// editMessageText returns a Message object for normal chat messages, not a
+	// boolean. Keep the result opaque: only the API's OK/description fields are
+	// relevant here and decoding it as bool makes every successful edit fail.
+	var result apiResponse[json.RawMessage]
 	payload := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true}
 	if keyboard != nil {
 		payload["reply_markup"] = map[string]any{"inline_keyboard": keyboard}
@@ -1434,7 +1491,7 @@ func isMissingMessage(description string) bool {
 }
 
 func (s *Service) clearKeyboard(token string, chatID, messageID int64) {
-	var result apiResponse[bool]
+	var result apiResponse[json.RawMessage]
 	payload := map[string]any{
 		"chat_id": chatID, "message_id": messageID,
 		"reply_markup": map[string]any{"inline_keyboard": [][]button{}},

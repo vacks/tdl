@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS chat_download_streams (
 );
 CREATE INDEX IF NOT EXISTS chat_download_jobs_scan ON chat_download_jobs(status, scan_state, created_at);
 CREATE INDEX IF NOT EXISTS chat_download_jobs_listener ON chat_download_jobs(account_id, dialog_key, listen_new, scan_state, status);
+CREATE INDEX IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status);
 CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_job_id);`)
 	if err != nil {
 		return err

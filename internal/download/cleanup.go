@@ -13,6 +13,7 @@ const cleanupBatchSize = 1000
 
 type CleanupResult struct {
 	Jobs           int64 `json:"jobs"`
+	ChatJobs       int64 `json:"chatJobs"`
 	Requests       int64 `json:"requests"`
 	Events         int64 `json:"events"`
 	ReactionEvents int64 `json:"reactionEvents"`
@@ -51,6 +52,16 @@ func (m *Manager) CleanupHistory(retentionDays int) (CleanupResult, error) {
 		}
 	}
 	for {
+		count, err := m.cleanupChatJobsBatch(cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.ChatJobs += count
+		if count == 0 {
+			break
+		}
+	}
+	for {
 		count, err := m.cleanupSimpleBatch(`SELECT id FROM reaction_inbox WHERE status IN ('done', 'failed') AND updated_at < ? ORDER BY id LIMIT ?`, `DELETE FROM reaction_inbox WHERE id IN (%s)`, cutoff)
 		if err != nil {
 			return CleanupResult{}, err
@@ -70,10 +81,83 @@ func (m *Manager) CleanupHistory(retentionDays int) (CleanupResult, error) {
 			break
 		}
 	}
-	if result.Jobs > 0 || result.Requests > 0 || result.Events > 0 || result.ReactionEvents > 0 {
+	if result.Jobs > 0 || result.ChatJobs > 0 || result.Requests > 0 || result.Events > 0 || result.ReactionEvents > 0 {
 		m.touch()
 	}
 	return result, nil
+}
+
+// cleanupChatJobsBatch removes a terminal chat parent together with its
+// hidden child download jobs. It is deliberately separate from the normal
+// task cleanup so an indexed conversation cannot leave millions of orphaned
+// chat_download_items behind after its retention period expires.
+func (m *Manager) cleanupChatJobsBatch(cutoff string) (int64, error) {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id FROM chat_download_jobs WHERE status IN ('completed', 'failed', 'partial', 'cancelled') AND updated_at < ? ORDER BY updated_at, id LIMIT ?`, cutoff, cleanupBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	chatIDs := make([]string, 0, cleanupBatchSize)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		chatIDs = append(chatIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(chatIDs) == 0 {
+		return 0, nil
+	}
+	marks, args := placeholders(chatIDs)
+	childRows, err := tx.Query(`SELECT id FROM download_jobs WHERE parent_chat_id IN (`+marks+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	childIDs := make([]string, 0)
+	for childRows.Next() {
+		var id string
+		if err := childRows.Scan(&id); err != nil {
+			_ = childRows.Close()
+			return 0, err
+		}
+		childIDs = append(childIDs, id)
+	}
+	if err := childRows.Close(); err != nil {
+		return 0, err
+	}
+	if len(childIDs) > 0 {
+		childMarks, childArgs := placeholders(childIDs)
+		if _, err := tx.Exec(`DELETE FROM download_events WHERE job_id IN (`+childMarks+`)`, childArgs...); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM download_requests WHERE job_id IN (`+childMarks+`)`, childArgs...); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM bot_lifecycle_messages WHERE job_id IN (`+childMarks+`)`, childArgs...); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM download_items WHERE job_id IN (`+childMarks+`)`, childArgs...); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM download_jobs WHERE id IN (`+childMarks+`)`, childArgs...); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id IN (`+marks+`)`, args...); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(chatIDs)), nil
 }
 
 // cleanupJobsBatch holds SQLite's write lock only while deleting a bounded

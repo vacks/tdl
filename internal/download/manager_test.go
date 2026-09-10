@@ -112,6 +112,97 @@ func TestChatJobsAreStoredSeparatelyFromMessageJobs(t *testing.T) {
 	if got.UpperMessageID != 99 || got.DialogKey != "channel:42" {
 		t.Fatalf("GetChat() = %#v", got)
 	}
+	if _, err := m.createChatJob(ChatJob{SourceURL: "https://t.me/example", DialogType: "channel", DialogKey: "channel:42", DialogID: 42, DialogName: "示例频道", AccountID: "account-a", UpperMessageID: 100, ListenNew: true}, directPeer{kind: "channel", id: 42, hash: 7}, "{}"); err == nil {
+		t.Fatal("duplicate active chat job was accepted")
+	}
+}
+
+func TestQueueIndexedChatMediaKeepsNonDuplicateMembers(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tdl.db")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{db: db, settings: store, wake: make(chan struct{}, 1), events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	chat, err := m.createChatJob(ChatJob{SourceURL: "https://t.me/example", DialogType: "channel", DialogKey: "channel:42", DialogID: 42, DialogName: "示例频道", AccountID: "account-a", UpperMessageID: 20}, directPeer{kind: "channel", id: 42, hash: 7}, "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := source{DialogName: "示例频道", Item: Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 10, OriginalName: "old.bin"}}
+	if _, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account-a", URL: "https://t.me/example/10"}, []source{existing}, directPeer{kind: "channel", id: 42, hash: 7}); err != nil {
+		t.Fatal(err)
+	}
+	newItem := source{DialogName: "示例频道", Item: Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 11, OriginalName: "new.bin"}}
+	for _, item := range []source{existing, newItem} {
+		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, original_name, discovered_at) VALUES (?, ?, ?, ?, ?, ?, 'now')`, chat.ID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.OriginalName); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.queueIndexedChatMedia(chat.ID); err != nil {
+		t.Fatal(err)
+	}
+	var linked int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = ? AND child_job_id != ''`, chat.ID).Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	if linked != 2 {
+		t.Fatalf("linked items = %d, want 2", linked)
+	}
+}
+
+func TestCleanupHistoryRemovesTerminalChatIndexes(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES ('chat-old', 'tg://chat', 'channel', 'channel:9', 9, '旧频道', 'account-a', 0, 10, 'completed', 'completed', ?, ?)`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, discovered_at) VALUES ('chat-old', 'channel:9', 1, ?)`, old); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.CleanupHistory(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ChatJobs != 1 {
+		t.Fatalf("chat jobs = %d, want 1", result.ChatJobs)
+	}
+	var remaining int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_jobs`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining chat jobs = %d, want 0", remaining)
+	}
+}
+
+func TestChatSourceBatchesDoNotSplitAlbums(t *testing.T) {
+	items := []source{
+		{Item: Item{MessageID: 1}},
+		{Item: Item{MessageID: 2, GroupedID: 9}},
+		{Item: Item{MessageID: 3, GroupedID: 9}},
+		{Item: Item{MessageID: 4, GroupedID: 9}},
+		{Item: Item{MessageID: 5}},
+	}
+	batches := chatSourceBatches(items, 3)
+	if len(batches) != 3 || len(batches[0]) != 1 || len(batches[1]) != 3 || len(batches[2]) != 1 {
+		t.Fatalf("batches = %#v", batches)
+	}
 }
 
 func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
