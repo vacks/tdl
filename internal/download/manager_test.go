@@ -321,6 +321,49 @@ func TestCleanupHistoryPreservesChildReferencedByRetainedChat(t *testing.T) {
 	}
 }
 
+func TestCleanupHistoryCollectsStandaloneJobAfterChatReferenceExpires(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES ('chat-old', 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'completed', 'completed', ?, ?)`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// This represents a pre-existing manual download linked to the chat by
+	// de-duplication. It has no parent_chat_id and must be collected only
+	// after the expired chat index row is gone.
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, account_id, status, created_at, updated_at) VALUES ('manual', 'https://t.me/example/1', 'account-a', 'completed', ?, ?)`, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('manual', 'channel', 'channel:9', 9, 1, 'file.bin', 'completed')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, discovered_at) VALUES ('chat-old', 'channel:9', 1, 'manual', ?)`, old); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.CleanupHistory(1)
+	if err != nil {
+		t.Fatalf("CleanupHistory(): %v", err)
+	}
+	if result.ChatJobs != 1 || result.Jobs != 1 {
+		t.Fatalf("cleanup result = %#v, want one chat and one normal job", result)
+	}
+	var remaining int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE id = 'manual'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("standalone job remained after its chat reference expired: %d", remaining)
+	}
+}
+
 func assertTaskStatuses(t *testing.T, db *sql.DB, wantChat, wantChild string) {
 	t.Helper()
 	var chat, child string

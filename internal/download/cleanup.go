@@ -40,6 +40,16 @@ func (m *Manager) CleanupHistory(retentionDays int) (CleanupResult, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339Nano)
 	result := CleanupResult{}
 	for {
+		count, err := m.cleanupChatJobsBatch(cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.ChatJobs += count
+		if count == 0 {
+			break
+		}
+	}
+	for {
 		batch, err := m.cleanupJobsBatch(cutoff)
 		if err != nil {
 			return CleanupResult{}, err
@@ -48,16 +58,6 @@ func (m *Manager) CleanupHistory(retentionDays int) (CleanupResult, error) {
 		result.Requests += batch.Requests
 		result.Events += batch.Events
 		if batch.Jobs == 0 {
-			break
-		}
-	}
-	for {
-		count, err := m.cleanupChatJobsBatch(cutoff)
-		if err != nil {
-			return CleanupResult{}, err
-		}
-		result.ChatJobs += count
-		if count == 0 {
 			break
 		}
 	}
