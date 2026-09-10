@@ -234,6 +234,59 @@ func TestDeleteChatPreservesChildReferencedByAnotherChat(t *testing.T) {
 	}
 }
 
+func TestChatControlsPropagateToOwnedDownloadJobs(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES ('chat', 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'downloading', 'completed', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, account_id, status, parent_chat_id, created_at, updated_at) VALUES ('child', 'tg://chat/chat/1', 'account-a', 'queued', 'chat', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('child', 'channel', 'channel:9', 9, 1, 'file.bin', 'queued')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PauseChat("chat"); err != nil {
+		t.Fatalf("PauseChat(): %v", err)
+	}
+	assertTaskStatuses(t, db, "paused", "paused")
+	if err := m.ResumeChat("chat"); err != nil {
+		t.Fatalf("ResumeChat(): %v", err)
+	}
+	assertTaskStatuses(t, db, "downloading", "queued")
+	if err := m.CancelChat("chat"); err != nil {
+		t.Fatalf("CancelChat(): %v", err)
+	}
+	assertTaskStatuses(t, db, "cancelled", "cancelled")
+	if err := m.RetryChat("chat"); err != nil {
+		t.Fatalf("RetryChat(): %v", err)
+	}
+	assertTaskStatuses(t, db, "downloading", "queued")
+}
+
+func assertTaskStatuses(t *testing.T, db *sql.DB, wantChat, wantChild string) {
+	t.Helper()
+	var chat, child string
+	if err := db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = 'chat'`).Scan(&chat); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM download_jobs WHERE id = 'child'`).Scan(&child); err != nil {
+		t.Fatal(err)
+	}
+	if chat != wantChat || child != wantChild {
+		t.Fatalf("statuses = chat:%q child:%q, want chat:%q child:%q", chat, child, wantChat, wantChild)
+	}
+}
+
 func TestChatSourceBatchesDoNotSplitAlbums(t *testing.T) {
 	items := []source{
 		{Item: Item{MessageID: 1}},
