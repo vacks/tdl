@@ -329,6 +329,14 @@ CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_j
 	if err := m.migrateItemIdentity(); err != nil {
 		return err
 	}
+	// Existing databases may already contain chat jobs created before a new
+	// media stream was introduced. Add the missing durable cursors without
+	// disturbing streams that have already completed.
+	for _, kind := range chatStreamKinds {
+		if _, err := m.db.Exec(`INSERT OR IGNORE INTO chat_download_streams(chat_job_id, stream_kind) SELECT id, ? FROM chat_download_jobs`, kind); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

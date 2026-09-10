@@ -62,6 +62,12 @@ const (
 	chatScanCompleted = "completed"
 )
 
+// Telegram exposes the media gallery as separate server-side filters. These
+// four streams cover ordinary photos/videos, files, music, and the special
+// voice/round-video class. Every result still enters the same message-ID
+// index, so a server-side filter overlap can never create a duplicate file.
+var chatStreamKinds = []string{"photo_video", "document", "music", "round_voice"}
+
 // createChatJob persists only a resolved and bounded chat target. Discovery
 // workers are attached in a later layer; keeping creation transactional lets
 // callers safely retry an interrupted HTTP/Bot request without partial rows.
@@ -94,7 +100,7 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 	if _, err := tx.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, start_message_id, upper_message_id, listen_new, status, scan_state, error, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`, job.ID, job.SourceURL, job.DialogType, job.DialogKey, job.DialogID, job.DialogName, job.AccountID, direct.kind, direct.id, direct.hash, job.StartMessageID, job.UpperMessageID, boolInt(job.ListenNew), job.Status, job.ScanState, configJSON, now, now); err != nil {
 		return ChatJob{}, err
 	}
-	for _, kind := range []string{"photo_video", "document"} {
+	for _, kind := range chatStreamKinds {
 		if _, err := tx.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind) VALUES (?, ?)`, job.ID, kind); err != nil {
 			return ChatJob{}, err
 		}
@@ -449,7 +455,7 @@ func (m *Manager) scanOneChat() error {
 		return err
 	}
 	err = m.accounts.Run(context.Background(), target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
-		for _, kind := range []string{"photo_video", "document"} {
+		for _, kind := range chatStreamKinds {
 			if err := m.scanChatStream(ctx, client, target, kind); err != nil {
 				return err
 			}
@@ -624,9 +630,9 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 	if completed != 0 {
 		return nil
 	}
-	filter := tg.MessagesFilterClass(&tg.InputMessagesFilterPhotoVideo{})
-	if kind == "document" {
-		filter = &tg.InputMessagesFilterDocument{}
+	filter, label, err := chatStreamFilter(kind)
+	if err != nil {
+		return err
 	}
 	for {
 		current, err := m.chatTarget(target.ID)
@@ -642,7 +648,7 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 		}
 		result, err := client.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{Peer: target.inputPeer(), Q: "", Filter: filter, OffsetID: offset, Limit: 100, MinID: minID, MaxID: target.UpperMessageID + 1})
 		if err != nil {
-			return fmt.Errorf("搜索%s媒体: %w", map[string]string{"photo_video": "照片和视频", "document": "文档"}[kind], err)
+			return fmt.Errorf("搜索%s媒体: %w", label, err)
 		}
 		messages := searchMessages(result)
 		if len(messages) == 0 {
@@ -677,6 +683,21 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 			return err
 		}
 		m.touch()
+	}
+}
+
+func chatStreamFilter(kind string) (tg.MessagesFilterClass, string, error) {
+	switch kind {
+	case "photo_video":
+		return &tg.InputMessagesFilterPhotoVideo{}, "照片和视频", nil
+	case "document":
+		return &tg.InputMessagesFilterDocument{}, "文档", nil
+	case "music":
+		return &tg.InputMessagesFilterMusic{}, "音乐", nil
+	case "round_voice":
+		return &tg.InputMessagesFilterRoundVoice{}, "语音和圆形视频", nil
+	default:
+		return nil, "", fmt.Errorf("未知会话媒体筛选器: %s", kind)
 	}
 }
 

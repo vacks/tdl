@@ -98,6 +98,13 @@ func TestChatJobsAreStoredSeparatelyFromMessageJobs(t *testing.T) {
 	if created.Status != ChatStatusQueued || created.ScanState != chatScanPending || created.ID == "" {
 		t.Fatalf("created chat job = %#v", created)
 	}
+	var streamCount int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_streams WHERE chat_job_id = ?`, created.ID).Scan(&streamCount); err != nil {
+		t.Fatal(err)
+	}
+	if streamCount != len(chatStreamKinds) {
+		t.Fatalf("chat stream count = %d, want %d", streamCount, len(chatStreamKinds))
+	}
 	jobs, total, _, err := m.ListChats("", 10)
 	if err != nil {
 		t.Fatalf("ListChats(): %v", err)
