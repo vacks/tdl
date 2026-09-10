@@ -129,6 +129,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/downloads", s.requireAuth(s.downloadsAPI))
 	s.mux.HandleFunc("/api/downloads/progress", s.requireAuth(s.downloadProgressSSE))
 	s.mux.HandleFunc("/api/downloads/", s.requireAuth(s.downloadControlAPI))
+	s.mux.HandleFunc("/api/chat-downloads", s.requireAuth(s.chatDownloadsAPI))
+	s.mux.HandleFunc("/api/chat-downloads/", s.requireAuth(s.chatDownloadControlAPI))
 	s.mux.HandleFunc("/api/maintenance/cleanup", s.requireAuth(s.cleanupHistory))
 	s.mux.HandleFunc("/", s.app)
 }
@@ -378,6 +380,98 @@ func (s *Server) downloadsAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		methodNotAllowed(w, "GET, POST")
 	}
+}
+
+func (s *Server) chatDownloadsAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+		jobs, total, nextCursor, err := s.downloads.ListChats(r.URL.Query().Get("cursor"), pageSize)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "total": total, "pageSize": pageSize, "nextCursor": nextCursor, "revision": s.downloads.Revision()})
+	case http.MethodPost:
+		var input struct {
+			URL       string `json:"url"`
+			ListenNew bool   `json:"listenNew"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&input); err != nil || strings.TrimSpace(input.URL) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请输入 Telegram 频道或群组链接"})
+			return
+		}
+		job, err := s.downloads.SubmitChat(r.Context(), download.ChatIntent{Source: download.SourceWeb, URL: strings.TrimSpace(input.URL), ListenNew: input.ListenNew})
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, job)
+	default:
+		methodNotAllowed(w, "GET, POST")
+	}
+}
+
+func (s *Server) chatDownloadControlAPI(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/chat-downloads/"), "/"), "/")
+	if parts[0] == "" || len(parts) > 2 {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 1 {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		job, err := s.downloads.GetChat(parts[0])
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, job)
+		return
+	}
+	var err error
+	switch parts[1] {
+	case "delete":
+		if r.Method != http.MethodDelete {
+			methodNotAllowed(w, http.MethodDelete)
+			return
+		}
+		err = s.downloads.DeleteChat(parts[0])
+	case "pause":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		err = s.downloads.PauseChat(parts[0])
+	case "resume":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		err = s.downloads.ResumeChat(parts[0])
+	case "retry":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		err = s.downloads.RetryChat(parts[0])
+	case "cancel":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		err = s.downloads.CancelChat(parts[0])
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // downloadProgressSSE streams in-memory progress. Download chunks never write

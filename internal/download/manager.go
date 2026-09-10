@@ -106,21 +106,24 @@ type directPeer struct {
 }
 
 type Manager struct {
-	db          *sql.DB
-	instanceID  string
-	downloadDir string
-	settings    *settings.Store
-	accounts    *telegram.Manager
-	mu          sync.Mutex
-	cancels     map[string]context.CancelFunc
-	wake        chan struct{}
-	slotWake    chan struct{}
-	progress    *progressStore
-	events      *eventBus
-	slotMu      sync.Mutex
-	activeJobs  int
-	jobLocks    [64]sync.Mutex
-	revision    atomic.Uint64
+	db            *sql.DB
+	instanceID    string
+	downloadDir   string
+	settings      *settings.Store
+	accounts      *telegram.Manager
+	mu            sync.Mutex
+	cancels       map[string]context.CancelFunc
+	wake          chan struct{}
+	chatWake      chan struct{}
+	chatEvents    chan telegram.NewMessageEvent
+	chatListeners map[string]context.CancelFunc
+	slotWake      chan struct{}
+	progress      *progressStore
+	events        *eventBus
+	slotMu        sync.Mutex
+	activeJobs    int
+	jobLocks      [64]sync.Mutex
+	revision      atomic.Uint64
 }
 
 func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram.Manager) (*Manager, error) {
@@ -135,7 +138,7 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, workerCount), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEvents: make(chan telegram.NewMessageEvent, 512), chatListeners: make(map[string]context.CancelFunc), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -149,6 +152,10 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	if _, err := m.db.Exec(`UPDATE download_jobs SET status = 'queued', error = '服务重启，任务等待恢复', updated_at = ? WHERE status = 'running'`, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("recover running tasks: %w", err)
+	}
+	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET status = 'queued', error = '', updated_at = ? WHERE status = 'scanning'`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover chat indexing tasks: %w", err)
 	}
 	// Jobs created before account binding was introduced cannot safely be resumed:
 	// selecting whichever account happens to be current could download under the
@@ -167,6 +174,8 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	for worker := 0; worker < workerCount; worker++ {
 		go m.worker()
 	}
+	go m.chatWorker()
+	go m.chatEventWorker()
 	go m.cleanupLoop()
 	return m, nil
 }
@@ -174,7 +183,7 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 func (m *Manager) migrate() error {
 	_, err := m.db.Exec(`
 CREATE TABLE IF NOT EXISTS download_jobs (
- id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, config_json TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, parent_chat_id TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS download_items (
  id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL, dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL, grouped_id INTEGER NOT NULL DEFAULT 0,
@@ -237,6 +246,37 @@ CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_a
 	if err != nil {
 		return err
 	}
+	// Chat download jobs are deliberately separate from the existing message-job
+	// table. A chat can contain millions of media records, so its lifecycle must
+	// not turn the normal message task list into millions of rows.
+	_, err = m.db.Exec(`
+CREATE TABLE IF NOT EXISTS chat_download_jobs (
+ id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_id INTEGER NOT NULL,
+ dialog_name TEXT NOT NULL, account_id TEXT NOT NULL, direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0,
+ direct_peer_hash INTEGER NOT NULL DEFAULT 0, start_message_id INTEGER NOT NULL DEFAULT 0, upper_message_id INTEGER NOT NULL DEFAULT 0,
+ listen_new INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, scan_state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chat_download_jobs_created_id ON chat_download_jobs(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS chat_download_jobs_account_status ON chat_download_jobs(account_id, status, updated_at);
+CREATE TABLE IF NOT EXISTS chat_download_items (
+ chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '',
+ dialog_type TEXT NOT NULL DEFAULT '', dialog_id INTEGER NOT NULL DEFAULT 0, grouped_id INTEGER NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0,
+ discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id),
+ FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS chat_download_items_child_job ON chat_download_items(child_job_id);
+CREATE TABLE IF NOT EXISTS chat_download_streams (
+ chat_job_id TEXT NOT NULL, stream_kind TEXT NOT NULL, offset_message_id INTEGER NOT NULL DEFAULT 0,
+ initialized INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(chat_job_id, stream_kind),
+ FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS chat_download_jobs_scan ON chat_download_jobs(status, scan_state, created_at);
+CREATE INDEX IF NOT EXISTS chat_download_jobs_listener ON chat_download_jobs(account_id, dialog_key, listen_new, scan_state, status);
+CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_job_id);`)
+	if err != nil {
+		return err
+	}
 	// Existing databases get the same columns without a data reset. Duplicate
 	// column errors are expected; every other migration failure must stop
 	// startup instead of leaving a partially upgraded schema running.
@@ -250,6 +290,13 @@ CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_a
 		`ALTER TABLE download_jobs ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`,
 		`ALTER TABLE download_jobs ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE download_jobs ADD COLUMN config_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_jobs ADD COLUMN parent_chat_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chat_download_items ADD COLUMN dialog_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chat_download_items ADD COLUMN dialog_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE chat_download_items ADD COLUMN grouped_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE chat_download_items ADD COLUMN message_text TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chat_download_items ADD COLUMN original_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chat_download_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE download_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE download_items ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`,
 		`ALTER TABLE download_items ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`,
@@ -271,6 +318,7 @@ CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_a
 	for _, statement := range []string{
 		`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_status_updated_id ON download_jobs(status, updated_at, id)`,
+		`CREATE INDEX IF NOT EXISTS download_jobs_parent_created_id ON download_jobs(parent_chat_id, created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS download_items_status ON download_items(status)`,
 	} {
 		if _, err := m.db.Exec(statement); err != nil {
@@ -473,7 +521,7 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 		pageSize = 50
 	}
 	var total int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs`).Scan(&total); err != nil {
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = ''`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	if total == 0 {
@@ -484,7 +532,7 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 		page = pages
 	}
 	offset := (page - 1) * pageSize
-	return m.listSummaries("", `ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?`, []any{pageSize, offset}, total)
+	return m.listSummaries("WHERE j.parent_chat_id = ''", `ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?`, []any{pageSize, offset}, total)
 }
 
 // ListCursor is stable when new tasks are inserted: it continues after the
@@ -499,10 +547,10 @@ func (m *Manager) ListCursor(cursor string, pageSize int) ([]Job, int, string, e
 		pageSize = 50
 	}
 	var total int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs`).Scan(&total); err != nil {
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = ''`).Scan(&total); err != nil {
 		return nil, 0, "", err
 	}
-	where := ""
+	where := "WHERE j.parent_chat_id = ''"
 	pagination := `ORDER BY j.created_at DESC, j.id DESC LIMIT ?`
 	args := []any{pageSize + 1}
 	if cursor != "" {
@@ -510,7 +558,7 @@ func (m *Manager) ListCursor(cursor string, pageSize int) ([]Job, int, string, e
 		if err != nil {
 			return nil, 0, "", errors.New("分页游标无效，请返回第一页")
 		}
-		where = `WHERE (j.created_at < ? OR (j.created_at = ? AND j.id < ?))`
+		where += ` AND (j.created_at < ? OR (j.created_at = ? AND j.id < ?))`
 		args = []any{createdAt, createdAt, id, pageSize + 1}
 	}
 	jobs, total, err := m.listSummaries(where, pagination, args, total)
@@ -607,6 +655,16 @@ func (m *Manager) Stop() {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	m.mu.Lock()
+	listeners := make([]context.CancelFunc, 0, len(m.chatListeners))
+	for _, cancel := range m.chatListeners {
+		listeners = append(listeners, cancel)
+	}
+	m.chatListeners = make(map[string]context.CancelFunc)
+	m.mu.Unlock()
+	for _, cancel := range listeners {
+		cancel()
+	}
 }
 
 // Revision increases only when persistent task state changes. It lets the UI
@@ -626,6 +684,24 @@ func taskLogFiles(sources []source) []string {
 }
 
 func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct directPeer) (Submission, error) {
+	return m.enqueueIntentParent(intent, sources, direct, "")
+}
+
+// enqueueIntentParent shares the mature message downloader with chat-index
+// batches. Parent jobs are hidden from ordinary message task listings but keep
+// every existing resume, progress and final-file safety guarantee.
+func (m *Manager) enqueueIntentParent(intent DownloadIntent, sources []source, direct directPeer, parentChatID string) (Submission, error) {
+	configJSON, err := json.Marshal(m.settings.Get().Download)
+	if err != nil {
+		return Submission{}, err
+	}
+	return m.enqueueIntentParentSnapshot(intent, sources, direct, parentChatID, string(configJSON))
+}
+
+// enqueueIntentParentSnapshot keeps every child of one chat task on the
+// configuration captured when that parent was created. A lengthy media index
+// must not silently mix old and newly edited download settings.
+func (m *Manager) enqueueIntentParentSnapshot(intent DownloadIntent, sources []source, direct directPeer, parentChatID, configJSON string) (Submission, error) {
 	id, err := randomID()
 	if err != nil {
 		return Submission{}, err
@@ -636,10 +712,6 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	trigger := triggerJSON(intent.Trigger)
-	configJSON, err := json.Marshal(m.settings.Get().Download)
-	if err != nil {
-		return Submission{}, err
-	}
 	tx, err := m.db.Begin()
 	if err != nil {
 		return Submission{}, err
@@ -694,7 +766,7 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 		m.emit(existingID, requestID, "request_attached", job.Status)
 		return Submission{RequestID: requestID, Job: job, Duplicate: true}, nil
 	}
-	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, string(configJSON), now, now); err != nil {
+	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, parent_chat_id, config_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, parentChatID, configJSON, now, now); err != nil {
 		return Submission{}, err
 	}
 	for _, item := range sources {
@@ -709,7 +781,7 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 		return Submission{}, err
 	}
 	m.touch()
-	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: string(configJSON), Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
 	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
 	return Submission{RequestID: requestID, Job: job, Created: true}, nil
@@ -888,7 +960,27 @@ func (m *Manager) run(job Job, sources []source) {
 		}}
 		if peer := job.directInputPeer(); peer != nil {
 			opts.URLs = nil
-			opts.DirectDialogs = [][]*tmessage.Dialog{{{Peer: peer, Messages: []int{sources[0].MessageID}}}}
+			// A chat child job may contain many media messages. Albums are passed
+			// once by their earliest member because upstream expands Group=true to
+			// all of their siblings; sending every member would download an album
+			// repeatedly.
+			messageIDs := make([]int, 0, len(sources))
+			seenMessages := make(map[int]struct{}, len(sources))
+			seenGroups := make(map[int64]struct{})
+			for _, item := range sources {
+				if item.GroupedID != 0 {
+					if _, exists := seenGroups[item.GroupedID]; exists {
+						continue
+					}
+					seenGroups[item.GroupedID] = struct{}{}
+				}
+				if _, exists := seenMessages[item.MessageID]; exists {
+					continue
+				}
+				seenMessages[item.MessageID] = struct{}{}
+				messageIDs = append(messageIDs, item.MessageID)
+			}
+			opts.DirectDialogs = [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}
 		}
 		return upstreamDL.Run(ctx, client, kvd, opts)
 	})
@@ -1151,6 +1243,13 @@ func (m *Manager) signal() {
 	// parallel instead of waiting for the workers' idle polling timeout.
 	select {
 	case m.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) signalChat() {
+	select {
+	case m.chatWake <- struct{}{}:
 	default:
 	}
 }

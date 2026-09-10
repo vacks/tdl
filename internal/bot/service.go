@@ -110,6 +110,9 @@ func New(store *settings.Store, downloads *download.Manager, telegram *telegram.
 
 func (s *Service) watchDownloadEvents(events <-chan download.Event) {
 	for event := range events {
+		if s.downloads.IsChatChild(event.JobID) {
+			continue
+		}
 		s.mu.Lock()
 		if expected, suppressed := s.suppressedStatus[event.JobID]; suppressed && event.Status == expected {
 			delete(s.suppressedStatus, event.JobID)
@@ -354,6 +357,10 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 		s.send(cfg.Token, msg.Chat.ID, helpText(), nil)
 	case text == "/list":
 		s.sendTaskList(cfg, msg.Chat.ID, 1)
+	case text == "/chat":
+		s.sendChatList(cfg, msg.Chat.ID, 1)
+	case strings.HasPrefix(text, "/chat "):
+		s.createChatTask(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/chat ")))
 	case text == "/status":
 		s.send(cfg.Token, msg.Chat.ID, s.statusText(), nil)
 	case text == "/config":
@@ -431,6 +438,10 @@ func (s *Service) clearRetry(updateID int64) {
 
 func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	if query.Message == nil {
+		return
+	}
+	if strings.HasPrefix(query.Data, "c:") {
+		s.handleChatCallback(cfg, query)
 		return
 	}
 	if strings.HasPrefix(query.Data, "l:") {
@@ -593,6 +604,183 @@ func (s *Service) taskList(page int) (string, [][]button, error) {
 	}
 	buttons = append(buttons, navigation)
 	return fmt.Sprintf("<b>下载任务</b> · 共 %d 个 · 第 %d/%d 页", total, page, totalPages), buttons, nil
+}
+
+func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
+	if !isTelegramLink(rawURL) {
+		s.send(cfg.Token, msg.Chat.ID, "请输入有效的 Telegram 频道或群组链接。", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+	job, err := s.downloads.SubmitChat(ctx, download.ChatIntent{Source: download.SourceBot, URL: rawURL})
+	cancel()
+	if err != nil {
+		applog.Error("bot", "chat_task_create_failed", "user_id", msg.From.ID, "error", err.Error())
+		s.send(cfg.Token, msg.Chat.ID, "❌ 创建会话下载失败："+html.EscapeString(err.Error()), nil)
+		return
+	}
+	applog.Info("bot", "chat_task_created", "user_id", msg.From.ID, "chat_job_id", job.ID)
+	s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, 1))
+}
+
+func (s *Service) sendChatList(cfg settings.Bot, chatID int64, page int) {
+	text, buttons, err := s.chatTaskList(page)
+	if err != nil {
+		s.send(cfg.Token, chatID, "读取会话下载列表失败。", nil)
+		return
+	}
+	s.send(cfg.Token, chatID, text, buttons)
+}
+
+func (s *Service) editChatList(cfg settings.Bot, chatID, messageID int64, page int) {
+	text, buttons, err := s.chatTaskList(page)
+	if err != nil {
+		s.edit(cfg.Token, chatID, messageID, "读取会话下载列表失败。", nil)
+		return
+	}
+	s.edit(cfg.Token, chatID, messageID, text, buttons)
+}
+
+// The Bot API callback payload is bounded, so the opaque SQLite cursor used
+// by the Web is intentionally not exposed here. Bot lists have small pages;
+// page-number access is translated through the manager's presentation helper.
+func (s *Service) chatTaskList(page int) (string, [][]button, error) {
+	if page < 1 {
+		page = 1
+	}
+	jobs, total, err := s.downloads.ListChatsPage(page, 10)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(jobs) == 0 {
+		return "暂无会话下载任务。", nil, nil
+	}
+	totalPages := (total + 9) / 10
+	if page > totalPages {
+		page = totalPages
+	}
+	buttons := make([][]button, 0, len(jobs)+1)
+	for _, job := range jobs {
+		label := fmt.Sprintf("%s %s %d/%d媒体", statusIcon(job.Status), short(job.DialogName, 18), job.Completed, job.Discovered)
+		buttons = append(buttons, []button{{Text: label, CallbackData: fmt.Sprintf("c:v:%s:%d", job.ID, page)}})
+	}
+	navigation := make([]button, 0, 3)
+	if page > 1 {
+		navigation = append(navigation, button{Text: "‹ 上一页", CallbackData: fmt.Sprintf("c:l:%d", page-1)})
+	}
+	navigation = append(navigation, button{Text: fmt.Sprintf("第 %d/%d 页", page, totalPages), CallbackData: fmt.Sprintf("c:l:%d", page)})
+	if page < totalPages {
+		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: fmt.Sprintf("c:l:%d", page+1)})
+	}
+	buttons = append(buttons, navigation)
+	return fmt.Sprintf("<b>会话下载</b> · 共 %d 个 · 第 %d/%d 页", total, page, totalPages), buttons, nil
+}
+
+func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
+	if query.Message == nil {
+		return
+	}
+	parts := strings.Split(query.Data, ":")
+	if len(parts) < 3 {
+		return
+	}
+	if parts[1] == "l" && len(parts) == 3 {
+		var page int
+		if _, err := fmt.Sscanf(parts[2], "%d", &page); err != nil || page < 1 {
+			s.answer(cfg.Token, query.ID, "页码无效")
+			return
+		}
+		s.editChatList(cfg, query.Message.Chat.ID, query.Message.MessageID, page)
+		s.answer(cfg.Token, query.ID, "")
+		return
+	}
+	if parts[1] == "v" && len(parts) == 4 {
+		var page int
+		if _, err := fmt.Sscanf(parts[3], "%d", &page); err != nil || page < 1 {
+			return
+		}
+		s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, parts[2], page)
+		s.answer(cfg.Token, query.ID, "")
+		return
+	}
+	if parts[1] != "t" || len(parts) != 5 {
+		return
+	}
+	id, action := parts[2], parts[3]
+	var page int
+	if _, err := fmt.Sscanf(parts[4], "%d", &page); err != nil || page < 1 {
+		return
+	}
+	var err error
+	switch action {
+	case "pause":
+		err = s.downloads.PauseChat(id)
+	case "resume":
+		err = s.downloads.ResumeChat(id)
+	case "retry":
+		err = s.downloads.RetryChat(id)
+	case "cancel":
+		err = s.downloads.CancelChat(id)
+	case "delete":
+		err = s.downloads.DeleteChat(id)
+	default:
+		return
+	}
+	if err != nil {
+		s.answer(cfg.Token, query.ID, err.Error())
+		return
+	}
+	s.answer(cfg.Token, query.ID, "操作成功")
+	if action == "delete" {
+		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, "会话任务已删除。", [][]button{{{Text: "返回会话列表", CallbackData: "c:l:1"}}})
+		return
+	}
+	s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, page)
+}
+
+func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id string, page int) {
+	job, err := s.downloads.GetChat(id)
+	if err != nil {
+		s.edit(cfg.Token, chatID, messageID, "会话任务不存在或已删除。", [][]button{{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}}})
+		return
+	}
+	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, page))
+}
+
+func chatTaskText(job download.ChatJob) string {
+	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), "<b>对话：</b>" + html.EscapeString(short(job.DialogName, 36)), fmt.Sprintf("<b>范围：</b>%s — %d", chatStartLabel(job.StartMessageID), job.UpperMessageID), fmt.Sprintf("<b>媒体：</b>%d/%d", job.Completed, job.Discovered)}
+	if job.Failed > 0 {
+		lines = append(lines, fmt.Sprintf("<b>失败：</b>%d", job.Failed))
+	}
+	if job.ListenNew {
+		lines = append(lines, "<b>新媒体监听：</b>已开启")
+	}
+	if job.Error != "" {
+		lines = append(lines, "<b>说明：</b>"+html.EscapeString(short(job.Error, 100)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func chatStartLabel(id int) string {
+	if id == 0 {
+		return "最早媒体"
+	}
+	return fmt.Sprint(id)
+}
+
+func chatTaskKeyboard(job download.ChatJob, page int) [][]button {
+	buttons := make([][]button, 0, 3)
+	if job.Status == "queued" || job.Status == "scanning" || job.Status == "downloading" || job.Status == "listening" {
+		buttons = append(buttons, []button{{Text: "暂停", CallbackData: fmt.Sprintf("c:t:%s:pause:%d", job.ID, page)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel:%d", job.ID, page)}})
+	}
+	if job.Status == "paused" {
+		buttons = append(buttons, []button{{Text: "恢复", CallbackData: fmt.Sprintf("c:t:%s:resume:%d", job.ID, page)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel:%d", job.ID, page)}})
+	}
+	if job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" || job.Status == "completed" {
+		buttons = append(buttons, []button{{Text: "重新开始", CallbackData: fmt.Sprintf("c:t:%s:retry:%d", job.ID, page)}, {Text: "删除", CallbackData: fmt.Sprintf("c:t:%s:delete:%d", job.ID, page)}})
+	}
+	buttons = append(buttons, []button{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}})
+	return buttons
 }
 
 func (s *Service) sendTask(cfg settings.Bot, chatID int64, id string) {
@@ -984,7 +1172,7 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 	return strings.Join(lines, "\n")
 }
 func helpText() string {
-	return "<b>TDL帮助</b>\n\n发送 Telegram 消息链接即可创建下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/list</code> 获取下载任务\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务"
+	return "<b>TDL帮助</b>\n\n发送 Telegram 消息链接即可创建下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/list</code> 获取下载任务\n<code>/chat</code> 获取会话下载；<code>/chat 链接</code> 创建会话下载\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务"
 }
 
 func (s *Service) statusText() string {
@@ -1045,13 +1233,13 @@ func isTelegramLink(v string) bool {
 	return err == nil && (u.Host == "t.me" || strings.HasSuffix(u.Host, ".t.me"))
 }
 func active(status string) bool {
-	return status == "queued" || status == "running" || status == "paused"
+	return status == "queued" || status == "running" || status == "paused" || status == "scanning" || status == "downloading" || status == "listening"
 }
 func statusName(status string) string {
-	return map[string]string{"queued": "排队中", "running": "下载中", "paused": "已暂停", "completed": "已完成", "partial": "部分完成", "failed": "失败", "cancelled": "已取消"}[status]
+	return map[string]string{"queued": "排队中", "running": "下载中", "scanning": "索引中", "downloading": "下载中", "listening": "监听中", "paused": "已暂停", "completed": "已完成", "partial": "部分完成", "failed": "失败", "cancelled": "已取消"}[status]
 }
 func statusIcon(status string) string {
-	return map[string]string{"queued": "🕓", "running": "⬇️", "paused": "⏸", "completed": "✅", "partial": "⚠️", "failed": "❌", "cancelled": "■"}[status]
+	return map[string]string{"queued": "🕓", "running": "⬇️", "scanning": "🔎", "downloading": "⬇️", "listening": "👂", "paused": "⏸", "completed": "✅", "partial": "⚠️", "failed": "❌", "cancelled": "■"}[status]
 }
 func short(v string, limit int) string {
 	r := []rune(v)
@@ -1179,6 +1367,7 @@ func (s *Service) configureCommands(token string) {
 	commands := []map[string]string{
 		{"command": "help", "description": "获取帮助信息"},
 		{"command": "list", "description": "获取下载任务"},
+		{"command": "chat", "description": "获取或创建会话下载"},
 		{"command": "status", "description": "获取当前状态"},
 		{"command": "config", "description": "获取当前配置"},
 		{"command": "restart", "description": "重启所有服务"},

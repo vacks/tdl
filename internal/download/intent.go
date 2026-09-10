@@ -5,8 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 
+	gotd "github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/peers"
+	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
+	"github.com/iyear/tdl/core/storage"
+	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/vacks/tdl/internal/applog"
 )
 
@@ -55,6 +63,17 @@ type DownloadIntent struct {
 	// Trigger is compact audit context, for example {"emoji":"❤️"}. It is
 	// intentionally not used for deduplication or download execution.
 	Trigger map[string]string
+}
+
+// ChatIntent creates a bounded historical download for a channel or group.
+// A message URL starts at that message (inclusive); a public chat URL starts
+// at the earliest available media. New messages are never part of the frozen
+// historical range unless ListenNew is explicitly enabled.
+type ChatIntent struct {
+	Source    SourceKind
+	AccountID string
+	URL       string
+	ListenNew bool
 }
 
 // Submission says whether a new job was made or this request was attached to
@@ -146,4 +165,100 @@ func (i DownloadIntent) String() string {
 		return fmt.Sprintf("message:%d", i.Message.MessageID)
 	}
 	return ""
+}
+
+func (i ChatIntent) validate() error {
+	if i.Source == "" {
+		return errors.New("会话下载请求缺少来源")
+	}
+	if strings.TrimSpace(i.URL) == "" {
+		return errors.New("请输入 Telegram 频道或群组链接")
+	}
+	return nil
+}
+
+// SubmitChat persists a resolved, immutable historical range. The indexing
+// worker is intentionally separate from link resolution: retries never change
+// the upper bound and therefore never make a moving channel history endless.
+func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, error) {
+	if err := intent.validate(); err != nil {
+		return ChatJob{}, err
+	}
+	accountID := intent.AccountID
+	if accountID == "" {
+		var err error
+		accountID, err = m.accounts.CurrentID()
+		if err != nil {
+			return ChatJob{}, err
+		}
+	}
+	intent.URL = strings.TrimSpace(intent.URL)
+	var created ChatJob
+	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
+		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+		peer, startID, err := resolveChatTarget(ctx, manager, intent.URL)
+		if err != nil {
+			return err
+		}
+		input := peer.InputPeer()
+		dialogType, dialogKey, dialogID := dialogIdentity(input, accountID)
+		if dialogType != "channel" && dialogType != "chat" {
+			return errors.New("会话下载仅支持频道和群组")
+		}
+		it := query.Messages(client.API()).GetHistory(input).BatchSize(1).Iter()
+		if !it.Next(ctx) {
+			if err := it.Err(); err != nil {
+				return fmt.Errorf("获取会话最新消息: %w", err)
+			}
+			return errors.New("该会话没有可读取的消息")
+		}
+		latest, ok := it.Value().Msg.(*tg.Message)
+		if !ok {
+			return errors.New("无法读取会话最新消息")
+		}
+		if startID > latest.ID {
+			return errors.New("起始消息位置晚于会话最新消息")
+		}
+		configJSON, err := json.Marshal(m.settings.Get().Download)
+		if err != nil {
+			return err
+		}
+		created, err = m.createChatJob(ChatJob{SourceURL: intent.URL, DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, DialogName: peer.VisibleName(), AccountID: accountID, StartMessageID: startID, UpperMessageID: latest.ID, ListenNew: intent.ListenNew}, makeDirectPeer(input), string(configJSON))
+		return err
+	})
+	if err != nil {
+		applog.Error("chat_download", "task_submit_failed", "source", intent.Source, "account_id", accountID, "error", err.Error())
+		return ChatJob{}, err
+	}
+	applog.Info("chat_download", "task_created", "chat_job_id", created.ID, "account_id", accountID, "dialog_key", created.DialogKey, "start_message_id", created.StartMessageID, "upper_message_id", created.UpperMessageID, "listen_new", created.ListenNew)
+	m.signalChat()
+	return created, nil
+}
+
+func resolveChatTarget(ctx context.Context, manager *peers.Manager, rawURL string) (peers.Peer, int, error) {
+	peer, messageID, err := tutil.ParseMessageLink(ctx, manager, rawURL)
+	if err == nil {
+		return peer, messageID, nil
+	}
+	parsed, parseErr := url.Parse(rawURL)
+	if parseErr != nil || !isTelegramHost(parsed.Host) {
+		return nil, 0, fmt.Errorf("解析会话链接: %w", err)
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 1 || parts[0] == "" || strings.EqualFold(parts[0], "c") {
+		return nil, 0, errors.New("请提供频道或群组链接；私有会话需使用一条消息链接")
+	}
+	if _, convertErr := strconv.Atoi(parts[0]); convertErr == nil {
+		return nil, 0, errors.New("会话链接缺少用户名")
+	}
+	resolved, resolveErr := tutil.GetInputPeer(ctx, manager, parts[0])
+	if resolveErr != nil {
+		return nil, 0, fmt.Errorf("解析会话链接: %w", resolveErr)
+	}
+	return resolved, 0, nil
+}
+
+func isTelegramHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(strings.Split(host, ":")[0]))
+	return host == "t.me" || host == "www.t.me" || host == "telegram.me" || host == "www.telegram.me"
 }

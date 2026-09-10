@@ -80,6 +80,40 @@ func TestDialogIdentityUsesPeerNamespaces(t *testing.T) {
 	}
 }
 
+func TestChatJobsAreStoredSeparatelyFromMessageJobs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tdl.db")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	created, err := m.createChatJob(ChatJob{SourceURL: "https://t.me/example", DialogType: "channel", DialogKey: "channel:42", DialogID: 42, DialogName: "示例频道", AccountID: "account-a", UpperMessageID: 99, ListenNew: true}, directPeer{kind: "channel", id: 42, hash: 7}, "{}")
+	if err != nil {
+		t.Fatalf("createChatJob(): %v", err)
+	}
+	if created.Status != ChatStatusQueued || created.ScanState != chatScanPending || created.ID == "" {
+		t.Fatalf("created chat job = %#v", created)
+	}
+	jobs, total, _, err := m.ListChats("", 10)
+	if err != nil {
+		t.Fatalf("ListChats(): %v", err)
+	}
+	if total != 1 || len(jobs) != 1 || jobs[0].ID != created.ID || !jobs[0].ListenNew {
+		t.Fatalf("chat jobs = %#v, total = %d", jobs, total)
+	}
+	got, err := m.GetChat(created.ID)
+	if err != nil {
+		t.Fatalf("GetChat(): %v", err)
+	}
+	if got.UpperMessageID != 99 || got.DialogKey != "channel:42" {
+		t.Fatalf("GetChat() = %#v", got)
+	}
+}
+
 func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "tdl.db")
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(ON)")

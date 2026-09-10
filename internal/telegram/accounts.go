@@ -63,6 +63,17 @@ type ReactionEvent struct {
 	Emojis     []string
 }
 
+// NewMessageEvent is a normalized update for one newly received message.
+// It intentionally carries an InputPeer, so consumers do not depend on
+// usernames or public links (both may be unavailable for private groups).
+type NewMessageEvent struct {
+	AccountID  string
+	DialogID   int64
+	DialogName string
+	MessageID  int
+	InputPeer  tg.InputPeerClass
+}
+
 type persisted struct {
 	Accounts  []Account `json:"accounts"`
 	CurrentID string    `json:"currentId"`
@@ -335,6 +346,64 @@ func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(c
 	return client.Run(ctx, func(runCtx context.Context) error {
 		if _, err := client.Self(runCtx); err != nil {
 			applog.Error("reaction", "listener_authorization_check_failed", "account_id", id, "error", err.Error())
+			return err
+		}
+		if onReady != nil {
+			onReady()
+		}
+		<-runCtx.Done()
+		return nil
+	})
+}
+
+// ListenNewMessages holds one update connection for an account and normalizes
+// both ordinary group and channel update constructors. Callers multiplex their
+// own subscriptions on this one connection.
+func (m *Manager) ListenNewMessages(ctx context.Context, id string, onEvent func(context.Context, NewMessageEvent), onReady func()) error {
+	m.mu.RLock()
+	account, ok := m.accountLocked(id)
+	proxyURL := m.proxyURL
+	m.mu.RUnlock()
+	if !ok || account.State != "authorized" {
+		return ErrNotAuthorized
+	}
+	store := m.accountStore(id)
+	dispatcher := tg.NewUpdateDispatcher()
+	var client *gotd.Client
+	dispatch := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass) {
+		message, ok := raw.(*tg.Message)
+		if !ok {
+			return
+		}
+		input, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
+		if err != nil {
+			applog.Info("chat_download", "new_message_peer_extract_failed", "account_id", id, "message_id", message.ID, "error", err.Error())
+			return
+		}
+		name := "会话"
+		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
+		if peer, err := manager.ResolvePeer(updateCtx, message.PeerID); err == nil {
+			input, name = peer.InputPeer(), peer.VisibleName()
+		}
+		dialogID, _ := inputPeerInfo(input)
+		onEvent(context.Background(), NewMessageEvent{AccountID: id, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input})
+	}
+	dispatcher.OnNewMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
+		dispatch(updateCtx, entities, update.Message)
+		return nil
+	})
+	dispatcher.OnNewChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewChannelMessage) error {
+		dispatch(updateCtx, entities, update.Message)
+		return nil
+	})
+	var err error
+	client, err = upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: proxyURL(), UpdateHandler: dispatcher}, false)
+	if err != nil {
+		return fmt.Errorf("创建新媒体监听连接: %w", err)
+	}
+	applog.Info("chat_download", "new_message_listener_connected", "account_id", id)
+	return client.Run(ctx, func(runCtx context.Context) error {
+		if _, err := client.Self(runCtx); err != nil {
 			return err
 		}
 		if onReady != nil {
