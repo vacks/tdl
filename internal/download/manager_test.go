@@ -1,8 +1,10 @@
 package download
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,6 +124,81 @@ func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
 	if !strings.Contains(snapshot, "tempFilenameTemplate") || !strings.Contains(snapshot, "finalFilenameTemplate") {
 		t.Fatalf("download configuration snapshot missing expected templates: %s", snapshot)
 	}
+	if _, err := db.Exec(`UPDATE download_jobs SET status = 'completed' WHERE id = ?`, first.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	m.downloadDir = t.TempDir()
+	if err := m.Delete(first.Job.ID); err != nil {
+		t.Fatalf("Delete() with request/event history: %v", err)
+	}
+}
+
+func TestCancelledTaskReactivatesForRepeatedLink(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{db: db, settings: store, wake: make(chan struct{}, 1), events: newEventBus(), cancels: make(map[string]context.CancelFunc)}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	sources := []source{{DialogName: "test", Item: Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 7, OriginalName: "file.bin", Status: "queued"}}}
+	first, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account-a", URL: "https://t.me/example/7"}, sources, directPeer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Cancel(first.Job.ID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	second, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account-a", URL: "https://t.me/example/7"}, sources, directPeer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Duplicate || !second.Reactivated || second.Job.ID != first.Job.ID || second.Job.Status != "queued" {
+		t.Fatalf("reactivated submission = %#v", second)
+	}
+	if err := m.Cancel(first.Job.ID); err != nil {
+		t.Fatalf("Cancel before explicit retry: %v", err)
+	}
+	if err := m.Retry(first.Job.ID); err != nil {
+		t.Fatalf("Retry cancelled task: %v", err)
+	}
+}
+
+func TestCancelledReactionCanBeTriggeredAgain(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, wake: make(chan struct{}, 1), events: newEventBus()}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES ('cancelled-job', 'tg://reaction/user/42/7', 'cancelled', 'now', 'now')`); err != nil {
+		t.Fatal(err)
+	}
+	intent := DownloadIntent{Source: SourceReaction, AccountID: "account-a", Message: &MessageRef{DialogName: "private", DialogID: 42, MessageID: 7, InputPeer: &tg.InputPeerUser{UserID: 42, AccessHash: 99}}}
+	queued, err := m.QueueReaction(intent, "👍")
+	if err != nil || !queued {
+		t.Fatalf("first QueueReaction() = (%v, %v)", queued, err)
+	}
+	events, err := m.ClaimReactionInbox(1)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ClaimReactionInbox() = (%d, %v)", len(events), err)
+	}
+	if err := m.CompleteReactionInbox(events[0].ID, "cancelled-job"); err != nil {
+		t.Fatal(err)
+	}
+	queued, err = m.QueueReaction(intent, "👍")
+	if err != nil || !queued {
+		t.Fatalf("repeated cancelled reaction = (%v, %v), want (true, nil)", queued, err)
+	}
 }
 
 func TestReactionInboxPersistsAndLeasesEvent(t *testing.T) {
@@ -159,6 +236,105 @@ func TestReactionInboxPersistsAndLeasesEvent(t *testing.T) {
 	}
 	if status != "done" || jobID != "job-a" {
 		t.Fatalf("inbox status = (%q, %q), want (done, job-a)", status, jobID)
+	}
+}
+
+func TestListCursorReturnsSummariesWithoutItems(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"job-3", "job-2", "job-1"} {
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES (?, ?, 'queued', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, id, "https://t.me/example/1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, total, cursor, err := m.ListCursor("", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(first) != 2 || cursor == "" || first[0].ID != "job-3" || first[0].Items != nil {
+		t.Fatalf("first cursor page = %#v, total=%d, cursor=%q", first, total, cursor)
+	}
+	second, _, next, err := m.ListCursor(cursor, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].ID != "job-1" || next != "" {
+		t.Fatalf("second cursor page = %#v, next=%q", second, next)
+	}
+}
+
+func TestCleanupHistoryProcessesMoreThanOneBatch(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES (?, 'https://t.me/example/1', 'completed', '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < cleanupBatchSize+1; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("job-%04d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.CleanupHistory(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Jobs != cleanupBatchSize+1 {
+		t.Fatalf("removed %d jobs, want %d", result.Jobs, cleanupBatchSize+1)
+	}
+	var remaining int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM download_jobs`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining jobs = %d, want 0", remaining)
+	}
+}
+
+func TestDatabaseInstanceIDIsStable(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	first := &Manager{db: db}
+	if err := first.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.loadInstanceID(); err != nil {
+		t.Fatal(err)
+	}
+	if first.InstanceID() == "" {
+		t.Fatal("database instance ID is empty")
+	}
+	second := &Manager{db: db}
+	if err := second.loadInstanceID(); err != nil {
+		t.Fatal(err)
+	}
+	if second.InstanceID() != first.InstanceID() {
+		t.Fatalf("instance ID changed from %q to %q", first.InstanceID(), second.InstanceID())
 	}
 }
 

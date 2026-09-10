@@ -6,7 +6,7 @@ export class APIError extends Error {
 }
 
 export async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { credentials: 'include', headers: { 'Content-Type': 'application/json', ...init?.headers }, ...init })
+  const response = await fetch(url, { credentials: 'include', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'TDL-Web', ...init?.headers }, ...init })
   const body = await response.json().catch(() => ({}))
   if (!response.ok) throw new APIError(body.error || '请求失败', response.status)
   return body as T

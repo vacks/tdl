@@ -5,14 +5,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vacks/tdl/internal/applog"
@@ -20,6 +23,7 @@ import (
 	"github.com/vacks/tdl/internal/monitor"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
+	"golang.org/x/net/proxy"
 )
 
 // Service is intentionally a small Telegram Bot API client. It is separate
@@ -29,11 +33,16 @@ type Service struct {
 	downloads  *download.Manager
 	telegram   *telegram.Manager
 	monitor    *monitor.Monitor
-	client     *http.Client
 	cursorPath string
+	instanceID string
 	cursor     updateCursor
+	ctx        context.Context
+	cancel     context.CancelFunc
 
-	mu sync.Mutex
+	mu          sync.Mutex
+	clientMu    sync.Mutex
+	client      *http.Client
+	clientProxy string
 	// lifecycleMu serializes a status refresh with deletion. Without it a
 	// refresh holding an old completed snapshot could overwrite a later
 	// "task deleted" card or send a replacement notification.
@@ -47,29 +56,46 @@ type Service struct {
 	// Bot message for every state transition.
 	lifecycle map[string]map[int64]messageRef
 	deleted   map[string]struct{}
-	ready     bool
-	helpSent  bool
+	dirty     map[string]struct{}
+	// suppressedStatus consumes the state event emitted synchronously by a
+	// successful Bot action. The callback itself has already rendered that
+	// state, so the generic lifecycle refresher must not edit the same card a
+	// second time.
+	suppressedStatus map[string]string
+	ready            bool
+	helpSent         map[int64]bool
+	helpRetry        map[int64]helpRetry
+	lastLiveEdit     map[string]time.Time
+	nextLiveEdit     time.Time
+	retryUpdates     map[int64]int
 	// downloadWake receives coalesced domain events. It shortens lifecycle
 	// updates without making the Bot poll the task table more aggressively.
 	downloadWake chan struct{}
 }
 
 type updateCursor struct {
-	TokenHash string `json:"tokenHash"`
-	Offset    int64  `json:"offset"`
+	TokenHash  string `json:"tokenHash"`
+	InstanceID string `json:"instanceId"`
+	Offset     int64  `json:"offset"`
 }
 
 type messageRef struct {
 	ChatID, MessageID int64
 	Text              string
+	TokenHash         string
 }
 type trackedRef struct {
 	JobID string
 	messageRef
 }
+type helpRetry struct {
+	next     time.Time
+	attempts int
+}
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, client: &http.Client{Timeout: 12 * time.Second}, cursorPath: filepath.Join(dataDir, "bot-updates.json"), known: map[string]string{}, tracked: map[string]trackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, downloadWake: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -83,7 +109,14 @@ func New(store *settings.Store, downloads *download.Manager, telegram *telegram.
 }
 
 func (s *Service) watchDownloadEvents(events <-chan download.Event) {
-	for range events {
+	for event := range events {
+		s.mu.Lock()
+		if expected, suppressed := s.suppressedStatus[event.JobID]; suppressed && event.Status == expected {
+			delete(s.suppressedStatus, event.JobID)
+		} else {
+			s.dirty[event.JobID] = struct{}{}
+		}
+		s.mu.Unlock()
 		select {
 		case s.downloadWake <- struct{}{}:
 		default:
@@ -93,58 +126,117 @@ func (s *Service) watchDownloadEvents(events <-chan download.Event) {
 
 func (s *Service) loop() {
 	for {
+		if s.ctx.Err() != nil {
+			return
+		}
 		cfg := s.settings.Get().Bot
 		if !cfg.Enabled || strings.TrimSpace(cfg.Token) == "" || len(cfg.ControlUserIDs) == 0 {
-			time.Sleep(3 * time.Second)
+			if !waitContext(s.ctx, 3*time.Second) {
+				return
+			}
 			continue
 		}
 		commandsChanged := false
+		lifecycleTokenChanged := false
 		s.mu.Lock()
 		if s.token != cfg.Token {
+			// A restart starts with an empty in-memory token. Compare the stored
+			// cursor too, so a changed token can never edit cards owned by an old
+			// Bot identity after a stopped service is configured again.
+			lifecycleTokenChanged = s.token != "" || (s.cursor.TokenHash != "" && s.cursor.TokenHash != tokenFingerprint(cfg.Token))
 			s.token = cfg.Token
-			if s.cursor.TokenHash == tokenFingerprint(cfg.Token) {
+			if s.cursor.TokenHash == tokenFingerprint(cfg.Token) && s.cursor.InstanceID == s.instanceID {
 				s.offset = s.cursor.Offset
 			} else {
 				s.offset = 0
 			}
-			s.known, s.tracked, s.lifecycle, s.deleted, s.ready, s.helpSent = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, false, false
+			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[int64]int{}, time.Time{}
 			commandsChanged = true
 		}
 		s.mu.Unlock()
 		if commandsChanged {
+			if lifecycleTokenChanged {
+				if err := s.downloads.ClearBotLifecycleMessages(); err != nil {
+					applog.Error("bot", "lifecycle_messages_clear_failed", "error", err.Error())
+				}
+			}
 			s.configureCommands(cfg.Token)
 		}
 		s.sendStartupHelp(cfg)
 		updates, err := s.getUpdates(cfg.Token)
 		if err == nil {
 			for _, update := range updates {
-				s.handle(cfg, update)
+				if !s.handle(cfg, update) {
+					// Keep this update (and every later one) visible to getUpdates.
+					// Advancing beyond a transient submission failure would lose a
+					// user command permanently.
+					if !waitContext(s.ctx, s.retryDelay(update.UpdateID)) {
+						return
+					}
+					break
+				}
+				s.clearRetry(update.UpdateID)
+				// Do not accept another update until this one has been durably
+				// acknowledged. Advancing only in memory would lose a successfully
+				// handled command if the process crashes after a filesystem failure.
+				if !s.advanceOffset(cfg.Token, update.UpdateID+1) {
+					return
+				}
 			}
 		} else {
 			applog.Error("bot", "updates_fetch_failed", "error", err.Error())
 		}
 		s.refresh(cfg)
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-s.downloadWake:
 		case <-time.After(2 * time.Second):
 		}
 	}
 }
 
+// Stop cancels long polling and releases idle Bot API connections.
+func (s *Service) Stop() {
+	s.cancel()
+	s.clientMu.Lock()
+	if s.client != nil {
+		if transport, ok := s.client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	s.clientMu.Unlock()
+}
+
 // sendStartupHelp confirms to authorized users that Bot control is available
 // after this application instance has completed its initialization.
 func (s *Service) sendStartupHelp(cfg settings.Bot) {
-	s.mu.Lock()
-	if s.helpSent {
-		s.mu.Unlock()
-		return
-	}
-	s.helpSent = true
-	s.mu.Unlock()
 	for _, id := range cfg.ControlUserIDs {
+		s.mu.Lock()
+		alreadySent := s.helpSent[id]
+		retry := s.helpRetry[id]
+		s.mu.Unlock()
+		if alreadySent || time.Now().Before(retry.next) {
+			continue
+		}
 		if _, err := s.send(cfg.Token, id, helpText(), nil); err != nil {
 			applog.Error("bot", "startup_help_send_failed", "chat_id", id, "error", err.Error())
+			if retry.attempts < 8 {
+				retry.attempts++
+			}
+			delay := time.Second * time.Duration(1<<min(retry.attempts, 8))
+			if delay > 5*time.Minute {
+				delay = 5 * time.Minute
+			}
+			s.mu.Lock()
+			s.helpRetry[id] = helpRetry{next: time.Now().Add(delay), attempts: retry.attempts}
+			s.mu.Unlock()
+			continue
 		}
+		s.mu.Lock()
+		s.helpSent[id] = true
+		delete(s.helpRetry, id)
+		s.mu.Unlock()
 	}
 }
 
@@ -188,29 +280,39 @@ func (s *Service) getUpdates(token string) ([]update, error) {
 	if !result.OK {
 		return nil, fmt.Errorf("Bot API: %s", result.Description)
 	}
-	if len(result.Result) > 0 {
-		s.mu.Lock()
-		s.offset = result.Result[len(result.Result)-1].UpdateID + 1
-		offset = s.offset
-		s.mu.Unlock()
-		s.saveCursor(token, offset)
-	}
 	return result.Result, nil
 }
 
-func (s *Service) saveCursor(token string, offset int64) {
-	cursor := updateCursor{TokenHash: tokenFingerprint(token), Offset: offset}
+func (s *Service) advanceOffset(token string, offset int64) bool {
+	s.mu.Lock()
+	if offset <= s.offset {
+		s.mu.Unlock()
+		return true
+	}
+	s.mu.Unlock()
+	cursor := updateCursor{TokenHash: tokenFingerprint(token), InstanceID: s.instanceID, Offset: offset}
 	data, err := json.Marshal(cursor)
 	if err != nil {
-		return
+		applog.Error("bot", "update_cursor_encode_failed", "error", err.Error())
+		return false
 	}
-	if err := os.WriteFile(s.cursorPath, data, 0o600); err != nil {
-		applog.Error("bot", "update_cursor_save_failed", "error", err.Error())
-		return
+	for attempt := 0; ; attempt++ {
+		if err := writePrivateFile(s.cursorPath, data); err == nil {
+			s.mu.Lock()
+			if offset > s.offset {
+				s.offset = offset
+				s.cursor = cursor
+			}
+			s.mu.Unlock()
+			return true
+		} else {
+			applog.Error("bot", "update_cursor_save_failed", "offset", offset, "attempt", attempt+1, "error", err.Error())
+		}
+		delay := time.Second * time.Duration(1<<min(attempt, 5))
+		if !waitContext(s.ctx, delay) {
+			return false
+		}
 	}
-	s.mu.Lock()
-	s.cursor = cursor
-	s.mu.Unlock()
 }
 
 func tokenFingerprint(token string) string {
@@ -218,24 +320,35 @@ func tokenFingerprint(token string) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
-func (s *Service) handle(cfg settings.Bot, update update) {
+func (s *Service) handle(cfg settings.Bot, update update) bool {
 	if update.Message != nil {
-		if !allowed(cfg, update.Message.From.ID) {
+		if !allowed(cfg, update.Message.From.ID) || !privateChat(*update.Message) {
 			applog.Info("bot", "update_rejected", "kind", "message", "user_id", update.Message.From.ID)
-			return
+			return true
 		}
 		applog.Info("bot", "command_received", "user_id", update.Message.From.ID)
-		s.handleMessage(cfg, *update.Message)
-		return
+		return s.handleMessage(cfg, *update.Message)
 	}
-	if update.CallbackQuery != nil && allowed(cfg, update.CallbackQuery.From.ID) {
+	if update.CallbackQuery != nil && allowed(cfg, update.CallbackQuery.From.ID) && privateCallback(*update.CallbackQuery) {
 		applog.Info("bot", "callback_received", "user_id", update.CallbackQuery.From.ID)
 		s.handleCallback(cfg, *update.CallbackQuery)
 	}
+	return true
 }
 
-func (s *Service) handleMessage(cfg settings.Bot, msg message) {
-	text := strings.TrimSpace(msg.Text)
+// Bot control is deliberately private-chat only. An authorized user can be a
+// member of many groups, but task names and download state must never be sent
+// into those groups merely because they invoked a command there.
+func privateChat(message message) bool { return message.Chat.ID == message.From.ID }
+
+// CallbackQuery.Message.From is the Bot that sent the card, not the person
+// pressing it. Test private-ness against CallbackQuery.From instead.
+func privateCallback(query callbackQuery) bool {
+	return query.Message != nil && query.Message.Chat.ID == query.From.ID
+}
+
+func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
+	text := normalizeCommand(strings.TrimSpace(msg.Text))
 	switch {
 	case text == "/start" || text == "/help":
 		s.send(cfg.Token, msg.Chat.ID, helpText(), nil)
@@ -248,19 +361,23 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) {
 	case text == "/restart":
 		if _, err := s.send(cfg.Token, msg.Chat.ID, "🔄 正在重启所有服务…", nil); err != nil {
 			applog.Error("bot", "restart_notice_send_failed", "error", err.Error())
-			return
+			return !retryableSubmitError(err)
 		}
 		applog.Info("bot", "service_restart_requested", "user_id", msg.From.ID)
 		go func() {
 			time.Sleep(time.Second)
-			os.Exit(0)
+			if process, err := os.FindProcess(os.Getpid()); err == nil {
+				_ = process.Signal(syscall.SIGTERM)
+			}
 		}()
 	case isTelegramLink(text):
-		submission, err := s.downloads.Submit(context.Background(), download.DownloadIntent{Source: download.SourceBot, URL: text})
+		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+		submission, err := s.downloads.Submit(ctx, download.DownloadIntent{Source: download.SourceBot, URL: text})
+		cancel()
 		if err != nil {
 			applog.Error("bot", "task_create_failed", "user_id", msg.From.ID, "error", err.Error())
 			s.send(cfg.Token, msg.Chat.ID, "❌ 创建下载任务失败："+html.EscapeString(err.Error()), nil)
-			return
+			return !retryableSubmitError(err)
 		}
 		job := submission.Job
 		if submission.Duplicate {
@@ -274,12 +391,42 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) {
 		messageID, err := s.send(cfg.Token, msg.Chat.ID, text, notificationKeyboard(job.ID))
 		if err != nil {
 			applog.Error("bot", "lifecycle_message_send_failed", "job_id", job.ID, "error", err.Error())
-			return
+			return true
 		}
 		s.rememberLifecycle(job.ID, messageRef{ChatID: msg.Chat.ID, MessageID: messageID, Text: text})
 	default:
 		s.send(cfg.Token, msg.Chat.ID, "发送 <code>/help</code> 查看可用命令。", nil)
 	}
+	return true
+}
+
+func retryableSubmitError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "timeout") || strings.Contains(message, "temporar") || strings.Contains(message, "connection") || strings.Contains(message, "network") || strings.Contains(message, "flood_wait")
+}
+
+func (s *Service) retryDelay(updateID int64) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt := s.retryUpdates[updateID] + 1
+	if attempt > 8 {
+		attempt = 8
+	}
+	s.retryUpdates[updateID] = attempt
+	delay := time.Second * time.Duration(1<<attempt)
+	if delay > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return delay
+}
+
+func (s *Service) clearRetry(updateID int64) {
+	s.mu.Lock()
+	delete(s.retryUpdates, updateID)
+	s.mu.Unlock()
 }
 
 func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
@@ -292,6 +439,7 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 			s.answer(cfg.Token, query.ID, "页码无效")
 			return
 		}
+		s.untrackMessage(query.Message.Chat.ID, query.Message.MessageID)
 		s.editTaskList(cfg, query.Message.Chat.ID, query.Message.MessageID, page)
 		s.answer(cfg.Token, query.ID, "")
 		return
@@ -345,7 +493,8 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 			s.answer(cfg.Token, query.ID, err.Error())
 			return
 		}
-		s.markLifecycleDeleted(cfg, refs)
+		s.markLifecycleDeleted(cfg, refs, query.Message.Chat.ID, query.Message.MessageID)
+		s.untrackJob(id)
 		s.forgetLifecycle(id)
 		s.lifecycleMu.Unlock()
 		s.answer(cfg.Token, query.ID, "操作成功")
@@ -370,7 +519,33 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 		return
 	}
 	s.answer(cfg.Token, query.ID, "操作成功")
-	s.editTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, listPage)
+	s.renderActionResult(cfg, *query.Message, id, listPage)
+}
+
+// renderActionResult is the sole post-action renderer. A callback already has
+// the final durable status, so consuming its matching domain event prevents a
+// second, visually confusing edit from the generic lifecycle refresh.
+func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID string, listPage int) {
+	job, err := s.downloads.Get(jobID)
+	if err != nil {
+		s.edit(cfg.Token, message.Chat.ID, message.MessageID, "任务不存在或已删除。", nil)
+		return
+	}
+	s.mu.Lock()
+	s.known[job.ID] = job.Status
+	delete(s.dirty, job.ID)
+	s.suppressedStatus[job.ID] = job.Status
+	s.mu.Unlock()
+	if s.isLifecycleMessage(job.ID, message.Chat.ID, message.MessageID) {
+		s.updateLifecycle(cfg, job)
+		return
+	}
+	s.edit(cfg.Token, message.Chat.ID, message.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, listPage))
+	if active(job.Status) {
+		s.track(job.ID, messageRef{ChatID: message.Chat.ID, MessageID: message.MessageID})
+	} else {
+		s.untrackMessage(message.Chat.ID, message.MessageID)
+	}
 }
 
 func (s *Service) sendTaskList(cfg settings.Bot, chatID int64, page int) {
@@ -448,13 +623,12 @@ func (s *Service) editTask(cfg settings.Bot, chatID, messageID int64, id string,
 }
 
 func (s *Service) refresh(cfg settings.Bot) {
-	jobs, _, err := s.downloads.ListPage(1, 50)
-	if err != nil {
-		return
-	}
-	current := make(map[string]download.Job, len(jobs))
-	for _, job := range jobs {
-		current[job.ID] = job
+	ids, tracked := s.refreshIDs()
+	for _, id := range ids {
+		job, err := s.downloads.Get(id)
+		if err != nil {
+			continue
+		}
 		s.mu.Lock()
 		previous, exists := s.known[job.ID]
 		ready := s.ready
@@ -462,8 +636,14 @@ func (s *Service) refresh(cfg settings.Bot) {
 		s.mu.Unlock()
 		s.lifecycleMu.Lock()
 		if !s.isDeleted(job.ID) {
-			if ready && !exists && cfg.Notifications.TaskCreated {
-				s.sendLifecycle(cfg, job)
+			if ready && !exists {
+				// Lifecycle cards survive restarts in SQLite. Reload them before
+				// deciding whether a first post-restart event needs a new card.
+				if len(s.lifecycleRefs(job.ID)) > 0 {
+					s.updateLifecycle(cfg, job)
+				} else if cfg.Notifications.TaskCreated || (terminal(job.Status) && shouldUpdateLifecycle(cfg, job.Status)) {
+					s.sendLifecycle(cfg, job)
+				}
 			}
 			if exists && previous != job.Status && shouldUpdateLifecycle(cfg, job.Status) {
 				// A lifecycle card may have been created by the Web UI, by a Bot
@@ -474,34 +654,36 @@ func (s *Service) refresh(cfg settings.Bot) {
 		}
 		s.lifecycleMu.Unlock()
 	}
-	s.mu.Lock()
-	s.ready = true
-	s.mu.Unlock()
-	// A new task observed after Bot startup is a creation notification, including
-	// tasks created through the Web UI.
-	s.mu.Lock()
-	tracked := make(map[string]trackedRef, len(s.tracked))
-	for key, ref := range s.tracked {
-		tracked[key] = ref
-	}
-	s.mu.Unlock()
+	// Only explicitly viewed task cards are refreshed on the cadence. This
+	// avoids repeatedly reading the newest task page when there is no event.
 	for key, ref := range tracked {
-		id := ref.JobID
-		job, ok := current[id]
-		if !ok {
-			if got, err := s.downloads.Get(id); err == nil {
-				job, ok = got, true
-			}
-		}
-		if !ok {
+		job, err := s.downloads.Get(ref.JobID)
+		if err != nil {
 			s.untrack(key)
 			continue
 		}
-		s.edit(cfg.Token, ref.ChatID, ref.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, 0))
+		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, 0)) {
+			s.untrack(key)
+		}
 		if !active(job.Status) {
 			s.untrack(key)
 		}
 	}
+}
+
+func (s *Service) refreshIDs() ([]string, map[string]trackedRef) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.dirty))
+	for id := range s.dirty {
+		ids = append(ids, id)
+	}
+	s.dirty = make(map[string]struct{})
+	tracked := make(map[string]trackedRef, len(s.tracked))
+	for key, ref := range s.tracked {
+		tracked[key] = ref
+	}
+	return ids, tracked
 }
 
 func (s *Service) track(id string, ref messageRef) {
@@ -510,15 +692,38 @@ func (s *Service) track(id string, ref messageRef) {
 	s.mu.Unlock()
 }
 func (s *Service) untrack(key string) { s.mu.Lock(); delete(s.tracked, key); s.mu.Unlock() }
+func (s *Service) untrackJob(jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, ref := range s.tracked {
+		if ref.JobID == jobID {
+			delete(s.tracked, key)
+		}
+	}
+}
+func (s *Service) untrackMessage(chatID, messageID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, ref := range s.tracked {
+		if ref.ChatID == chatID && ref.MessageID == messageID {
+			delete(s.tracked, key)
+		}
+	}
+}
 
 func (s *Service) rememberLifecycle(jobID string, ref messageRef) {
+	if ref.TokenHash == "" {
+		s.mu.Lock()
+		ref.TokenHash = tokenFingerprint(s.token)
+		s.mu.Unlock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lifecycle[jobID] == nil {
 		s.lifecycle[jobID] = make(map[int64]messageRef)
 	}
 	s.lifecycle[jobID][ref.ChatID] = ref
-	if err := s.downloads.SaveBotLifecycleMessage(jobID, download.BotMessageRef{ChatID: ref.ChatID, MessageID: ref.MessageID, Text: ref.Text}); err != nil {
+	if err := s.downloads.SaveBotLifecycleMessage(jobID, download.BotMessageRef{ChatID: ref.ChatID, MessageID: ref.MessageID, Text: ref.Text, TokenHash: ref.TokenHash}); err != nil {
 		applog.Error("bot", "lifecycle_message_save_failed", "job_id", jobID, "chat_id", ref.ChatID, "error", err.Error())
 	}
 }
@@ -534,7 +739,7 @@ func (s *Service) lifecycleRefs(jobID string) []messageRef {
 		s.lifecycle[jobID] = make(map[int64]messageRef)
 	}
 	for _, ref := range persisted {
-		s.lifecycle[jobID][ref.ChatID] = messageRef{ChatID: ref.ChatID, MessageID: ref.MessageID, Text: ref.Text}
+		s.lifecycle[jobID][ref.ChatID] = messageRef{ChatID: ref.ChatID, MessageID: ref.MessageID, Text: ref.Text, TokenHash: ref.TokenHash}
 	}
 	refs := s.lifecycle[jobID]
 	result := make([]messageRef, 0, len(refs))
@@ -550,8 +755,21 @@ func (s *Service) forgetLifecycle(jobID string) {
 	s.mu.Unlock()
 }
 
-func (s *Service) markLifecycleDeleted(cfg settings.Bot, refs []messageRef) {
+func (s *Service) isLifecycleMessage(jobID string, chatID, messageID int64) bool {
+	for _, ref := range s.lifecycleRefs(jobID) {
+		if ref.ChatID == chatID && ref.MessageID == messageID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) markLifecycleDeleted(cfg settings.Bot, refs []messageRef, skipChatID, skipMessageID int64) {
+	tokenHash := tokenFingerprint(cfg.Token)
 	for _, ref := range refs {
+		if !allowed(cfg, ref.ChatID) || ref.TokenHash != tokenHash || (ref.ChatID == skipChatID && ref.MessageID == skipMessageID) {
+			continue
+		}
 		s.edit(cfg.Token, ref.ChatID, ref.MessageID, deletedTaskText(ref.Text), nil)
 	}
 }
@@ -589,15 +807,40 @@ func (s *Service) sendLifecycle(cfg settings.Bot, job download.Job) {
 
 func (s *Service) updateLifecycle(cfg settings.Bot, job download.Job) {
 	refs := s.lifecycleRefs(job.ID)
+	activeRefs := make([]messageRef, 0, len(refs))
+	tokenHash := tokenFingerprint(cfg.Token)
+	for _, ref := range refs {
+		if ref.TokenHash == tokenHash && allowed(cfg, ref.ChatID) {
+			activeRefs = append(activeRefs, ref)
+			continue
+		}
+		// A removed controller must stop receiving task metadata immediately.
+		s.forgetLifecycleMessage(job.ID, ref.ChatID)
+	}
+	refs = activeRefs
 	if len(refs) == 0 {
 		s.sendLifecycle(cfg, job)
 		return
 	}
 	text := lifecycleText(job)
 	for _, ref := range refs {
-		s.edit(cfg.Token, ref.ChatID, ref.MessageID, text, notificationKeyboard(job.ID))
+		if s.edit(cfg.Token, ref.ChatID, ref.MessageID, text, notificationKeyboard(job.ID)) {
+			s.forgetLifecycleMessage(job.ID, ref.ChatID)
+			continue
+		}
 		ref.Text = text
 		s.rememberLifecycle(job.ID, ref)
+	}
+}
+
+func (s *Service) forgetLifecycleMessage(jobID string, chatID int64) {
+	s.mu.Lock()
+	if refs := s.lifecycle[jobID]; refs != nil {
+		delete(refs, chatID)
+	}
+	s.mu.Unlock()
+	if err := s.downloads.RemoveBotLifecycleMessage(jobID, chatID); err != nil {
+		applog.Error("bot", "lifecycle_message_remove_failed", "job_id", jobID, "chat_id", chatID, "error", err.Error())
 	}
 }
 
@@ -613,6 +856,15 @@ func shouldUpdateLifecycle(cfg settings.Bot, status string) bool {
 		// There is no separate switch for queue/running/paused transitions;
 		// keep the existing lifecycle card current for these intermediate states.
 		return true
+	}
+}
+
+func terminal(status string) bool {
+	switch status {
+	case "completed", "partial", "failed", "cancelled":
+		return true
+	default:
+		return false
 	}
 }
 func allowed(cfg settings.Bot, userID int64) bool {
@@ -695,7 +947,9 @@ func taskKeyboard(job download.Job, listPage int) [][]button {
 		rows = append(rows, []button{{"▶ 继续", callback("resume")}, {"■ 取消", callback("cancel")}})
 	case "failed", "partial":
 		rows = append(rows, []button{{"↻ 重试", callback("retry")}, {"删除", callback("delete")}})
-	case "completed", "cancelled":
+	case "cancelled":
+		rows = append(rows, []button{{"↻ 重新开始", callback("retry")}, {"删除", callback("delete")}})
+	case "completed":
 		rows = append(rows, []button{{"删除", callback("delete")}})
 	}
 	rows = append(rows, []button{{"↻ 刷新", callback("view")}})
@@ -776,7 +1030,7 @@ func configText(cfg settings.Values) string {
 	if cfg.Reaction.Enabled {
 		reactionState = "已启用"
 	}
-	return fmt.Sprintf("<b>当前配置</b>\n代理：%s\n下载：线程 %d · 同时任务 %d · 连接池 %d · 间隔 %dms\nBot：%s\n表情监听：%s（%s）\n临时命名模板：<code>%s</code>\n最终命名模板：<code>%s</code>", html.EscapeString(proxy), cfg.Download.Threads, cfg.Download.TaskLimit, cfg.Download.PoolSize, cfg.Download.DelayMS, botState, reactionState, html.EscapeString(strings.Join(cfg.Reaction.Emojis, " ")), html.EscapeString(short(cfg.Download.TempFilenameTemplate, 180)), html.EscapeString(short(cfg.Download.FinalFilenameTemplate, 180)))
+	return fmt.Sprintf("<b>当前配置</b>\n代理：%s\n下载：线程 %d · 单任务文件并发 %d · 任务并发 %d · 连接池 %d · 间隔 %dms\nBot：%s\n表情监听：%s（%s）\n临时命名模板：<code>%s</code>\n最终命名模板：<code>%s</code>", html.EscapeString(proxy), cfg.Download.Threads, cfg.Download.TaskLimit, cfg.Download.ConcurrentJobs, cfg.Download.PoolSize, cfg.Download.DelayMS, botState, reactionState, html.EscapeString(strings.Join(cfg.Reaction.Emojis, " ")), html.EscapeString(short(cfg.Download.TempFilenameTemplate, 180)), html.EscapeString(short(cfg.Download.FinalFilenameTemplate, 180)))
 }
 
 func safeProxyLabel(raw string) string {
@@ -806,12 +1060,6 @@ func short(v string, limit int) string {
 	}
 	return string(r[:limit-1]) + "…"
 }
-func shortID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
-	return id
-}
 func bytesLabel(value int64) string {
 	units := []string{"B", "KB", "MB", "GB", "TB"}
 	n := float64(value)
@@ -831,17 +1079,97 @@ func (s *Service) call(token, method string, body any, out any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("Bot API %s returned HTTP %d", method, resp.StatusCode)
+	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func waitContext(ctx context.Context, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
+}
+
+func (s *Service) httpClient() *http.Client {
+	raw := strings.TrimSpace(s.settings.ProxyURL())
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	if s.client != nil && s.clientProxy == raw {
+		return s.client
+	}
+	if s.client != nil {
+		if transport, ok := s.client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	client := &http.Client{Timeout: 12 * time.Second, Transport: transport}
+	s.clientProxy = raw
+	s.client = client
+	if raw == "" {
+		return client
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return client
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(u)
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth = &proxy.Auth{User: u.User.Username(), Password: password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+		if err == nil {
+			transport.Proxy = nil
+			transport.DialContext = func(_ context.Context, network, address string) (net.Conn, error) {
+				return dialer.Dial(network, address)
+			}
+		}
+	}
+	return client
+}
+
+func normalizeCommand(text string) string {
+	parts := strings.Fields(text)
+	if len(parts) != 1 || !strings.HasPrefix(parts[0], "/") {
+		return text
+	}
+	if at := strings.IndexByte(parts[0], '@'); at > 1 {
+		return parts[0][:at]
+	}
+	return parts[0]
+}
+
+func (s *Service) editLive(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
+	key := fmt.Sprintf("%d:%d", chatID, messageID)
+	now := time.Now()
+	s.mu.Lock()
+	if now.Sub(s.lastLiveEdit[key]) < 3*time.Second || now.Before(s.nextLiveEdit) {
+		s.mu.Unlock()
+		return false
+	}
+	s.lastLiveEdit[key] = now
+	s.nextLiveEdit = now.Add(50 * time.Millisecond)
+	s.mu.Unlock()
+	return s.edit(token, chatID, messageID, text, keyboard)
 }
 
 // configureCommands enables Telegram's native slash-command suggestions and
@@ -886,7 +1214,9 @@ func (s *Service) send(token string, chatID int64, text string, keyboard [][]but
 	}
 	return result.Result.MessageID, nil
 }
-func (s *Service) edit(token string, chatID, messageID int64, text string, keyboard [][]button) {
+
+// edit returns true only when Telegram confirms that the message no longer exists.
+func (s *Service) edit(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
 	var result apiResponse[bool]
 	payload := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true}
 	if keyboard != nil {
@@ -894,15 +1224,24 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 	}
 	if err := s.call(token, "editMessageText", payload, &result); err != nil {
 		applog.Error("bot", "message_edit_failed", "chat_id", chatID, "message_id", messageID, "error", err.Error())
-		return
+		return false
 	}
 	if !result.OK {
+		if isMissingMessage(result.Description) {
+			return true
+		}
 		applog.Error("bot", "message_edit_rejected", "chat_id", chatID, "message_id", messageID, "error", result.Description)
-		return
+		return false
 	}
 	if keyboard == nil {
 		s.clearKeyboard(token, chatID, messageID)
 	}
+	return false
+}
+
+func isMissingMessage(description string) bool {
+	v := strings.ToLower(description)
+	return strings.Contains(v, "message to edit not found") || strings.Contains(v, "message_id_invalid")
 }
 
 func (s *Service) clearKeyboard(token string, chatID, messageID int64) {
@@ -922,4 +1261,29 @@ func (s *Service) clearKeyboard(token string, chatID, messageID int64) {
 func (s *Service) answer(token, id, text string) {
 	var result apiResponse[bool]
 	_ = s.call(token, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": short(text, 180)}, &result)
+}
+
+func writePrivateFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	defer os.Remove(name)
+	if err = file.Chmod(0o600); err == nil {
+		_, err = file.Write(data)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }

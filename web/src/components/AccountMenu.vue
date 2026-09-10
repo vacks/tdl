@@ -40,9 +40,11 @@ async function changePassword() {
   saving.value = true
   try {
     await api('/api/auth/password', { method: 'POST', body: JSON.stringify({ currentPassword: currentPassword.value, newPassword: newPassword.value }) })
-    ElMessage.success('密码已修改')
+    ElMessage.success('密码已修改，请使用新密码重新登录')
     visible.value = false
     resetForm()
+	username.value = ''
+	await router.replace('/login')
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '密码修改失败')
   } finally {

@@ -1,0 +1,89 @@
+--- a/app/dl/dl.go
++++ b/app/dl/dl.go
+@@ -4,6 +4,7 @@
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"time"
+ 
+ 	"github.com/AlecAivazis/survey/v2"
+ 	"github.com/fatih/color"
+@@ -52,6 +53,7 @@
+ 	// FileCompletedCallback receives a media file only after its temporary file
+ 	// has been closed and its per-file post-processing has succeeded.
+ 	FileCompletedCallback func(FileCompletedUpdate)
++	Runtime *RuntimeOptions
+ 
+ 	// serve
+ 	Serve bool
+@@ -75,15 +77,40 @@
+ 	Path      string
+ }
+ 
++type RuntimeOptions struct {
++	PoolSize          int
++	Threads           int
++	TaskLimit         int
++	Delay             time.Duration
++	ReconnectTimeout  time.Duration
++	DisableProgressPS bool
++}
++
+ type parser struct {
+ 	Data   []string
+ 	Parser tmessage.ParseSource
+ }
+ 
+ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
++	poolSize := int64(viper.GetInt(consts.FlagPoolSize))
++	reconnectTimeout := viper.GetDuration(consts.FlagReconnectTimeout)
++	delay := viper.GetDuration(consts.FlagDelay)
++	disableProgressPS := viper.GetBool(consts.FlagDisableProgressPS)
++	threads := viper.GetInt(consts.FlagThreads)
++	limit := viper.GetInt(consts.FlagLimit)
++	if opts.Runtime != nil {
++		poolSize = int64(opts.Runtime.PoolSize)
++		if opts.Runtime.ReconnectTimeout > 0 {
++			reconnectTimeout = opts.Runtime.ReconnectTimeout
++		}
++		delay = opts.Runtime.Delay
++		disableProgressPS = opts.Runtime.DisableProgressPS
++		threads = opts.Runtime.Threads
++		limit = opts.Runtime.TaskLimit
++	}
+ 	pool := dcpool.NewPool(c,
+-		int64(viper.GetInt(consts.FlagPoolSize)),
+-		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
++		poolSize,
++		tclient.NewDefaultMiddlewares(ctx, reconnectTimeout)...)
+ 	defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
+ 
+ 	parsers := []parser{
+@@ -104,7 +129,7 @@
+ 
+ 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
+ 
+-	it, err := newIter(pool, manager, dialogs, opts, viper.GetDuration(consts.FlagDelay))
++	it, err := newIter(pool, manager, dialogs, opts, delay)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -130,17 +155,16 @@
+ 
+ 	dlProgress := prog.New(utils.Byte.FormatBinaryBytes)
+ 	dlProgress.SetNumTrackersExpected(it.Total())
+-	if !viper.GetBool(consts.FlagDisableProgressPS) {
++	if !disableProgressPS {
+ 		prog.EnablePS(ctx, dlProgress)
+ 	}
+ 
+ 	options := downloader.Options{
+ 		Pool:     pool,
+-		Threads:  viper.GetInt(consts.FlagThreads),
++		Threads:  threads,
+ 		Iter:     it,
+ 		Progress: newProgress(dlProgress, it, opts),
+ 	}
+-	limit := viper.GetInt(consts.FlagLimit)
+ 
+ 	logctx.From(ctx).Info("Start download",

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,9 +26,7 @@ import (
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/iyear/tdl/core/util/tutil"
-	"github.com/iyear/tdl/pkg/consts"
 	"github.com/iyear/tdl/pkg/tmessage"
-	"github.com/spf13/viper"
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
@@ -36,13 +35,13 @@ import (
 )
 
 var (
-	ErrDuplicate        = errors.New("该 Telegram 消息已存在于下载记录中")
 	errFinalNameTooLong = errors.New("最终文件名或完整路径超过 Linux 长度限制")
 )
 
 const (
 	linuxNameMaxBytes = 255
 	linuxPathMaxBytes = 4096
+	workerCount       = 16
 )
 
 type Item struct {
@@ -94,6 +93,7 @@ type BotMessageRef struct {
 	ChatID    int64
 	MessageID int64
 	Text      string
+	TokenHash string
 }
 
 type source struct {
@@ -107,14 +107,19 @@ type directPeer struct {
 
 type Manager struct {
 	db          *sql.DB
+	instanceID  string
 	downloadDir string
 	settings    *settings.Store
 	accounts    *telegram.Manager
 	mu          sync.Mutex
 	cancels     map[string]context.CancelFunc
 	wake        chan struct{}
+	slotWake    chan struct{}
 	progress    *progressStore
 	events      *eventBus
+	slotMu      sync.Mutex
+	activeJobs  int
+	jobLocks    [64]sync.Mutex
 	revision    atomic.Uint64
 }
 
@@ -130,20 +135,39 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, workerCount), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
 	if err := m.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := m.loadInstanceID(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	// Retain the upstream temporary files and resume keys. A worker will resume
 	// these jobs using the account originally selected at enqueue time.
-	_, _ = m.db.Exec(`UPDATE download_jobs SET status = 'queued', error = '服务重启，任务等待恢复', updated_at = ? WHERE status = 'running'`, time.Now().UTC().Format(time.RFC3339))
+	if _, err := m.db.Exec(`UPDATE download_jobs SET status = 'queued', error = '服务重启，任务等待恢复', updated_at = ? WHERE status = 'running'`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover running tasks: %w", err)
+	}
 	// Jobs created before account binding was introduced cannot safely be resumed:
 	// selecting whichever account happens to be current could download under the
 	// wrong Telegram identity. Keep their records visible, but require a new job.
-	_, _ = m.db.Exec(`UPDATE download_jobs SET status = 'failed', error = '旧任务缺少 Telegram 账户绑定，无法安全重试，请重新创建下载任务', updated_at = ? WHERE status NOT IN ('completed', 'cancelled') AND account_id = ''`, time.Now().UTC().Format(time.RFC3339))
-	_, _ = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing' AND updated_at < ?`, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339Nano))
-	go m.worker()
+	if _, err := m.db.Exec(`UPDATE download_jobs SET status = 'failed', error = '旧任务缺少 Telegram 账户绑定，无法安全重试，请重新创建下载任务', updated_at = ? WHERE status NOT IN ('completed', 'cancelled') AND account_id = ''`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover legacy tasks: %w", err)
+	}
+	// This process is the only inbox consumer. Any lease left by a previous
+	// process is safe to recover immediately; waiting for an arbitrary age here
+	// would leave a just-claimed event permanently stuck after a restart.
+	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing'`, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover reaction inbox: %w", err)
+	}
+	for worker := 0; worker < workerCount; worker++ {
+		go m.worker()
+	}
+	go m.cleanupLoop()
 	return m, nil
 }
 
@@ -167,14 +191,19 @@ CREATE TABLE IF NOT EXISTS bot_lifecycle_messages (
  chat_id INTEGER NOT NULL,
  message_id INTEGER NOT NULL,
 	message_text TEXT NOT NULL DEFAULT '',
+	token_hash TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(job_id, chat_id),
  FOREIGN KEY(job_id) REFERENCES download_jobs(id) ON DELETE CASCADE
 )`)
 	if err != nil {
 		return err
 	}
+	_, err = m.db.Exec(`CREATE TABLE IF NOT EXISTS app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
+	if err != nil {
+		return err
+	}
 	_, err = m.db.Exec(`CREATE TABLE IF NOT EXISTS download_resets (
- account_id TEXT NOT NULL, source_url TEXT NOT NULL,
+ account_id TEXT NOT NULL, source_url TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(account_id, source_url)
 )`)
 	if err != nil {
@@ -208,25 +237,81 @@ CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_a
 	if err != nil {
 		return err
 	}
-	// Existing development databases get the same new columns without a data reset.
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_name TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_type TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_id INTEGER NOT NULL DEFAULT 0`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN direct_peer_hash INTEGER NOT NULL DEFAULT 0`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_jobs ADD COLUMN config_json TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`)
-	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0`)
-	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN started_at TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''`)
-	_, _ = m.db.Exec(`ALTER TABLE download_items ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0`)
-	_, _ = m.db.Exec(`ALTER TABLE bot_lifecycle_messages ADD COLUMN message_text TEXT NOT NULL DEFAULT ''`)
+	// Existing databases get the same columns without a data reset. Duplicate
+	// column errors are expected; every other migration failure must stop
+	// startup instead of leaving a partially upgraded schema running.
+	for _, statement := range []string{
+		`ALTER TABLE download_jobs ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_jobs ADD COLUMN dialog_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE download_jobs ADD COLUMN direct_peer_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_jobs ADD COLUMN direct_peer_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE download_jobs ADD COLUMN direct_peer_hash INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE download_jobs ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`,
+		`ALTER TABLE download_jobs ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_jobs ADD COLUMN config_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE download_items ADD COLUMN dialog_type TEXT NOT NULL DEFAULT 'legacy'`,
+		`ALTER TABLE download_items ADD COLUMN dialog_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE download_items ADD COLUMN started_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_items ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_items ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE bot_lifecycle_messages ADD COLUMN message_text TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE bot_lifecycle_messages ADD COLUMN token_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE download_resets ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
+	} {
+		if err := m.addColumn(statement); err != nil {
+			return err
+		}
+	}
+	if _, err := m.db.Exec(`UPDATE download_resets SET created_at = ? WHERE created_at = ''`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	for _, statement := range []string{
+		`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS download_jobs_status_updated_id ON download_jobs(status, updated_at, id)`,
+		`CREATE INDEX IF NOT EXISTS download_items_status ON download_items(status)`,
+	} {
+		if _, err := m.db.Exec(statement); err != nil {
+			return err
+		}
+	}
 	if err := m.migrateItemIdentity(); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (m *Manager) addColumn(statement string) error {
+	if _, err := m.db.Exec(statement); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return fmt.Errorf("migrate database: %w", err)
+	}
+	return nil
+}
+
+// InstanceID changes only when the task database is replaced. Delivery
+// adapters use it to distinguish a fresh installation from a normal restart.
+func (m *Manager) InstanceID() string { return m.instanceID }
+
+func (m *Manager) loadInstanceID() error {
+	var value string
+	err := m.db.QueryRow(`SELECT value FROM app_metadata WHERE key = 'instance_id'`).Scan(&value)
+	if err == nil {
+		m.instanceID = value
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	value, err = randomID()
+	if err != nil {
+		return err
+	}
+	if _, err = m.db.Exec(`INSERT INTO app_metadata(key, value) VALUES ('instance_id', ?)`, value); err != nil {
+		return err
+	}
+	m.instanceID = value
 	return nil
 }
 
@@ -234,25 +319,48 @@ CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_a
 // basic-chat and channel IDs live in different namespaces, so dialog_id alone
 // is not a safe cross-dialog identity.
 func (m *Manager) migrateItemIdentity() error {
-	rows, err := m.db.Query(`PRAGMA table_info(download_items)`)
+	rows, err := m.db.Query(`PRAGMA index_list(download_items)`)
 	if err != nil {
 		return err
 	}
-	hasDialogKey := false
+	hasIdentityIndex := false
 	for rows.Next() {
-		var cid int
-		var name, kind string
-		var notNull, primary int
-		var defaultValue any
-		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primary); err != nil {
+		var sequence int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&sequence, &name, &unique, &origin, &partial); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		if name == "dialog_key" {
-			hasDialogKey = true
+		if unique == 0 {
+			continue
+		}
+		columns, err := m.db.Query(`PRAGMA index_info(` + name + `)`)
+		if err != nil {
+			_ = rows.Close()
+			return err
+		}
+		var indexed []string
+		for columns.Next() {
+			var position, columnID int
+			var column string
+			if err := columns.Scan(&position, &columnID, &column); err != nil {
+				_ = columns.Close()
+				_ = rows.Close()
+				return err
+			}
+			indexed = append(indexed, column)
+		}
+		if err := columns.Close(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if len(indexed) == 2 && indexed[0] == "dialog_key" && indexed[1] == "message_id" {
+			hasIdentityIndex = true
+			break
 		}
 	}
-	if err := rows.Close(); err != nil || hasDialogKey {
+	if err := rows.Close(); err != nil || hasIdentityIndex {
 		return err
 	}
 	tx, err := m.db.Begin()
@@ -268,7 +376,7 @@ func (m *Manager) migrateItemIdentity() error {
 		return err
 	}
 	if _, err = tx.Exec(`INSERT INTO download_items_v2(id, job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error)
- SELECT id, job_id, 'legacy', 'legacy:' || dialog_id, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items`); err != nil {
+ SELECT id, job_id, CASE WHEN dialog_type = '' THEN 'legacy' ELSE dialog_type END, CASE WHEN dialog_key = '' THEN 'legacy:' || dialog_id ELSE dialog_key END, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items`); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`DROP TABLE download_items`); err != nil {
@@ -280,18 +388,34 @@ func (m *Manager) migrateItemIdentity() error {
 	if _, err = tx.Exec(`CREATE INDEX download_items_job_id ON download_items(job_id)`); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(`CREATE INDEX download_items_status ON download_items(status)`); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 // SaveBotLifecycleMessage stores the one lifecycle card shown to a Bot user.
 func (m *Manager) SaveBotLifecycleMessage(jobID string, ref BotMessageRef) error {
-	_, err := m.db.Exec(`INSERT OR REPLACE INTO bot_lifecycle_messages(job_id, chat_id, message_id, message_text) VALUES (?, ?, ?, ?)`, jobID, ref.ChatID, ref.MessageID, ref.Text)
+	_, err := m.db.Exec(`INSERT OR REPLACE INTO bot_lifecycle_messages(job_id, chat_id, message_id, message_text, token_hash) VALUES (?, ?, ?, ?, ?)`, jobID, ref.ChatID, ref.MessageID, ref.Text, ref.TokenHash)
+	return err
+}
+
+func (m *Manager) RemoveBotLifecycleMessage(jobID string, chatID int64) error {
+	_, err := m.db.Exec(`DELETE FROM bot_lifecycle_messages WHERE job_id = ? AND chat_id = ?`, jobID, chatID)
+	return err
+}
+
+// ClearBotLifecycleMessages detaches cards created by a previous Bot token.
+// Telegram Bot API messages belong to the token that created them; retaining
+// those references would otherwise cause failed edits after the token changes.
+func (m *Manager) ClearBotLifecycleMessages() error {
+	_, err := m.db.Exec(`DELETE FROM bot_lifecycle_messages`)
 	return err
 }
 
 // BotLifecycleMessages returns all lifecycle cards for a task.
 func (m *Manager) BotLifecycleMessages(jobID string) ([]BotMessageRef, error) {
-	rows, err := m.db.Query(`SELECT chat_id, message_id, message_text FROM bot_lifecycle_messages WHERE job_id = ?`, jobID)
+	rows, err := m.db.Query(`SELECT chat_id, message_id, message_text, token_hash FROM bot_lifecycle_messages WHERE job_id = ?`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -299,17 +423,12 @@ func (m *Manager) BotLifecycleMessages(jobID string) ([]BotMessageRef, error) {
 	refs := make([]BotMessageRef, 0)
 	for rows.Next() {
 		var ref BotMessageRef
-		if err := rows.Scan(&ref.ChatID, &ref.MessageID, &ref.Text); err != nil {
+		if err := rows.Scan(&ref.ChatID, &ref.MessageID, &ref.Text, &ref.TokenHash); err != nil {
 			return nil, err
 		}
 		refs = append(refs, ref)
 	}
 	return refs, rows.Err()
-}
-
-func (m *Manager) List() ([]Job, error) {
-	jobs, _, err := m.ListPage(1, 100)
-	return jobs, err
 }
 
 // Get returns one task including its file records. It is used by the Bot to
@@ -340,9 +459,9 @@ func (m *Manager) Get(id string) (Job, error) {
 	return job, nil
 }
 
-// ListPage fetches only the requested page of task records. Item detail is
-// intentionally loaded after the job rows are closed, so the same SQLite
-// connection can safely serve both queries.
+// ListPage is retained for Bot page navigation. The Web UI uses ListCursor;
+// Bot callbacks carry only a human page number, so use one bounded SQL query
+// rather than replaying every earlier page for a deep page request.
 func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 	if page < 1 {
 		page = 1
@@ -357,14 +476,69 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := m.db.Query(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, attempts, status, error, created_at, updated_at FROM download_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?`, pageSize, (page-1)*pageSize)
+	if total == 0 {
+		return []Job{}, 0, nil
+	}
+	pages := (total + pageSize - 1) / pageSize
+	if page > pages {
+		page = pages
+	}
+	offset := (page - 1) * pageSize
+	return m.listSummaries("", `ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?`, []any{pageSize, offset}, total)
+}
+
+// ListCursor is stable when new tasks are inserted: it continues after the
+// last row seen rather than making deep pages increasingly expensive with
+// OFFSET. Its jobs intentionally omit Items; file details are fetched on row
+// expansion through Get.
+func (m *Manager) ListCursor(cursor string, pageSize int) ([]Job, int, string, error) {
+	if pageSize < 1 {
+		pageSize = 10
+	}
+	if pageSize > 50 {
+		pageSize = 50
+	}
+	var total int
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs`).Scan(&total); err != nil {
+		return nil, 0, "", err
+	}
+	where := ""
+	pagination := `ORDER BY j.created_at DESC, j.id DESC LIMIT ?`
+	args := []any{pageSize + 1}
+	if cursor != "" {
+		createdAt, id, err := decodeJobCursor(cursor)
+		if err != nil {
+			return nil, 0, "", errors.New("分页游标无效，请返回第一页")
+		}
+		where = `WHERE (j.created_at < ? OR (j.created_at = ? AND j.id < ?))`
+		args = []any{createdAt, createdAt, id, pageSize + 1}
+	}
+	jobs, total, err := m.listSummaries(where, pagination, args, total)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	next := ""
+	if len(jobs) > pageSize {
+		jobs = jobs[:pageSize]
+		last := jobs[len(jobs)-1]
+		next = encodeJobCursor(last.CreatedAt, last.ID)
+	}
+	return jobs, total, next, nil
+}
+
+func (m *Manager) listSummaries(where, pagination string, args []any, total int) ([]Job, int, error) {
+	query := `SELECT j.id, j.source_url, j.dialog_type, j.dialog_key, j.dialog_name, j.account_id, j.attempts, j.status, j.error, j.created_at, j.updated_at,
+ COUNT(i.id), COALESCE(SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(MAX(NULLIF(i.message_text, '')), '')
+ FROM download_jobs j LEFT JOIN download_items i ON i.job_id = j.id ` + where + `
+ GROUP BY j.id ` + pagination
+	rows, err := m.db.Query(query, args...)
 	if err != nil {
 		return nil, 0, err
 	}
 	jobs := make([]Job, 0)
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.TotalItems, &job.CompletedItems, &job.MessageText); err != nil {
 			_ = rows.Close()
 			return nil, 0, err
 		}
@@ -379,64 +553,66 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 	}
 	for index := range jobs {
 		jobs[index].HasPublicLink = isPublicMessageLink(jobs[index].SourceURL)
-		items, err := m.items(jobs[index].ID)
-		if err != nil {
-			return nil, 0, err
-		}
-		jobs[index].Items = items
-		jobs[index].TotalItems = len(items)
-		for _, item := range items {
-			if jobs[index].MessageText == "" && item.MessageText != "" {
-				jobs[index].MessageText = item.MessageText
-			}
-			if item.Status == "completed" {
-				jobs[index].CompletedItems++
-			}
-		}
 	}
 	return jobs, total, nil
 }
 
+func encodeJobCursor(createdAt, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(createdAt + "\x00" + id))
+}
+
+func decodeJobCursor(cursor string) (string, string, error) {
+	data, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return "", "", err
+	}
+	parts := strings.SplitN(string(data), "\x00", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", errors.New("invalid cursor")
+	}
+	return parts[0], parts[1], nil
+}
+
 func (m *Manager) Summary() (active, completedItems, failedItems int) {
-	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'running', 'downloaded', 'paused')`).Scan(&active)
-	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status = 'completed'`).Scan(&completedItems)
-	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status = 'failed'`).Scan(&failedItems)
+	_ = m.db.QueryRow(`SELECT
+ COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'downloaded', 'paused') THEN 1 ELSE 0 END), 0),
+ COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
+ COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+ FROM download_items`).Scan(&active, &completedItems, &failedItems)
 	return
+}
+
+// ActiveAccountJobs reports work that would lose its bound Telegram session if
+// the account were removed. Terminal history does not block account removal.
+func (m *Manager) ActiveAccountJobs(accountID string) (int, error) {
+	var count int
+	err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE account_id = ? AND status IN ('queued', 'running', 'paused')`, accountID).Scan(&count)
+	return count, err
 }
 
 func (m *Manager) LiveProgress() []FileProgress {
 	return m.progress.Snapshot()
 }
 
+// Stop asks all active upstream transfers to stop at a resumable boundary.
+// It is called before process shutdown so a restart does not depend on a hard
+// kill to recover task state.
+func (m *Manager) Stop() {
+	m.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.cancels))
+	for _, cancel := range m.cancels {
+		cancels = append(cancels, cancel)
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 // Revision increases only when persistent task state changes. It lets the UI
 // avoid polling SQLite while still refreshing promptly after state transitions.
 func (m *Manager) Revision() uint64 { return m.revision.Load() }
 func (m *Manager) touch()           { m.revision.Add(1) }
-
-func (m *Manager) Enqueue(ctx context.Context, sourceURL string) (Job, error) {
-	submission, err := m.Submit(ctx, DownloadIntent{Source: SourceWeb, URL: sourceURL})
-	if err != nil {
-		return Job{}, err
-	}
-	if submission.Duplicate {
-		return submission.Job, ErrDuplicate
-	}
-	return submission.Job, nil
-}
-
-// EnqueueReaction creates a normal download job from a reaction update. The
-// message is resolved with the exact InputPeer supplied by Telegram, so private
-// chats and channels work without requiring a shareable public message link.
-func (m *Manager) EnqueueReaction(ctx context.Context, accountID, sourceURL, dialogName string, dialogID int64, peer tg.InputPeerClass, messageID int) (Job, error) {
-	submission, err := m.Submit(ctx, DownloadIntent{Source: SourceReaction, AccountID: accountID, Message: &MessageRef{SourceURL: sourceURL, DialogName: dialogName, DialogID: dialogID, InputPeer: peer, MessageID: messageID}})
-	if err != nil {
-		return Job{}, err
-	}
-	if submission.Duplicate {
-		return submission.Job, ErrDuplicate
-	}
-	return submission.Job, nil
-}
 
 // taskLogFiles adds useful creation context without exposing final paths.
 // File names are the original Telegram media names and are emitted only once
@@ -484,6 +660,21 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 		}
 	}
 	if existingID != "" {
+		var existingStatus string
+		if err := tx.QueryRow(`SELECT status FROM download_jobs WHERE id = ?`, existingID).Scan(&existingStatus); err != nil {
+			return Submission{}, err
+		}
+		reactivated := existingStatus == "cancelled"
+		if reactivated {
+			if _, err := tx.Exec(`UPDATE download_jobs SET status = 'queued', error = '', updated_at = ? WHERE id = ? AND status = 'cancelled'`, now, existingID); err != nil {
+				return Submission{}, err
+			}
+			// Completed files are already safely published and must never be
+			// downloaded again. Every other file restarts or resumes normally.
+			if _, err := tx.Exec(`UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, existingID); err != nil {
+				return Submission{}, err
+			}
+		}
 		if _, err = tx.Exec(`INSERT INTO download_requests(id, job_id, source_kind, account_id, source_url, dialog_key, message_id, trigger_json, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'duplicate', ?)`, requestID, existingID, intent.Source, intent.AccountID, intent.URL, sources[0].DialogKey, sources[0].MessageID, trigger, now); err != nil {
 			return Submission{}, err
 		}
@@ -493,6 +684,12 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 		job, err := m.Get(existingID)
 		if err != nil {
 			return Submission{}, err
+		}
+		if reactivated {
+			m.touch()
+			m.emit(existingID, requestID, "job_reactivated", "queued")
+			m.signal()
+			return Submission{RequestID: requestID, Job: job, Duplicate: true, Reactivated: true}, nil
 		}
 		m.emit(existingID, requestID, "request_attached", job.Status)
 		return Submission{RequestID: requestID, Job: job, Duplicate: true}, nil
@@ -520,15 +717,54 @@ func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct 
 
 func (m *Manager) worker() {
 	for {
+		if !m.acquireJobSlot() {
+			return
+		}
 		job, sources, err := m.nextQueued()
 		if err == nil && job.ID != "" {
 			m.run(job, sources)
+			m.releaseJobSlot()
 			continue
 		}
+		m.releaseJobSlot()
 		select {
 		case <-m.wake:
 		case <-time.After(3 * time.Second):
 		}
+	}
+}
+
+// acquireJobSlot applies the configured cross-task limit in this wrapper. It
+// is intentionally independent from upstream tdl's per-invocation media
+// limit, so two distinct Telegram links can run at the same time.
+func (m *Manager) acquireJobSlot() bool {
+	for {
+		m.slotMu.Lock()
+		limit := m.settings.Get().Download.ConcurrentJobs
+		if m.activeJobs < limit {
+			m.activeJobs++
+			m.slotMu.Unlock()
+			return true
+		}
+		m.slotMu.Unlock()
+		// A release wakes one waiting worker immediately. The timeout also
+		// picks up a changed concurrency setting without busy-waiting.
+		select {
+		case <-m.slotWake:
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (m *Manager) releaseJobSlot() {
+	m.slotMu.Lock()
+	if m.activeJobs > 0 {
+		m.activeJobs--
+	}
+	m.slotMu.Unlock()
+	select {
+	case m.slotWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -557,25 +793,39 @@ func (m *Manager) run(job Job, sources []source) {
 	m.touch()
 	m.emit(job.ID, "", "job_status_changed", "running")
 	applog.Info("download", "task_started", "job_id", job.ID, "account_id", job.AccountID, "item_count", len(sources))
+	// Register cancellation before any per-file state mutation. A pause or
+	// cancellation that races task startup can then stop this worker before it
+	// starts an upstream transfer or overwrites the terminal task state.
+	ctx, cancel := context.WithCancel(context.Background())
+	m.mu.Lock()
+	m.cancels[job.ID] = cancel
+	m.mu.Unlock()
+	defer func() { cancel(); m.mu.Lock(); delete(m.cancels, job.ID); m.mu.Unlock() }()
+	defer m.progress.ClearJob(job.ID)
 	pending := make([]source, 0, len(sources))
 	for _, item := range sources {
+		if ctx.Err() != nil || m.status(job.ID) != "running" {
+			return
+		}
 		if item.Status == "completed" {
 			continue
 		}
 		pending = append(pending, item)
-		m.beginItemAttempt(item)
+		if err := m.beginItemAttempt(item); err != nil {
+			m.fail(job.ID, sources, fmt.Errorf("记录文件下载尝试失败: %w", err))
+			return
+		}
 	}
 	if len(pending) == 0 {
-		m.setJob(job.ID, "completed", "")
+		_ = m.setJob(job.ID, "completed", "")
 		return
 	}
-	base, stop := context.WithTimeout(context.Background(), 24*time.Hour)
-	ctx, cancel := context.WithCancel(base)
-	m.mu.Lock()
-	m.cancels[job.ID] = cancel
-	m.mu.Unlock()
-	defer func() { cancel(); stop(); m.mu.Lock(); delete(m.cancels, job.ID); m.mu.Unlock() }()
-	defer m.progress.ClearJob(job.ID)
+	if ctx.Err() != nil || m.status(job.ID) != "running" {
+		return
+	}
+	// A media transfer must not fail merely because it is slow. Cancellation is
+	// controlled by pause/cancel and graceful application shutdown instead of a
+	// fixed wall-clock deadline.
 	tmpDir := filepath.Join(m.downloadDir, ".tdl-tmp", job.ID)
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		m.fail(job.ID, pending, err)
@@ -599,34 +849,41 @@ func (m *Manager) run(job Job, sources []source) {
 		pendingByMessage[item.MessageID] = item
 	}
 	var publishWG sync.WaitGroup
+	var stateMu sync.Mutex
+	var stateErr error
+	recordStateErr := func(err error) {
+		if err == nil {
+			return
+		}
+		stateMu.Lock()
+		if stateErr == nil {
+			stateErr = err
+		}
+		stateMu.Unlock()
+	}
 	// A deleted task may have left an upstream resume key. Consume this one-shot
 	// marker so recreating it starts with a new temporary directory.
 	restart := m.consumeRestart(job.AccountID, job.SourceURL)
 	err = m.accounts.Run(ctx, job.AccountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		viper.Set(consts.FlagThreads, config.Download.Threads)
-		viper.Set(consts.FlagLimit, config.Download.TaskLimit)
-		viper.Set(consts.FlagPoolSize, config.Download.PoolSize)
-		viper.Set(consts.FlagDelay, time.Duration(config.Download.DelayMS)*time.Millisecond)
-		viper.Set(consts.FlagDisableProgressPS, true)
-		opts := upstreamDL.Options{URLs: []string{job.SourceURL}, Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Restart: restart, Quiet: true, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
+		opts := upstreamDL.Options{URLs: []string{job.SourceURL}, Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Restart: restart, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
 			item, ok := pendingByMessage[update.MessageID]
 			if !ok {
 				return
 			}
 			started, _ := m.progress.Update(job.ID, item.Item, update)
 			if started {
-				m.markItemStarted(item)
+				recordStateErr(m.markItemStarted(item))
 			}
 		}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
 			item, ok := pendingByMessage[update.MessageID]
 			if !ok {
 				return
 			}
-			m.markItemFinished(item)
+			recordStateErr(m.markItemFinished(item))
 			publishWG.Add(1)
 			go func() {
 				defer publishWG.Done()
-				m.publishItem(job.ID, update.Path, item, config)
+				recordStateErr(m.publishItem(job.ID, update.Path, item, config))
 			}()
 		}}
 		if peer := job.directInputPeer(); peer != nil {
@@ -639,6 +896,13 @@ func (m *Manager) run(job Job, sources []source) {
 	// publishing work is deliberately asynchronous, but the job state must not
 	// be decided until every accepted file has finished moving.
 	publishWG.Wait()
+	stateMu.Lock()
+	persistErr := stateErr
+	stateMu.Unlock()
+	if persistErr != nil {
+		m.fail(job.ID, pending, fmt.Errorf("保存下载状态失败: %w", persistErr))
+		return
+	}
 	if err != nil {
 		if m.status(job.ID) == "paused" {
 			for _, item := range pending {
@@ -653,7 +917,7 @@ func (m *Manager) run(job Job, sources []source) {
 		// media callbacks have already completed and every final move succeeded.
 		// The observable task result is still successful in that case.
 		if m.allItemsCompleted(job.ID) {
-			m.setJob(job.ID, "completed", "")
+			_ = m.setJob(job.ID, "completed", "")
 			_ = os.RemoveAll(tmpDir)
 			return
 		}
@@ -674,7 +938,7 @@ func (m *Manager) run(job Job, sources []source) {
 	if !m.allItemsCompleted(job.ID) {
 		m.fail(job.ID, pending, errors.New("部分文件未收到收尾完成回调或移动失败"))
 	} else {
-		m.setJob(job.ID, "completed", "")
+		_ = m.setJob(job.ID, "completed", "")
 		_ = os.RemoveAll(tmpDir)
 	}
 }
@@ -738,28 +1002,27 @@ func (m *Manager) allItemsCompleted(jobID string) bool {
 
 // publishItem moves a file only after upstream tdl has closed and finalized
 // its temporary file. It runs outside the upstream download worker.
-func (m *Manager) publishItem(jobID, path string, item source, config settings.Values) {
+func (m *Manager) publishItem(jobID, path string, item source, config settings.Values) error {
+	lock := m.jobLock(jobID)
+	lock.Lock()
+	defer lock.Unlock()
 	if m.status(jobID) != "running" {
-		return
+		return nil
 	}
 	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
 	if err != nil {
-		m.setItem(item, "failed", "", err.Error())
-		return
+		return m.setItem(item, "failed", "", err.Error())
 	}
 	if _, statErr := os.Stat(finalPath); statErr == nil {
-		m.setItem(item, "failed", "", "目标文件已存在，未覆盖")
-		return
+		return m.setItem(item, "failed", "", "目标文件已存在，未覆盖")
 	}
 	if err := publishNoReplace(path, finalPath); err != nil {
 		if errors.Is(err, unix.EEXIST) {
-			m.setItem(item, "failed", "", "目标文件已存在，未覆盖")
-			return
+			return m.setItem(item, "failed", "", "目标文件已存在，未覆盖")
 		}
-		m.setItem(item, "failed", "", err.Error())
-		return
+		return m.setItem(item, "failed", "", err.Error())
 	}
-	m.setItem(item, "completed", finalPath, "")
+	return m.setItem(item, "completed", finalPath, "")
 }
 
 func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]source, error) {
@@ -884,6 +1147,8 @@ func (m *Manager) sources(jobID string) ([]source, error) {
 	return result, nil
 }
 func (m *Manager) signal() {
+	// Keep one wake-up per worker so several newly queued jobs can begin in
+	// parallel instead of waiting for the workers' idle polling timeout.
 	select {
 	case m.wake <- struct{}{}:
 	default:
@@ -901,6 +1166,9 @@ func (m *Manager) itemStatus(dialogKey string, messageID int) string {
 }
 
 func (m *Manager) Pause(id string) error {
+	lock := m.jobLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	status := m.status(id)
 	if status == "" {
 		return errors.New("下载任务不存在")
@@ -908,11 +1176,9 @@ func (m *Manager) Pause(id string) error {
 	if status != "queued" && status != "running" {
 		return errors.New("当前任务不能暂停")
 	}
-	m.setJob(id, "paused", "已暂停，可继续恢复")
-	if status == "queued" {
-		_, _ = m.db.Exec(`UPDATE download_items SET status = 'paused' WHERE job_id = ? AND status != 'completed'`, id)
-		m.touch()
-		return nil
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := m.transitionItems(id, status, "paused", "已暂停，可继续恢复", `UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('queued', 'running', 'downloaded')`, now, id); err != nil {
+		return fmt.Errorf("暂停任务: %w", err)
 	}
 	m.mu.Lock()
 	cancel := m.cancels[id]
@@ -923,19 +1189,25 @@ func (m *Manager) Pause(id string) error {
 	return nil
 }
 func (m *Manager) Resume(id string) error {
+	lock := m.jobLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	if m.status(id) != "paused" {
 		return errors.New("当前任务不能恢复")
 	}
-	m.setJob(id, "queued", "")
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, id)
-	m.touch()
+	if err := m.transitionItems(id, "paused", "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
+		return fmt.Errorf("恢复任务: %w", err)
+	}
 	m.signal()
 	return nil
 }
 func (m *Manager) Retry(id string) error {
+	lock := m.jobLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	status := m.status(id)
-	if status != "failed" && status != "partial" {
-		return errors.New("只有失败或部分完成任务可以重试")
+	if status != "failed" && status != "partial" && status != "cancelled" {
+		return errors.New("只有失败、部分完成或已取消任务可以重新开始")
 	}
 	var accountID string
 	if err := m.db.QueryRow(`SELECT account_id FROM download_jobs WHERE id = ?`, id).Scan(&accountID); err != nil {
@@ -946,27 +1218,61 @@ func (m *Manager) Retry(id string) error {
 	}
 	// Attempts count real worker runs, not clicks. The worker increments it only
 	// after atomically claiming this queued task.
-	_, _ = m.db.Exec(`UPDATE download_jobs SET status = 'queued', error = '', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), id)
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'queued', error = '' WHERE job_id = ? AND status != 'completed'`, id)
-	m.touch()
-	m.emit(id, "", "job_status_changed", "queued")
+	if err := m.transitionItems(id, status, "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
+		return fmt.Errorf("重试任务: %w", err)
+	}
 	m.signal()
 	return nil
 }
 func (m *Manager) Cancel(id string) error {
+	lock := m.jobLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	status := m.status(id)
 	if status != "queued" && status != "running" && status != "paused" {
 		return errors.New("当前任务不能取消")
 	}
-	m.setJob(id, "cancelled", "已取消；临时文件保留，可手动清理")
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status != 'completed'`, time.Now().UTC().Format(time.RFC3339Nano), id)
-	m.touch()
+	if err := m.transitionItems(id, status, "cancelled", "已取消；临时文件保留，可手动清理", `UPDATE download_items SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status != 'completed'`, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+		return fmt.Errorf("取消任务: %w", err)
+	}
 	m.mu.Lock()
 	cancel := m.cancels[id]
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	return nil
+}
+
+// transitionItems updates the task and its non-final file rows in one SQLite
+// transaction. A control request therefore never leaves a task marked as
+// paused/cancelled/queued while its file rows still describe a different
+// durable state.
+func (m *Manager) transitionItems(id, expected, next, message, itemSQL string, args ...any) error {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, next, message, time.Now().UTC().Format(time.RFC3339), id, expected)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errors.New("任务状态已变化，请刷新后重试")
+	}
+	if _, err := tx.Exec(itemSQL, args...); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.touch()
+	m.emit(id, "", "job_status_changed", next)
 	return nil
 }
 
@@ -991,9 +1297,18 @@ func (m *Manager) Delete(id string) error {
 		return err
 	}
 	if accountID != "" {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO download_resets(account_id, source_url) VALUES (?, ?)`, accountID, sourceURL); err != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO download_resets(account_id, source_url, created_at) VALUES (?, ?, ?)`, accountID, sourceURL, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
+	}
+	// These are historical/audit child records. They deliberately retain no
+	// foreign-key cascade for old databases, so delete them explicitly in the
+	// same transaction before removing their task.
+	if _, err := tx.Exec(`DELETE FROM download_events WHERE job_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM download_requests WHERE job_id = ?`, id); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM download_items WHERE job_id = ?`, id); err != nil {
 		return err
@@ -1026,53 +1341,74 @@ func (m *Manager) consumeRestart(accountID, sourceURL string) bool {
 	}
 	return tx.Commit() == nil
 }
-func (m *Manager) setJob(id, status, message string) {
-	_, _ = m.db.Exec(`UPDATE download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, status, message, time.Now().UTC().Format(time.RFC3339), id)
+func (m *Manager) jobLock(id string) *sync.Mutex {
+	var hash uint32
+	for index := 0; index < len(id); index++ {
+		hash = hash*33 + uint32(id[index])
+	}
+	return &m.jobLocks[hash%uint32(len(m.jobLocks))]
+}
+
+func (m *Manager) setJob(id, status, message string) error {
+	if _, err := m.db.Exec(`UPDATE download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, status, message, time.Now().UTC().Format(time.RFC3339), id); err != nil {
+		applog.Error("download", "task_state_save_failed", "job_id", id, "status", status, "error", err.Error())
+		return err
+	}
 	m.touch()
 	m.emit(id, "", "job_status_changed", status)
+	return nil
 }
-func (m *Manager) setItem(item source, status, path, message string) {
+func (m *Manager) setItem(item source, status, path, message string) error {
 	finishedAt := ""
 	if status == "completed" || status == "failed" || status == "cancelled" {
 		finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, _ = m.db.Exec(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ?`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID)
+	if _, err := m.db.Exec(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ?`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID); err != nil {
+		applog.Error("download", "item_state_save_failed", "dialog_key", item.DialogKey, "message_id", item.MessageID, "status", status, "error", err.Error())
+		return err
+	}
 	m.touch()
+	return nil
 }
-func (m *Manager) beginItemAttempt(item source) {
+func (m *Manager) beginItemAttempt(item source) error {
 	// A task may be running while this particular file is still waiting for an
 	// upstream worker slot. It becomes "running" only on its first byte-level
 	// progress callback.
-	_, _ = m.db.Exec(`UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID)
-	m.touch()
+	return m.execItemState("item_attempt_save_failed", `UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID)
 }
 func (m *Manager) pauseItem(item source) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ? AND status IN ('queued', 'running')`, now, item.DialogKey, item.MessageID)
-	m.touch()
+	m.execItemState("item_pause_save_failed", `UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ? AND status IN ('queued', 'running')`, now, item.DialogKey, item.MessageID)
 }
-func (m *Manager) markItemStarted(item source) {
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
-	m.touch()
+func (m *Manager) markItemStarted(item source) error {
+	return m.execItemState("item_start_save_failed", `UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
 }
-func (m *Manager) markItemFinished(item source) {
-	_, _ = m.db.Exec(`UPDATE download_items SET status = 'downloaded', finished_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'running' AND started_at != '' AND finished_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
+func (m *Manager) markItemFinished(item source) error {
+	return m.execItemState("item_finish_save_failed", `UPDATE download_items SET status = 'downloaded', finished_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'running' AND started_at != '' AND finished_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
+}
+
+func (m *Manager) execItemState(event, query string, args ...any) error {
+	if _, err := m.db.Exec(query, args...); err != nil {
+		applog.Error("download", event, "error", err.Error())
+		return err
+	}
 	m.touch()
+	return nil
 }
 func (m *Manager) fail(id string, sources []source, err error) {
 	for _, item := range sources {
 		if m.itemStatus(item.DialogKey, item.MessageID) == "completed" {
 			continue
 		}
-		m.setItem(item, "failed", "", err.Error())
+		_ = m.setItem(item, "failed", "", err.Error())
 	}
 	var completed int
 	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, id).Scan(&completed)
 	if completed > 0 {
-		m.setJob(id, "partial", "部分文件未完成，可重试失败文件")
+		_ = m.setJob(id, "partial", "部分文件未完成，可重试失败文件")
 		return
 	}
-	m.setJob(id, "failed", err.Error())
+	_ = m.setJob(id, "failed", err.Error())
 }
 
 func renderName(pattern string, item source) (string, error) {

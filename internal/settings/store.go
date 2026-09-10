@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,14 +10,18 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"text/template"
+	"time"
 	"unicode"
 
+	"github.com/iyear/tdl/pkg/tplfunc"
 	"github.com/vacks/tdl/internal/applog"
 )
 
 type Download struct {
 	Threads               int    `json:"threads"`
-	TaskLimit             int    `json:"taskLimit"`
+	TaskLimit             int    `json:"taskLimit"` // media files concurrently processed within one task
+	ConcurrentJobs        int    `json:"concurrentJobs"`
 	PoolSize              int    `json:"poolSize"`
 	DelayMS               int    `json:"delayMs"`
 	TempFilenameTemplate  string `json:"tempFilenameTemplate"`
@@ -45,16 +50,23 @@ type Reaction struct {
 	Emojis  []string `json:"emojis"`
 }
 
+// Cleanup controls retention of terminal task history and reaction inbox
+// records. Final downloaded files are never removed by this policy.
+type Cleanup struct {
+	RetentionDays int `json:"retentionDays"`
+}
+
 type Values struct {
 	ProxyURL string   `json:"proxyUrl"`
 	Download Download `json:"download"`
 	Bot      Bot      `json:"bot"`
 	Reaction Reaction `json:"reaction"`
+	Cleanup  Cleanup  `json:"cleanup"`
 }
 
 func Defaults() Values {
 	return Values{Download: Download{
-		Threads: 4, TaskLimit: 2, PoolSize: 8, DelayMS: 0,
+		Threads: 4, TaskLimit: 2, ConcurrentJobs: 1, PoolSize: 8, DelayMS: 0,
 		// This is evaluated by upstream tdl while it writes to the private
 		// temporary directory. Keep it limited to variables/functions supported
 		// by upstream tdl.
@@ -62,7 +74,7 @@ func Defaults() Values {
 		// This is evaluated by the web application after download and therefore
 		// can include our MessageText mapping.
 		FinalFilenameTemplate: "{{ .DialogID }}_{{ .MessageID }}_{{ if .MessageText }}{{ .MessageText }}_{{ end }}{{ .FileName }}",
-	}, Bot: Bot{Notifications: BotNotifications{TaskCreated: true, TaskCompleted: true, TaskPartial: true, TaskFailed: true}}, Reaction: Reaction{Emojis: []string{"👍"}}}
+	}, Bot: Bot{Notifications: BotNotifications{TaskCreated: true, TaskCompleted: true, TaskPartial: true, TaskFailed: true}}, Reaction: Reaction{Emojis: []string{"👍"}}, Cleanup: Cleanup{RetentionDays: 90}}
 }
 
 type Store struct {
@@ -75,6 +87,13 @@ func Open(dataDir string) (*Store, error) {
 	s := &Store{path: filepath.Join(dataDir, "settings.json"), values: Defaults()}
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
+		data, err := json.MarshalIndent(s.values, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		if err := writePrivateFile(s.path, data); err != nil {
+			return nil, fmt.Errorf("create default settings: %w", err)
+		}
 		return s, nil
 	}
 	if err != nil {
@@ -83,8 +102,10 @@ func Open(dataDir string) (*Store, error) {
 	if err := json.Unmarshal(data, &s.values); err != nil {
 		return nil, fmt.Errorf("parse settings: %w", err)
 	}
+	normalizeDownload(&s.values.Download)
 	normalizeBot(&s.values.Bot)
 	normalizeReaction(&s.values.Reaction)
+	normalizeCleanup(&s.values.Cleanup)
 	if err := Validate(s.values); err != nil {
 		return nil, fmt.Errorf("validate settings: %w", err)
 	}
@@ -94,8 +115,10 @@ func Open(dataDir string) (*Store, error) {
 func (s *Store) Get() Values      { s.mu.RLock(); defer s.mu.RUnlock(); return s.values }
 func (s *Store) ProxyURL() string { s.mu.RLock(); defer s.mu.RUnlock(); return s.values.ProxyURL }
 func (s *Store) Update(values Values) error {
+	normalizeDownload(&values.Download)
 	normalizeBot(&values.Bot)
 	normalizeReaction(&values.Reaction)
+	normalizeCleanup(&values.Cleanup)
 	if err := Validate(values); err != nil {
 		return err
 	}
@@ -130,7 +153,10 @@ func Validate(values Values) error {
 		return errors.New("单任务下载线程数需在 1 至 32 之间")
 	}
 	if d.TaskLimit < 1 || d.TaskLimit > 16 {
-		return errors.New("同时下载任务数需在 1 至 16 之间")
+		return errors.New("单任务同时下载文件数需在 1 至 16 之间")
+	}
+	if d.ConcurrentJobs < 1 || d.ConcurrentJobs > 16 {
+		return errors.New("同时执行下载任务数需在 1 至 16 之间")
 	}
 	if d.PoolSize < 0 || d.PoolSize > 64 {
 		return errors.New("连接池大小需在 0 至 64 之间")
@@ -143,6 +169,12 @@ func Validate(values Values) error {
 	}
 	if strings.TrimSpace(d.FinalFilenameTemplate) == "" {
 		return errors.New("最终文件命名模板不能为空")
+	}
+	if err := validateTempTemplate(d.TempFilenameTemplate); err != nil {
+		return err
+	}
+	if err := validateFinalTemplate(d.FinalFilenameTemplate); err != nil {
+		return err
 	}
 	b := values.Bot
 	if b.Enabled && strings.TrimSpace(b.Token) == "" {
@@ -159,7 +191,55 @@ func Validate(values Values) error {
 			return errors.New("触发表情仅支持普通 Unicode 表情")
 		}
 	}
+	if values.Cleanup.RetentionDays < 1 || values.Cleanup.RetentionDays > 3650 {
+		return errors.New("历史保留天数需在 1 至 3650 天之间")
+	}
 	return nil
+}
+
+func validateTempTemplate(pattern string) error {
+	// Use the exact function registry linked into upstream tdl. This keeps the
+	// Web validator in lockstep with its temporary-file renderer instead of
+	// rejecting a valid upstream helper or accepting a nonexistent one.
+	funcs := tplfunc.FuncMap(tplfunc.All...)
+	tpl, err := template.New("temporary filename").Option("missingkey=error").Funcs(funcs).Parse(pattern)
+	if err != nil {
+		return fmt.Errorf("临时文件命名模板无效: %w", err)
+	}
+	var rendered bytes.Buffer
+	data := map[string]any{"DialogID": int64(1), "MessageID": 1, "MessageDate": time.Now().Unix(), "FileName": "file.txt", "FileCaption": "caption", "FileSize": "1 KB", "DownloadDate": time.Now().Unix()}
+	if err := tpl.Execute(&rendered, data); err != nil {
+		return fmt.Errorf("临时文件命名模板无效: %w", err)
+	}
+	return nil
+}
+
+func validateFinalTemplate(pattern string) error {
+	funcs := template.FuncMap{
+		"formatDate": func(_ int64, layout string) string { return time.Now().Format(layout) },
+	}
+	tpl, err := template.New("final filename").Option("missingkey=error").Funcs(funcs).Parse(pattern)
+	if err != nil {
+		return fmt.Errorf("最终文件命名模板无效: %w", err)
+	}
+	var rendered bytes.Buffer
+	data := map[string]any{"DialogID": int64(1), "DialogName": "dialog", "MessageID": 1, "GroupedID": int64(0), "MessageText": "message", "FileName": "file.txt", "FileExt": ".txt", "DownloadDate": time.Now().Unix()}
+	if err := tpl.Execute(&rendered, data); err != nil {
+		return fmt.Errorf("最终文件命名模板无效: %w", err)
+	}
+	return nil
+}
+
+func normalizeDownload(download *Download) {
+	if download.ConcurrentJobs == 0 {
+		download.ConcurrentJobs = Defaults().Download.ConcurrentJobs
+	}
+}
+
+func normalizeCleanup(cleanup *Cleanup) {
+	if cleanup.RetentionDays == 0 {
+		cleanup.RetentionDays = Defaults().Cleanup.RetentionDays
+	}
 }
 
 func normalizeBot(bot *Bot) {

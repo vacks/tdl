@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
-import { api } from '@/api'
+import { APIError, api } from '@/api'
 
 type Account = {
   id: string; telegramId?: number; firstName?: string; lastName?: string; username?: string
@@ -65,7 +65,12 @@ async function removeAccount(account: Account) {
     await api(`/api/telegram/accounts/${account.id}`, { method: 'DELETE' })
     if (loginAccountId.value === account.id) closeLogin()
     await load()
-  } catch { /* 用户取消或请求失败时无需额外处理 */ }
+  } catch (error) {
+    // Element Plus uses a non-Error rejection for a user cancellation; actual
+    // API failures (including incomplete sensitive-file cleanup) must remain
+    // visible to the administrator.
+    if (error instanceof APIError || error instanceof Error) ElMessage.error(error.message)
+  }
 }
 async function renewAccount(account: Account) {
   try {
@@ -103,8 +108,8 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
 
 <template>
   <el-container class="shell">
-    <el-aside width="244px"><div class="brand">tdl <span>WEB</span></div><el-menu default-active="/accounts" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">Telegram 账户</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">功能配置</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>v0.1.0</b></span></div></el-aside>
-    <el-container><el-header><span>Telegram 账户</span><el-button text @click="logout">退出管理台</el-button></el-header>
+    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/accounts" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>v0.1.0</b></span></div></el-aside>
+    <el-container><el-header><span>登录管理</span><el-button text @click="logout">退出管理台</el-button></el-header>
       <el-main class="accounts-page">
         <section class="page-heading"><div><p class="eyebrow">ACCOUNT MANAGEMENT</p><h1>Telegram 登录管理</h1><p class="subtle">每个账户独立保存会话，可随时切换当前用于下载和 Bot 功能的账户。</p></div><el-button type="primary" :loading="loading" @click="startLogin">添加 Telegram 账户</el-button></section>
         <el-alert title="请用已登录的 Telegram 手机客户端扫描二维码。" type="info" show-icon :closable="false" />

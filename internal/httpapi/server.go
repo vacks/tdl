@@ -2,14 +2,18 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vacks/tdl/internal/adapter/upstream"
@@ -40,6 +44,15 @@ type Server struct {
 	bot       *bot.Service
 	reactions *reaction.Service
 	mux       *http.ServeMux
+	sseSlots  chan struct{}
+	loginMu   sync.Mutex
+	logins    map[string]loginAttempt
+}
+
+type loginAttempt struct {
+	failures int
+	until    time.Time
+	updated  time.Time
 }
 
 func New(cfg config.Config) (*Server, error) {
@@ -62,7 +75,7 @@ func New(cfg config.Config) (*Server, error) {
 	reactions := reaction.New(settingsStore, telegram, downloads)
 	reactions.Start()
 	systemMonitor := monitor.New(cfg.DownloadDir)
-	s := &Server{cfg: cfg, accounts: accounts, sessions: auth.NewSessions(), telegram: telegram, settings: settingsStore, downloads: downloads, monitor: systemMonitor, bot: bot.New(settingsStore, downloads, telegram, systemMonitor, cfg.DataDir), reactions: reactions, mux: http.NewServeMux()}
+	s := &Server{cfg: cfg, accounts: accounts, sessions: auth.NewSessions(), telegram: telegram, settings: settingsStore, downloads: downloads, monitor: systemMonitor, bot: bot.New(settingsStore, downloads, telegram, systemMonitor, cfg.DataDir), reactions: reactions, mux: http.NewServeMux(), sseSlots: make(chan struct{}, 8), logins: make(map[string]loginAttempt)}
 	s.routes()
 	return s, nil
 }
@@ -71,9 +84,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
 	s.mux.ServeHTTP(recorder, r)
-	if strings.HasPrefix(r.URL.Path, "/api/") {
+	// Domain services already log meaningful state changes. Suppress routine
+	// polling and stale-session 401s so a dashboard tab cannot turn Docker's
+	// stdout log into a high-frequency disk write stream.
+	if strings.HasPrefix(r.URL.Path, "/api/") && r.Method != http.MethodGet && recorder.status < 400 {
 		applog.Info("http", "request_completed", "method", r.Method, "path", r.URL.Path, "status", recorder.status, "duration_ms", time.Since(start).Milliseconds())
 	}
+}
+
+// Stop releases background connections and active downloads before process exit.
+func (s *Server) Stop() {
+	s.bot.Stop()
+	s.reactions.Stop()
+	s.downloads.Stop()
+	s.telegram.Stop()
 }
 
 type responseRecorder struct {
@@ -105,7 +129,32 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/downloads", s.requireAuth(s.downloadsAPI))
 	s.mux.HandleFunc("/api/downloads/progress", s.requireAuth(s.downloadProgressSSE))
 	s.mux.HandleFunc("/api/downloads/", s.requireAuth(s.downloadControlAPI))
+	s.mux.HandleFunc("/api/maintenance/cleanup", s.requireAuth(s.cleanupHistory))
 	s.mux.HandleFunc("/", s.app)
+}
+
+func (s *Server) cleanupHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var input struct {
+		RetentionDays int `json:"retentionDays"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式无效"})
+		return
+	}
+	if input.RetentionDays < 1 || input.RetentionDays > 3650 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "历史保留天数需在 1 至 3650 天之间"})
+		return
+	}
+	result, err := s.downloads.CleanupHistory(input.RetentionDays)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -125,11 +174,18 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
+	client := s.loginClient(r)
+	if retry := s.loginRetryAfter(client); retry > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "登录尝试过于频繁，请稍后再试"})
+		return
+	}
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&input); err != nil || !s.accounts.Verify(input.Username, input.Password) {
+		s.recordLoginFailure(client)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "用户名或密码不正确"})
 		return
 	}
@@ -138,7 +194,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "无法创建会话"})
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	s.clearLoginFailures(client)
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -146,7 +203,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		s.sessions.Delete(c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -167,6 +224,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	s.sessions.Clear()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -221,7 +279,31 @@ func (s *Server) telegramAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[0]
 	if len(parts) == 1 && r.Method == http.MethodDelete {
+		active, err := s.downloads.ActiveAccountJobs(id)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if active > 0 {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": fmt.Sprintf("该账户仍有 %d 个排队、下载中或暂停任务，请先处理这些任务", active)})
+			return
+		}
+		stopCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		err = s.reactions.StopAccount(stopCtx, id)
+		cancel()
+		if err != nil {
+			s.reactions.ResumeAccount(id)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "等待表情监听停止失败: " + err.Error()})
+			return
+		}
 		if err := s.telegram.Delete(id); err != nil {
+			accounts, _ := s.telegram.List()
+			for _, account := range accounts {
+				if account.ID == id {
+					s.reactions.ResumeAccount(id)
+					break
+				}
+			}
 			telegramError(w, err)
 			return
 		}
@@ -268,21 +350,17 @@ func telegramError(w http.ResponseWriter, err error) {
 func (s *Server) downloadsAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 		pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
-		if page < 1 {
-			page = 1
-		}
 		if pageSize < 1 {
 			pageSize = 10
 		}
 		revision := s.downloads.Revision()
-		jobs, total, err := s.downloads.ListPage(page, pageSize)
+		jobs, total, nextCursor, err := s.downloads.ListCursor(r.URL.Query().Get("cursor"), pageSize)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "total": total, "page": page, "pageSize": pageSize, "revision": revision})
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "total": total, "pageSize": pageSize, "nextCursor": nextCursor, "revision": revision})
 	case http.MethodPost:
 		var input struct {
 			URL string `json:"url"`
@@ -314,9 +392,17 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unavailable", http.StatusInternalServerError)
 		return
 	}
+	select {
+	case s.sseSlots <- struct{}{}:
+		defer func() { <-s.sseSlots }()
+	default:
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "已有过多实时连接，请关闭多余页面后重试"})
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	events, unsubscribe := s.downloads.SubscribeEvents()
 	defer unsubscribe()
 	write := func(event *download.Event) bool {
@@ -339,7 +425,7 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 	if !write(nil) {
 		return
 	}
-	ticker := time.NewTicker(750 * time.Millisecond)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -359,8 +445,21 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) downloadControlAPI(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/downloads/"), "/"), "/")
-	if len(parts) != 2 || parts[0] == "" {
+	if parts[0] == "" || len(parts) > 2 {
 		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 1 {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		job, err := s.downloads.Get(parts[0])
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, job)
 		return
 	}
 	if parts[1] == "delete" {
@@ -410,7 +509,96 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "请先登录"})
 			return
 		}
+		if unsafeMethod(r.Method) && !s.validRequestOrigin(r) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "请求来源校验失败"})
+			return
+		}
 		next(w, r)
+	}
+}
+
+func unsafeMethod(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete
+}
+
+func (s *Server) validRequestOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// The SPA adds this non-simple header to every state-changing request;
+		// a cross-site form cannot forge it without a successful CORS preflight.
+		return r.Header.Get("X-Requested-With") == "TDL-Web"
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if origin == scheme+"://"+r.Host {
+		return true
+	}
+	for _, trusted := range s.cfg.TrustedOrigins {
+		if origin == trusted {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) loginClient(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		for _, value := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+			candidate := strings.TrimSpace(value)
+			if net.ParseIP(candidate) != nil {
+				return candidate
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (s *Server) loginRetryAfter(client string) time.Duration {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	s.pruneLoginAttemptsLocked(time.Now())
+	attempt := s.logins[client]
+	if time.Now().Before(attempt.until) {
+		return time.Until(attempt.until)
+	}
+	return 0
+}
+
+func (s *Server) recordLoginFailure(client string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	now := time.Now()
+	s.pruneLoginAttemptsLocked(now)
+	attempt := s.logins[client]
+	attempt.failures++
+	if attempt.failures >= 5 {
+		delay := time.Second * time.Duration(1<<min(attempt.failures-5, 6))
+		if delay > time.Minute {
+			delay = time.Minute
+		}
+		attempt.until = now.Add(delay)
+	}
+	attempt.updated = now
+	s.logins[client] = attempt
+}
+
+func (s *Server) clearLoginFailures(client string) {
+	s.loginMu.Lock()
+	delete(s.logins, client)
+	s.loginMu.Unlock()
+}
+
+func (s *Server) pruneLoginAttemptsLocked(now time.Time) {
+	for client, attempt := range s.logins {
+		if !attempt.updated.IsZero() && now.Sub(attempt.updated) > 15*time.Minute {
+			delete(s.logins, client)
+		}
 	}
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {

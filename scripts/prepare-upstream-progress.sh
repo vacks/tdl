@@ -3,10 +3,15 @@ set -eu
 
 tdl_version="v0.20.4"
 patch_file="patches/tdl-progress-0.20.4.patch"
+runtime_patch="patches/tdl-runtime-options-0.20.4.patch"
 target_dir=".upstream/tdl"
 
 if [ ! -f "$patch_file" ]; then
   echo "missing upstream progress patch: $patch_file" >&2
+  exit 1
+fi
+if [ ! -f "$runtime_patch" ]; then
+  echo "missing upstream runtime options patch: $runtime_patch" >&2
   exit 1
 fi
 
@@ -43,6 +48,11 @@ chmod -R u+w "$target_dir"
 
 if ! (cd "$target_dir" && patch --batch --forward -p1 < "../../$patch_file"); then
   echo "tdl progress patch did not apply; refusing to build an unpatched image" >&2
+  rm -rf "$target_dir"
+  exit 1
+fi
+if ! (cd "$target_dir" && patch --batch --forward -p1 < "../../$runtime_patch"); then
+  echo "tdl runtime options patch did not apply; refusing to build an unsafe concurrent image" >&2
   rm -rf "$target_dir"
   exit 1
 fi

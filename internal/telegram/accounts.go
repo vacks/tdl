@@ -83,8 +83,11 @@ type Manager struct {
 	accounts   []Account
 	current    string
 	jobs       map[string]*loginJob
-	operations map[string]*sync.Mutex
+	operations map[string]*sync.RWMutex
+	stores     map[string]*sync.RWMutex
 	proxyURL   func() string
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func Open(dataDir string, proxyURL func() string) (*Manager, error) {
@@ -95,7 +98,8 @@ func Open(dataDir string, proxyURL func() string) (*Manager, error) {
 	if err := os.MkdirAll(filepath.Join(root, "state"), 0o700); err != nil {
 		return nil, fmt.Errorf("create Telegram state directory: %w", err)
 	}
-	m := &Manager{root: root, path: filepath.Join(root, "accounts.json"), jobs: make(map[string]*loginJob), operations: make(map[string]*sync.Mutex), proxyURL: proxyURL}
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Manager{root: root, path: filepath.Join(root, "accounts.json"), jobs: make(map[string]*loginJob), operations: make(map[string]*sync.RWMutex), stores: make(map[string]*sync.RWMutex), proxyURL: proxyURL, ctx: ctx, cancel: cancel}
 	if data, err := os.ReadFile(m.path); err == nil {
 		var saved persisted
 		if err := json.Unmarshal(data, &saved); err != nil {
@@ -111,7 +115,7 @@ func Open(dataDir string, proxyURL func() string) (*Manager, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("open Telegram accounts: %w", err)
 	}
-	go m.monitorSessions()
+	go m.monitorSessions(ctx)
 	return m, nil
 }
 
@@ -129,11 +133,15 @@ func (m *Manager) StartQR() (Account, error) {
 		return Account{}, err
 	}
 	account := Account{ID: id, State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339)}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(m.ctx)
 	m.mu.Lock()
 	m.accounts = append(m.accounts, account)
 	m.jobs[id] = &loginJob{cancel: cancel, password: make(chan string, 1)}
 	err = m.saveLocked()
+	if err != nil {
+		m.accounts = m.accounts[:len(m.accounts)-1]
+		delete(m.jobs, id)
+	}
 	m.mu.Unlock()
 	if err != nil {
 		cancel()
@@ -176,13 +184,22 @@ func (m *Manager) Select(id string) error {
 	if account.State != "authorized" {
 		return ErrNotAuthorized
 	}
+	previous := m.current
 	m.current = id
-	return m.saveLocked()
+	if err := m.saveLocked(); err != nil {
+		m.current = previous
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) Delete(id string) error {
+	// Account removal must wait for in-flight reads/downloads, so its session
+	// and state files cannot disappear underneath an active client.
+	operation := m.operation(id)
+	operation.Lock()
+	defer operation.Unlock()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	index := -1
 	for i := range m.accounts {
 		if m.accounts[i].ID == id {
@@ -191,27 +208,46 @@ func (m *Manager) Delete(id string) error {
 		}
 	}
 	if index < 0 {
+		m.mu.Unlock()
 		return ErrNotFound
+	}
+	previousAccounts, previousCurrent := m.accounts, m.current
+	nextAccounts := append([]Account(nil), m.accounts[:index]...)
+	nextAccounts = append(nextAccounts, m.accounts[index+1:]...)
+	nextCurrent := m.current
+	if nextCurrent == id {
+		nextCurrent = ""
+	}
+	m.accounts, m.current = nextAccounts, nextCurrent
+	if err := m.saveLocked(); err != nil {
+		m.accounts, m.current = previousAccounts, previousCurrent
+		m.mu.Unlock()
+		return err
 	}
 	if job, ok := m.jobs[id]; ok {
 		job.cancel()
 		delete(m.jobs, id)
 	}
-	m.accounts = append(m.accounts[:index], m.accounts[index+1:]...)
-	if m.current == id {
-		m.current = ""
-	}
+	delete(m.stores, id)
+	delete(m.operations, id)
+	m.mu.Unlock()
+	// The account metadata is now durably removed. Surface a private-file cleanup
+	// failure to the caller so it can be handled instead of silently leaving an
+	// orphaned Telegram session on disk.
+	var cleanupErr error
 	if err := os.Remove(m.sessionPath(id)); err != nil && !os.IsNotExist(err) {
-		return err
+		applog.Error("telegram", "account_session_cleanup_failed", "account_id", id, "error", err.Error())
+		cleanupErr = fmt.Errorf("清理会话文件: %w", err)
 	}
 	if err := os.RemoveAll(m.statePath(id)); err != nil {
-		return err
+		applog.Error("telegram", "account_state_cleanup_failed", "account_id", id, "error", err.Error())
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("清理状态目录: %w", err))
 	}
-	err := m.saveLocked()
-	if err == nil {
-		applog.Info("telegram", "account_deleted", "account_id", id)
+	applog.Info("telegram", "account_deleted", "account_id", id)
+	if cleanupErr != nil {
+		return fmt.Errorf("账户记录已删除，但敏感文件未能完全清理: %w", cleanupErr)
 	}
-	return err
+	return nil
 }
 
 func (m *Manager) Status() string {
@@ -310,7 +346,6 @@ func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(c
 }
 
 func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateType string, entities tg.Entities, raw tg.MessageClass, client *gotd.Client, onEvent func(context.Context, ReactionEvent)) {
-	logReactionEditUpdate(accountID, updateType, raw)
 	message, ok := raw.(*tg.Message)
 	if !ok {
 		return
@@ -358,51 +393,15 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 }
 
 func dispatchReactionEvent(onEvent func(context.Context, ReactionEvent), event ReactionEvent) {
-	// Update dispatch must stay responsive. Task parsing is independent and is
-	// bounded so a temporary Telegram/API error cannot block later updates.
-	go func() {
-		workCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
-		onEvent(workCtx, event)
-	}()
+	// The consumer owns bounded buffering. Do not create one goroutine for each
+	// update: a busy group plus a slow SQLite write would otherwise grow memory
+	// without limit.
+	onEvent(context.Background(), event)
 }
 
 // logReactionEditUpdate emits a privacy-safe diagnostic only when an edited
 // message actually contains reaction state. It intentionally excludes message
 // text, captions, usernames and media names.
-func logReactionEditUpdate(accountID, updateType string, raw tg.MessageClass) {
-	message, ok := raw.(*tg.Message)
-	if !ok {
-		return
-	}
-	reactions, ok := message.GetReactions()
-	if !ok {
-		return
-	}
-	chosen := 0
-	standard := 0
-	for _, reaction := range reactions.Results {
-		if _, ok := reaction.Reaction.(*tg.ReactionEmoji); ok {
-			standard++
-		}
-		if _, ok := reaction.GetChosenOrder(); ok {
-			chosen++
-		}
-	}
-	peerType, peerID := peerIdentity(message.PeerID)
-	applog.Info("reaction", "reaction_edit_update_received",
-		"account_id", accountID,
-		"update_type", updateType,
-		"peer_type", peerType,
-		"peer_id", peerID,
-		"message_id", message.ID,
-		"reaction_count", len(reactions.Results),
-		"standard_reaction_count", standard,
-		"chosen_reaction_count", chosen,
-		"summary", reactions.Min,
-	)
-}
-
 func peerIdentity(peer tg.PeerClass) (string, int64) {
 	switch value := peer.(type) {
 	case *tg.PeerUser:
@@ -500,8 +499,11 @@ func (m *Manager) Run(ctx context.Context, id string, fn func(context.Context, *
 
 func (m *Manager) runAccount(ctx context.Context, id string, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
 	operation := m.operation(id)
-	operation.Lock()
-	defer operation.Unlock()
+	// Telegram authorization is safe to use from several independent client
+	// connections. A shared read lease permits the configured job concurrency;
+	// exclusive leases remain for removal and session validation.
+	operation.RLock()
+	defer operation.RUnlock()
 	return m.runAccountLocked(ctx, id, fn)
 }
 
@@ -521,31 +523,35 @@ func (m *Manager) runAccountLocked(ctx context.Context, id string, fn func(conte
 	return client.Run(ctx, func(ctx context.Context) error { return fn(ctx, client, store) })
 }
 
-func (m *Manager) operation(id string) *sync.Mutex {
+func (m *Manager) operation(id string) *sync.RWMutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	operation := m.operations[id]
 	if operation == nil {
-		operation = &sync.Mutex{}
+		operation = &sync.RWMutex{}
 		m.operations[id] = operation
 	}
 	return operation
 }
 
-func (m *Manager) monitorSessions() {
+func (m *Manager) monitorSessions(ctx context.Context) {
 	timer := time.NewTimer(sessionCheckInitialDelay)
 	defer timer.Stop()
 	for {
-		<-timer.C
-		m.checkSessions()
-		timer.Reset(sessionCheckInterval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.checkSessions(ctx)
+			timer.Reset(sessionCheckInterval)
+		}
 	}
 }
 
 // checkSessions is intentionally independent of downloads and other business
 // operations. A successful Self request confirms that Telegram still accepts
 // the saved authorization key for that individual account.
-func (m *Manager) checkSessions() {
+func (m *Manager) checkSessions(parent context.Context) {
 	m.mu.RLock()
 	ids := make([]string, 0, len(m.accounts))
 	for _, account := range m.accounts {
@@ -561,7 +567,7 @@ func (m *Manager) checkSessions() {
 		if !operation.TryLock() {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 		err := m.runAccountLocked(ctx, id, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
 			_, err := client.Self(ctx)
 			return err
@@ -573,6 +579,21 @@ func (m *Manager) checkSessions() {
 			continue
 		}
 		m.markChecked(id)
+	}
+}
+
+// Stop releases periodic checks and incomplete QR login connections during a
+// graceful application shutdown.
+func (m *Manager) Stop() {
+	m.cancel()
+	m.mu.RLock()
+	cancels := make([]context.CancelFunc, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		cancels = append(cancels, job.cancel)
+	}
+	m.mu.RUnlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 
@@ -591,6 +612,7 @@ func (m *Manager) markExpired(id string) {
 		if m.accounts[i].ID != id || m.accounts[i].State != "authorized" {
 			continue
 		}
+		previous, previousCurrent := m.accounts[i], m.current
 		m.accounts[i].State = "expired"
 		m.accounts[i].Error = "Telegram 会话已失效，请重新登录"
 		m.accounts[i].QRCode = ""
@@ -598,7 +620,11 @@ func (m *Manager) markExpired(id string) {
 		if m.current == id {
 			m.current = ""
 		}
-		_ = m.saveLocked()
+		if err := m.saveLocked(); err != nil {
+			m.accounts[i], m.current = previous, previousCurrent
+			applog.Error("telegram", "session_expiry_save_failed", "account_id", id, "error", err.Error())
+			return
+		}
 		applog.Error("telegram", "session_expired", "account_id", id)
 		return
 	}
@@ -698,8 +724,12 @@ func (m *Manager) update(id string, update func(*Account)) {
 	defer m.mu.Unlock()
 	for i := range m.accounts {
 		if m.accounts[i].ID == id {
+			previous := m.accounts[i]
 			update(&m.accounts[i])
-			_ = m.saveLocked()
+			if err := m.saveLocked(); err != nil {
+				m.accounts[i] = previous
+				applog.Error("telegram", "account_state_save_failed", "account_id", id, "error", err.Error())
+			}
 			return
 		}
 	}
@@ -721,7 +751,14 @@ func (m *Manager) statePath(id string) string {
 }
 
 func (m *Manager) accountStore(id string) *accountStore {
-	return &accountStore{sessionPath: m.sessionPath(id), stateDir: m.statePath(id)}
+	m.mu.Lock()
+	fileMu := m.stores[id]
+	if fileMu == nil {
+		fileMu = &sync.RWMutex{}
+		m.stores[id] = fileMu
+	}
+	m.mu.Unlock()
+	return &accountStore{sessionPath: m.sessionPath(id), stateDir: m.statePath(id), fileMu: fileMu}
 }
 func (m *Manager) saveLocked() error {
 	data, err := json.MarshalIndent(persisted{Accounts: m.accounts, CurrentID: m.current}, "", "  ")
@@ -745,9 +782,14 @@ func randomID() (string, error) {
 type accountStore struct {
 	sessionPath string
 	stateDir    string
+	fileMu      *sync.RWMutex
 }
 
 func (s *accountStore) Get(_ context.Context, key string) ([]byte, error) {
+	if s.fileMu != nil {
+		s.fileMu.RLock()
+		defer s.fileMu.RUnlock()
+	}
 	if key == upstreamKey.App() {
 		return []byte(upstreamClient.AppDesktop), nil
 	}
@@ -758,9 +800,17 @@ func (s *accountStore) Get(_ context.Context, key string) ([]byte, error) {
 	return data, err
 }
 func (s *accountStore) Set(_ context.Context, key string, value []byte) error {
+	if s.fileMu != nil {
+		s.fileMu.Lock()
+		defer s.fileMu.Unlock()
+	}
 	return writePrivateFile(s.path(key), value)
 }
 func (s *accountStore) Delete(_ context.Context, key string) error {
+	if s.fileMu != nil {
+		s.fileMu.Lock()
+		defer s.fileMu.Unlock()
+	}
 	if err := os.Remove(s.path(key)); err != nil && !os.IsNotExist(err) {
 		return err
 	}

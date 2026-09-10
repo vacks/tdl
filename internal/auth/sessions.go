@@ -42,3 +42,11 @@ func (s *Sessions) Delete(token string) {
 	delete(s.values, token)
 	s.mu.Unlock()
 }
+
+// Clear invalidates all administrator sessions, including the session that
+// changed the password. This prevents older cookies from remaining usable.
+func (s *Sessions) Clear() {
+	s.mu.Lock()
+	s.values = make(map[string]time.Time)
+	s.mu.Unlock()
+}

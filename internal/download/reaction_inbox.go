@@ -42,6 +42,31 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
 	if err != nil {
 		return false, err
 	}
+	if changed == 0 {
+		// A terminal failure is not a permanent user-facing ban. A new matching
+		// reaction is an intentional retry request and starts a fresh attempt set.
+		result, err = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND status = 'failed'`, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
+		if err != nil {
+			return false, err
+		}
+		changed, err = result.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if changed == 0 {
+			// A second application of the same emoji is a fresh user action only
+			// when its previous task was cancelled. Do not revive completed jobs
+			// because Telegram redelivered an ordinary message update.
+			result, err = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND status = 'done' AND job_id IN (SELECT id FROM download_jobs WHERE status = 'cancelled')`, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
+			if err != nil {
+				return false, err
+			}
+			changed, err = result.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+		}
+	}
 	if changed == 1 {
 		m.signal()
 	}
@@ -90,17 +115,22 @@ FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY i
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	claimed := make([]ReactionInboxEvent, 0, len(result))
 	for index := range result {
 		event := &result[index]
-		if _, err := tx.Exec(`UPDATE reaction_inbox SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'`, now.Format(time.RFC3339Nano), event.ID); err != nil {
+		update, err := tx.Exec(`UPDATE reaction_inbox SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'`, now.Format(time.RFC3339Nano), event.ID)
+		if err != nil {
 			return nil, err
 		}
-		event.Attempts++
+		if changed, _ := update.RowsAffected(); changed == 1 {
+			event.Attempts++
+			claimed = append(claimed, *event)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return result, nil
+	return claimed, nil
 }
 
 func inboxPeer(kind string, id, hash int64) tg.InputPeerClass {

@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends patch && rm -rf
 COPY go.mod go.sum go.work ./
 COPY scripts/prepare-upstream-progress.sh ./scripts/prepare-upstream-progress.sh
 COPY patches/tdl-progress-0.20.4.patch ./patches/tdl-progress-0.20.4.patch
+COPY patches/tdl-runtime-options-0.20.4.patch ./patches/tdl-runtime-options-0.20.4.patch
 RUN sh ./scripts/prepare-upstream-progress.sh && go mod download
 COPY . ./
 RUN go test ./internal/download ./internal/telegram

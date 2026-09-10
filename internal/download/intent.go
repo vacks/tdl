@@ -60,10 +60,11 @@ type DownloadIntent struct {
 // Submission says whether a new job was made or this request was attached to
 // an existing one. A duplicate is a successful, idempotent outcome.
 type Submission struct {
-	RequestID string `json:"requestId"`
-	Job       Job    `json:"job"`
-	Created   bool   `json:"created"`
-	Duplicate bool   `json:"duplicate"`
+	RequestID   string `json:"requestId"`
+	Job         Job    `json:"job"`
+	Created     bool   `json:"created"`
+	Duplicate   bool   `json:"duplicate"`
+	Reactivated bool   `json:"reactivated"`
 }
 
 func (i DownloadIntent) validate() error {
