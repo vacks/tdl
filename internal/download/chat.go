@@ -787,13 +787,16 @@ func (m *Manager) PauseChat(id string) error {
 	if target.Status != ChatStatusQueued && target.Status != ChatStatusScanning && target.Status != ChatStatusDownloading && target.Status != ChatStatusListening {
 		return errors.New("当前会话任务不能暂停")
 	}
-	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`, ChatStatusPaused, time.Now().UTC().Format(time.RFC3339Nano), id, target.Status); err != nil {
+	if err := m.updateChatStatus(id, target.Status, ChatStatusPaused, ""); err != nil {
 		return err
 	}
-	for _, child := range m.chatChildJobIDs(id) {
+	if err := m.applyChatChildren(id, "暂停", func(child string) error {
 		if status := m.status(child); status == "queued" || status == "running" {
-			_ = m.Pause(child)
+			return m.Pause(child)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	m.touch()
 	return nil
@@ -811,13 +814,16 @@ func (m *Manager) ResumeChat(id string) error {
 	if target.ScanState == chatScanCompleted {
 		next = ChatStatusDownloading
 	}
-	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = '', updated_at = ? WHERE id = ? AND status = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusPaused); err != nil {
+	if err := m.updateChatStatus(id, ChatStatusPaused, next, ""); err != nil {
 		return err
 	}
-	for _, child := range m.chatChildJobIDs(id) {
+	if err := m.applyChatChildren(id, "恢复", func(child string) error {
 		if m.status(child) == "paused" {
-			_ = m.Resume(child)
+			return m.Resume(child)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	m.touch()
 	m.signalChat()
@@ -837,13 +843,16 @@ func (m *Manager) RetryChat(id string) error {
 	if target.ScanState == chatScanCompleted {
 		next = ChatStatusDownloading
 	}
-	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = '', updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if err := m.updateChatStatus(id, target.Status, next, ""); err != nil {
 		return err
 	}
-	for _, child := range m.chatChildJobIDs(id) {
+	if err := m.applyChatChildren(id, "重新开始", func(child string) error {
 		if status := m.status(child); status == "failed" || status == "partial" || status == "cancelled" {
-			_ = m.Retry(child)
+			return m.Retry(child)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	m.touch()
 	m.signalChat()
@@ -859,16 +868,57 @@ func (m *Manager) CancelChat(id string) error {
 	if target.Status == ChatStatusCompleted || target.Status == ChatStatusFailed || target.Status == ChatStatusPartial || target.Status == ChatStatusCancelled {
 		return errors.New("当前会话任务不能取消")
 	}
-	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, ChatStatusCancelled, "已取消，可重新开始", time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if err := m.updateChatStatus(id, target.Status, ChatStatusCancelled, "已取消，可重新开始"); err != nil {
 		return err
 	}
-	for _, child := range m.chatChildJobIDs(id) {
+	if err := m.applyChatChildren(id, "取消", func(child string) error {
 		if status := m.status(child); status == "queued" || status == "running" || status == "paused" {
-			_ = m.Cancel(child)
+			return m.Cancel(child)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	m.touch()
 	return nil
+}
+
+// updateChatStatus makes concurrent parent controls observable instead of
+// silently succeeding after another request has already changed the task.
+func (m *Manager) updateChatStatus(id, expected, next, message string) error {
+	result, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, next, message, time.Now().UTC().Format(time.RFC3339Nano), id, expected)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errors.New("会话任务状态已变化，请刷新后重试")
+	}
+	return nil
+}
+
+// applyChatChildren never discards a child-control failure. The parent state
+// already prevents further indexing, and its error field records any child
+// that needs a later retry instead of presenting a misleading clean result.
+func (m *Manager) applyChatChildren(chatID, action string, apply func(string) error) error {
+	var failures []error
+	for _, child := range m.chatChildJobIDs(chatID) {
+		if err := apply(child); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", child, err))
+		}
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	message := fmt.Sprintf("会话已%s，但 %d 个子任务未完成对应操作", action, len(failures))
+	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET error = ?, updated_at = ? WHERE id = ?`, message, time.Now().UTC().Format(time.RFC3339Nano), chatID); err != nil {
+		failures = append(failures, fmt.Errorf("记录会话任务错误: %w", err))
+	}
+	m.touch()
+	return errors.Join(failures...)
 }
 
 func (m *Manager) DeleteChat(id string) error {

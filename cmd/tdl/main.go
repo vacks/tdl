@@ -26,9 +26,10 @@ func main() {
 		log.Fatalf("create server: %v", err)
 	}
 
-	// Keep read deadlines bounded against slow request bodies. Do not set a
-	// WriteTimeout: the authenticated SSE endpoint intentionally stays open.
-	httpServer := &http.Server{Addr: cfg.ListenAddr, Handler: server, ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	// Keep ordinary requests bounded against slow readers and writers. The
+	// authenticated SSE handler explicitly clears its deadline after it has
+	// acquired one of the small, dedicated streaming slots.
+	httpServer := &http.Server{Addr: cfg.ListenAddr, Handler: server, ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
 	applog.Info("app", "service_listening", "address", cfg.ListenAddr)

@@ -494,6 +494,13 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "已有过多实时连接，请关闭多余页面后重试"})
 		return
 	}
+	// The server has a finite write deadline for ordinary HTTP responses. This
+	// stream is intentionally long-lived, so clear it only after authentication
+	// and the SSE connection limit have been established.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		http.Error(w, "streaming unavailable", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

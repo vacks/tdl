@@ -314,6 +314,33 @@ func TestChatControlsPropagateToOwnedDownloadJobs(t *testing.T) {
 	assertTaskStatuses(t, db, "downloading", "queued")
 }
 
+func TestChatControlRejectsStaleParentState(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES ('chat-stale', 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'paused', 'completed', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.updateChatStatus("chat-stale", ChatStatusDownloading, ChatStatusCancelled, ""); err == nil {
+		t.Fatal("updateChatStatus() succeeded for a stale state")
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = 'chat-stale'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != ChatStatusPaused {
+		t.Fatalf("status = %q, want %q", status, ChatStatusPaused)
+	}
+}
+
 func TestDeleteChatRemovesChildRequestHistory(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
