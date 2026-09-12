@@ -99,6 +99,12 @@ type helpRetry struct {
 	attempts int
 }
 
+const (
+	botRequestTimeout  = 12 * time.Second
+	botLongPollTimeout = 25 * time.Second
+	botPollHTTPTimeout = 35 * time.Second
+)
+
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
@@ -111,6 +117,7 @@ func New(store *settings.Store, downloads *download.Manager, telegram *telegram.
 	events, _ := downloads.SubscribeEvents()
 	go s.watchDownloadEvents(events)
 	go s.loop()
+	go s.refreshLoop()
 	return s
 }
 
@@ -134,6 +141,7 @@ func (s *Service) watchDownloadEvents(events <-chan download.Event) {
 }
 
 func (s *Service) loop() {
+	failures := 0
 	for {
 		if s.ctx.Err() != nil {
 			return
@@ -175,6 +183,7 @@ func (s *Service) loop() {
 		s.sendStartupHelp(cfg)
 		updates, err := s.getUpdates(cfg.Token)
 		if err == nil {
+			failures = 0
 			for _, update := range updates {
 				if !s.handle(cfg, update) {
 					// Keep this update (and every later one) visible to getUpdates.
@@ -194,16 +203,59 @@ func (s *Service) loop() {
 				}
 			}
 		} else {
-			applog.Error("bot", "updates_fetch_failed", "error", redactBotError(cfg.Token, err.Error()))
+			failures++
+			delay := pollRetryDelay(failures)
+			if shouldLogPollFailure(failures) {
+				applog.Error("bot", "updates_fetch_failed", "attempt", failures, "retry_after", delay.String(), "error", redactBotError(cfg.Token, err.Error()))
+			}
+			if !waitContext(s.ctx, delay) {
+				return
+			}
+			continue
 		}
-		s.refresh(cfg)
+	}
+}
+
+// refreshLoop is intentionally independent from command long-polling. A
+// 25-second getUpdates request therefore never delays a viewed task card's
+// three-second progress refresh, while an idle Bot performs no task-table I/O.
+func (s *Service) refreshLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		cfg := s.settings.Get().Bot
+		if cfg.Enabled && strings.TrimSpace(cfg.Token) != "" && len(cfg.ControlUserIDs) > 0 {
+			s.refresh(cfg)
+		}
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.downloadWake:
-		case <-time.After(2 * time.Second):
+		case <-ticker.C:
 		}
 	}
+}
+
+func pollRetryDelay(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	shift := min(failures-1, 5)
+	delay := 2 * time.Second * time.Duration(1<<shift)
+	if delay > time.Minute {
+		delay = time.Minute
+	}
+	// Stable jitter prevents several restarted instances from reconnecting in
+	// lockstep without making tests or logs nondeterministic.
+	jitter := time.Duration((failures*347)%700) * time.Millisecond
+	if delay+jitter > time.Minute {
+		return time.Minute
+	}
+	return delay + jitter
+}
+
+func shouldLogPollFailure(failures int) bool {
+	return failures == 1 || failures == 2 || failures == 4 || failures == 8 || failures%10 == 0
 }
 
 // Stop cancels long polling and releases idle Bot API connections.
@@ -284,7 +336,7 @@ func (s *Service) getUpdates(token string) ([]update, error) {
 	offset := s.offset
 	s.mu.Unlock()
 	var result apiResponse[[]update]
-	if err := s.call(token, "getUpdates", map[string]any{"offset": offset, "timeout": 1, "allowed_updates": []string{"message", "callback_query"}}, &result); err != nil {
+	if err := s.callWithTimeout(token, "getUpdates", map[string]any{"offset": offset, "timeout": int(botLongPollTimeout / time.Second), "allowed_updates": []string{"message", "callback_query"}}, &result, botPollHTTPTimeout); err != nil {
 		return nil, err
 	}
 	if !result.OK {
@@ -1353,11 +1405,17 @@ func bytesLabel(value int64) string {
 }
 
 func (s *Service) call(token, method string, body any, out any) error {
+	return s.callWithTimeout(token, method, body, out, botRequestTimeout)
+}
+
+func (s *Service) callWithTimeout(token, method string, body any, out any, timeout time.Duration) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(data))
+	ctx, cancel := context.WithTimeout(s.ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -1395,7 +1453,7 @@ func (s *Service) httpClient() *http.Client {
 		}
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	client := &http.Client{Timeout: 12 * time.Second, Transport: transport}
+	client := &http.Client{Transport: transport}
 	s.clientProxy = raw
 	s.client = client
 	if raw == "" {

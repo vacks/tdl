@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vacks/tdl/internal/download"
 	"github.com/vacks/tdl/internal/settings"
@@ -41,6 +42,21 @@ func TestRetryableSubmitError(t *testing.T) {
 		if got := retryableSubmitError(test.err); got != test.want {
 			t.Errorf("%s: retryableSubmitError(%v) = %v, want %v", test.name, test.err, got, test.want)
 		}
+	}
+}
+
+func TestPollRetryDelayIsBoundedAndDeterministic(t *testing.T) {
+	if got := pollRetryDelay(1); got < 2*time.Second || got >= 3*time.Second {
+		t.Fatalf("first retry delay = %s, want 2s to 3s", got)
+	}
+	if got, want := pollRetryDelay(99), time.Minute; got != want {
+		t.Fatalf("capped retry delay = %s, want %s", got, want)
+	}
+	if got, want := pollRetryDelay(4), pollRetryDelay(4); got != want {
+		t.Fatalf("retry jitter must be stable: %s != %s", got, want)
+	}
+	if !shouldLogPollFailure(1) || !shouldLogPollFailure(8) || shouldLogPollFailure(3) {
+		t.Fatal("unexpected poll failure log cadence")
 	}
 }
 
