@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/vacks/tdl/internal/download"
+	"github.com/vacks/tdl/internal/settings"
 )
 
 func TestNormalizeCommand(t *testing.T) {
@@ -64,5 +67,63 @@ func TestPrivateCallbackUsesClickingUser(t *testing.T) {
 	query.Message.Chat.ID = -100123
 	if privateCallback(query) {
 		t.Fatal("group callback was accepted")
+	}
+}
+
+func TestBotAuthorizationAndTelegramLinks(t *testing.T) {
+	cfg := settings.Bot{ControlUserIDs: []int64{7, 9}}
+	if !allowed(cfg, 7) || !allowed(cfg, 9) || allowed(cfg, 8) {
+		t.Fatal("control-user authorization did not match configured users")
+	}
+	for raw, want := range map[string]bool{
+		"https://t.me/example/1":        true,
+		"https://subdomain.t.me/a":      true,
+		"https://telegram.me/example/1": false,
+		"https://example.com/t.me/test": false,
+		"not a URL":                     false,
+	} {
+		if got := isTelegramLink(raw); got != want {
+			t.Errorf("isTelegramLink(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
+func TestTaskPresentationContainsEscapedProgressAndActions(t *testing.T) {
+	job := download.Job{ID: "job-1", DialogName: "<unsafe>", Status: "running", CompletedItems: 1, TotalItems: 2, Items: []download.Item{
+		{DialogKey: "channel:1", MessageID: 1, OriginalName: "<one>.mp4", Status: "completed"},
+		{DialogKey: "channel:1", MessageID: 2, OriginalName: "two.mp4", Status: "running"},
+	}}
+	text := taskText(job, []download.FileProgress{{DialogKey: "channel:1", MessageID: 2, Downloaded: 50, Total: 100, SpeedBPS: 1024}})
+	for _, want := range []string{"下载中", "&lt;unsafe&gt;", "1/2 文件", "100%", "50%", "1.00 KB/s", "&lt;one&gt;.mp4"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("taskText missing %q: %s", want, text)
+		}
+	}
+	keys := taskKeyboard(job, 2)
+	joined := ""
+	for _, row := range keys {
+		for _, button := range row {
+			joined += button.CallbackData + " "
+		}
+	}
+	for _, want := range []string{"t:job-1:pause:2", "t:job-1:cancel:2", "t:job-1:view:2", "l:2"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("taskKeyboard missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestLifecycleAndDeletedMessagesKeepExpectedControls(t *testing.T) {
+	job := download.Job{ID: "job-1", DialogName: "频道", Status: "completed", CompletedItems: 2, TotalItems: 2}
+	if text := lifecycleText(job); !strings.Contains(text, "下载完成") || !strings.Contains(text, "2/2 文件") {
+		t.Fatalf("lifecycleText() = %q", text)
+	}
+	deleted := deletedTaskText("✅ <b>下载完成</b>\n进度：2/2 文件")
+	if !strings.Contains(deleted, "任务已删除") || !strings.Contains(deleted, "2/2 文件") {
+		t.Fatalf("deletedTaskText() = %q", deleted)
+	}
+	keyboard := deletedTaskKeyboard(3)
+	if len(keyboard) != 1 || keyboard[0][0].CallbackData != "l:3" {
+		t.Fatalf("deletedTaskKeyboard() = %#v", keyboard)
 	}
 }
