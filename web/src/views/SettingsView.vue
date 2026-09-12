@@ -73,6 +73,7 @@ onMounted(async () => { try { const session = await api<{ authenticated: boolean
 	  <p class="field-help">设为 0 表示不限制；最小值以下或最大值以上的文件不会创建下载任务。筛选会在解析消息和会话历史时生效。</p>
 	  <el-form-item label="文件类型筛选"><el-checkbox-group v-model="form.download.fileTypes" class="file-type-group"><el-checkbox label="image">图片</el-checkbox><el-checkbox label="video">视频</el-checkbox><el-checkbox label="audio">音频</el-checkbox><el-checkbox label="document">文档</el-checkbox></el-checkbox-group></el-form-item>
 	  <p class="field-help">不勾选表示下载全部类型；勾选后仅下载选中的类型。语音消息归入音频，圆形视频归入视频。</p>
+	  <el-divider class="download-config-divider filter-config-divider" />
           <el-form-item label="临时文件命名模板（上游 tdl）"><el-input v-model="form.download.tempFilenameTemplate" /></el-form-item>
           <div class="field-help template-help" v-pre>
             <p>仅用于上游 tdl 写入私有临时目录。可用变量：</p>
