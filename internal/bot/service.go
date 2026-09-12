@@ -194,7 +194,7 @@ func (s *Service) loop() {
 				}
 			}
 		} else {
-			applog.Error("bot", "updates_fetch_failed", "error", err.Error())
+			applog.Error("bot", "updates_fetch_failed", "error", redactBotError(cfg.Token, err.Error()))
 		}
 		s.refresh(cfg)
 		select {
@@ -230,7 +230,7 @@ func (s *Service) sendStartupHelp(cfg settings.Bot) {
 			continue
 		}
 		if _, err := s.send(cfg.Token, id, helpText(), nil); err != nil {
-			applog.Error("bot", "startup_help_send_failed", "chat_id", id, "error", err.Error())
+			applog.Error("bot", "startup_help_send_failed", "chat_id", id, "error", redactBotError(cfg.Token, err.Error()))
 			if retry.attempts < 8 {
 				retry.attempts++
 			}
@@ -374,7 +374,7 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 		s.send(cfg.Token, msg.Chat.ID, configText(s.settings.Get()), nil)
 	case text == "/restart":
 		if _, err := s.send(cfg.Token, msg.Chat.ID, "🔄 正在重启所有服务…", nil); err != nil {
-			applog.Error("bot", "restart_notice_send_failed", "error", err.Error())
+			applog.Error("bot", "restart_notice_send_failed", "error", redactBotError(cfg.Token, err.Error()))
 			return !retryableSubmitError(err)
 		}
 		applog.Info("bot", "service_restart_requested", "user_id", msg.From.ID)
@@ -404,7 +404,7 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 		text := lifecycleText(job)
 		messageID, err := s.send(cfg.Token, msg.Chat.ID, text, notificationKeyboard(job.ID))
 		if err != nil {
-			applog.Error("bot", "lifecycle_message_send_failed", "job_id", job.ID, "error", err.Error())
+			applog.Error("bot", "lifecycle_message_send_failed", "job_id", job.ID, "error", redactBotError(cfg.Token, err.Error()))
 			return true
 		}
 		s.rememberLifecycle(job.ID, messageRef{ChatID: msg.Chat.ID, MessageID: messageID, Text: text})
@@ -1043,7 +1043,7 @@ func (s *Service) sendLifecycle(cfg settings.Bot, job download.Job) {
 	for _, id := range cfg.ControlUserIDs {
 		messageID, err := s.send(cfg.Token, id, text, notificationKeyboard(job.ID))
 		if err != nil {
-			applog.Error("bot", "lifecycle_message_send_failed", "job_id", job.ID, "chat_id", id, "error", err.Error())
+			applog.Error("bot", "lifecycle_message_send_failed", "job_id", job.ID, "chat_id", id, "error", redactBotError(cfg.Token, err.Error()))
 			continue
 		}
 		s.rememberLifecycle(job.ID, messageRef{ChatID: id, MessageID: messageID, Text: text})
@@ -1307,6 +1307,17 @@ func safeProxyLabel(raw string) string {
 	}
 	return u.Scheme + "://" + u.Host
 }
+
+// redactBotError keeps a transport error useful while preventing an HTTP URL
+// from exposing the Bot API token in Docker logs or diagnostics. Telegram
+// clients include the full request URL in errors such as connection timeouts.
+func redactBotError(token, message string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return message
+	}
+	return strings.ReplaceAll(message, token, "[REDACTED]")
+}
 func isTelegramLink(v string) bool {
 	u, err := url.Parse(v)
 	return err == nil && (u.Host == "t.me" || strings.HasSuffix(u.Host, ".t.me"))
@@ -1452,19 +1463,19 @@ func (s *Service) configureCommands(token string) {
 		{"command": "restart", "description": "重启所有服务"},
 	}
 	if err := s.call(token, "setMyCommands", map[string]any{"commands": commands}, &result); err != nil {
-		applog.Error("bot", "commands_configure_failed", "error", err.Error())
+		applog.Error("bot", "commands_configure_failed", "error", redactBotError(token, err.Error()))
 		return
 	}
 	if !result.OK {
-		applog.Error("bot", "commands_configure_rejected", "error", result.Description)
+		applog.Error("bot", "commands_configure_rejected", "error", redactBotError(token, result.Description))
 		return
 	}
 	if err := s.call(token, "setChatMenuButton", map[string]any{"menu_button": map[string]string{"type": "commands"}}, &result); err != nil {
-		applog.Error("bot", "command_menu_configure_failed", "error", err.Error())
+		applog.Error("bot", "command_menu_configure_failed", "error", redactBotError(token, err.Error()))
 		return
 	}
 	if !result.OK {
-		applog.Error("bot", "command_menu_configure_rejected", "error", result.Description)
+		applog.Error("bot", "command_menu_configure_rejected", "error", redactBotError(token, result.Description))
 	}
 }
 func (s *Service) send(token string, chatID int64, text string, keyboard [][]button) (int64, error) {
@@ -1494,14 +1505,14 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 		payload["reply_markup"] = map[string]any{"inline_keyboard": keyboard}
 	}
 	if err := s.call(token, "editMessageText", payload, &result); err != nil {
-		applog.Error("bot", "message_edit_failed", "chat_id", chatID, "message_id", messageID, "error", err.Error())
+		applog.Error("bot", "message_edit_failed", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, err.Error()))
 		return false
 	}
 	if !result.OK {
 		if isMissingMessage(result.Description) {
 			return true
 		}
-		applog.Error("bot", "message_edit_rejected", "chat_id", chatID, "message_id", messageID, "error", result.Description)
+		applog.Error("bot", "message_edit_rejected", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, result.Description))
 		return false
 	}
 	if keyboard == nil {
@@ -1522,11 +1533,11 @@ func (s *Service) clearKeyboard(token string, chatID, messageID int64) {
 		"reply_markup": map[string]any{"inline_keyboard": [][]button{}},
 	}
 	if err := s.call(token, "editMessageReplyMarkup", payload, &result); err != nil {
-		applog.Error("bot", "keyboard_clear_failed", "chat_id", chatID, "message_id", messageID, "error", err.Error())
+		applog.Error("bot", "keyboard_clear_failed", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, err.Error()))
 		return
 	}
 	if !result.OK {
-		applog.Error("bot", "keyboard_clear_rejected", "chat_id", chatID, "message_id", messageID, "error", result.Description)
+		applog.Error("bot", "keyboard_clear_rejected", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, result.Description))
 	}
 }
 func (s *Service) answer(token, id, text string) {

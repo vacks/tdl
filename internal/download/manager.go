@@ -176,7 +176,7 @@ type Manager struct {
 	wake          chan struct{}
 	chatWake      chan struct{}
 	chatEvents    chan telegram.NewMessageEvent
-	chatListeners map[string]context.CancelFunc
+	chatListeners map[string]*chatListener
 	slotWake      chan struct{}
 	progress      *progressStore
 	events        *eventBus
@@ -198,7 +198,7 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEvents: make(chan telegram.NewMessageEvent, 512), chatListeners: make(map[string]context.CancelFunc), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEvents: make(chan telegram.NewMessageEvent, 512), chatListeners: make(map[string]*chatListener), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -742,10 +742,10 @@ func (m *Manager) Stop() {
 	}
 	m.mu.Lock()
 	listeners := make([]context.CancelFunc, 0, len(m.chatListeners))
-	for _, cancel := range m.chatListeners {
-		listeners = append(listeners, cancel)
+	for _, listener := range m.chatListeners {
+		listeners = append(listeners, listener.cancel)
 	}
-	m.chatListeners = make(map[string]context.CancelFunc)
+	m.chatListeners = make(map[string]*chatListener)
 	m.mu.Unlock()
 	for _, cancel := range listeners {
 		cancel()

@@ -314,6 +314,55 @@ func TestChatControlsPropagateToOwnedDownloadJobs(t *testing.T) {
 	assertTaskStatuses(t, db, "downloading", "queued")
 }
 
+func TestDeleteChatRemovesChildRequestHistory(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	if err := m.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, status, scan_state, created_at, updated_at) VALUES ('chat-delete', 'tg://chat', 'channel', 'channel:9', 9, '频道', 'account-a', 0, 10, 'cancelled', 'completed', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, account_id, status, parent_chat_id, created_at, updated_at) VALUES ('child-delete', 'tg://chat/chat-delete/1', 'account-a', 'cancelled', 'chat-delete', ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('child-delete', 'channel', 'channel:9', 9, 1, 'file.bin', 'cancelled')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, discovered_at) VALUES ('chat-delete', 'channel:9', 1, 'child-delete', ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_requests(id, job_id, source_kind, account_id, outcome, created_at) VALUES ('request-delete', 'child-delete', 'api', 'account-a', 'created', ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_events(job_id, request_id, kind, created_at) VALUES ('child-delete', 'request-delete', 'queued', ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteChat("chat-delete"); err != nil {
+		t.Fatalf("DeleteChat(): %v", err)
+	}
+	for _, query := range []string{
+		`SELECT COUNT(1) FROM chat_download_jobs WHERE id = 'chat-delete'`,
+		`SELECT COUNT(1) FROM download_jobs WHERE id = 'child-delete'`,
+		`SELECT COUNT(1) FROM download_requests WHERE id = 'request-delete'`,
+		`SELECT COUNT(1) FROM download_events WHERE job_id = 'child-delete'`,
+	} {
+		var count int
+		if err := db.QueryRow(query).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("rows remain after DeleteChat for query %q: %d", query, count)
+		}
+	}
+}
+
 func TestCleanupHistoryPreservesChildReferencedByRetainedChat(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +38,15 @@ func TestRetryableSubmitError(t *testing.T) {
 		if got := retryableSubmitError(test.err); got != test.want {
 			t.Errorf("%s: retryableSubmitError(%v) = %v, want %v", test.name, test.err, got, test.want)
 		}
+	}
+}
+
+func TestRedactBotError(t *testing.T) {
+	token := "123456:secret-token"
+	message := "Post \"https://api.telegram.org/bot123456:secret-token/getUpdates\": timeout"
+	got := redactBotError(token, message)
+	if got == message || !strings.Contains(got, "[REDACTED]") || strings.Contains(got, token) {
+		t.Fatalf("redactBotError() = %q", got)
 	}
 }
 

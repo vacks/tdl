@@ -237,6 +237,16 @@ type storedChatTarget struct {
 	configJSON string
 }
 
+// chatListener records the network configuration used to establish one
+// account's long-lived update connection. A proxy change must replace this
+// connection: otherwise only newly-created short-lived Telegram clients would
+// honor the new configuration while new-media events kept arriving over the
+// old route.
+type chatListener struct {
+	cancel context.CancelFunc
+	proxy  string
+}
+
 func (m *Manager) chatTarget(id string) (storedChatTarget, error) {
 	var target storedChatTarget
 	var listen int
@@ -367,25 +377,31 @@ func (m *Manager) reconcileChatListeners() {
 			wanted[accountID] = struct{}{}
 		}
 	}
+	proxyURL := m.settings.ProxyURL()
 	m.mu.Lock()
 	for accountID := range wanted {
-		if _, exists := m.chatListeners[accountID]; exists {
+		if current, exists := m.chatListeners[accountID]; exists && current.proxy == proxyURL {
 			continue
+		} else if exists {
+			// Leave replacement ownership with the new pointer. The old goroutine
+			// will only remove itself when it still owns the map entry.
+			current.cancel()
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		m.chatListeners[accountID] = cancel
-		go m.runChatListener(ctx, accountID, cancel)
+		listener := &chatListener{cancel: cancel, proxy: proxyURL}
+		m.chatListeners[accountID] = listener
+		go m.runChatListener(ctx, accountID, listener)
 	}
-	for accountID, cancel := range m.chatListeners {
+	for accountID, listener := range m.chatListeners {
 		if _, keep := wanted[accountID]; !keep {
-			cancel()
+			listener.cancel()
 			delete(m.chatListeners, accountID)
 		}
 	}
 	m.mu.Unlock()
 }
 
-func (m *Manager) runChatListener(ctx context.Context, accountID string, cancel context.CancelFunc) {
+func (m *Manager) runChatListener(ctx context.Context, accountID string, listener *chatListener) {
 	err := m.accounts.ListenNewMessages(ctx, accountID, func(_ context.Context, event telegram.NewMessageEvent) {
 		select {
 		case m.chatEvents <- event:
@@ -400,7 +416,7 @@ func (m *Manager) runChatListener(ctx context.Context, accountID string, cancel 
 		applog.Error("chat_download", "new_message_listener_failed", "account_id", accountID, "error", err.Error())
 	}
 	m.mu.Lock()
-	if current, ok := m.chatListeners[accountID]; ok && fmt.Sprintf("%p", current) == fmt.Sprintf("%p", cancel) {
+	if current, ok := m.chatListeners[accountID]; ok && current == listener {
 		delete(m.chatListeners, accountID)
 	}
 	m.mu.Unlock()
@@ -875,13 +891,29 @@ func (m *Manager) DeleteChat(id string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id = ?`, id); err != nil {
-		return err
-	}
+	// download_requests and download_events intentionally support old database
+	// layouts without ON DELETE CASCADE. Remove every dependent row before the
+	// child job itself; otherwise a terminal chat with request history cannot be
+	// deleted because SQLite correctly rejects the dangling foreign key.
 	for _, child := range children {
+		if _, err := tx.Exec(`DELETE FROM download_events WHERE job_id = ?`, child); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM download_requests WHERE job_id = ?`, child); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM bot_lifecycle_messages WHERE job_id = ?`, child); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM download_items WHERE job_id = ?`, child); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DELETE FROM download_jobs WHERE id = ? AND parent_chat_id = ?`, child, id); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id = ?`, id); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
