@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -31,21 +32,43 @@ type Monitor struct {
 	lastCPU cpuStat
 	lastNet netStat
 	lastAt  time.Time
+	cancel  context.CancelFunc
+	done    chan struct{}
+	stop    sync.Once
 }
 type cpuStat struct{ total, idle uint64 }
 type netStat struct{ receive, transmit uint64 }
 
 func New(downloadDir string) *Monitor {
-	m := &Monitor{root: downloadDir}
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Monitor{root: downloadDir, cancel: cancel, done: make(chan struct{})}
 	m.sample()
 	go func() {
+		defer close(m.done)
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			m.sample()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.sample()
+			}
 		}
 	}()
 	return m
+}
+
+// Stop ends the in-memory sampler. It is safe to call more than once and is
+// used by HTTP server shutdown and isolated tests alike.
+func (m *Monitor) Stop() {
+	if m == nil {
+		return
+	}
+	m.stop.Do(func() {
+		m.cancel()
+		<-m.done
+	})
 }
 
 func (m *Monitor) Snapshot() (Sample, []Sample) {

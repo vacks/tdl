@@ -98,6 +98,7 @@ func (s *Server) Stop() {
 	s.reactions.Stop()
 	s.downloads.Stop()
 	s.telegram.Stop()
+	s.monitor.Stop()
 }
 
 type responseRecorder struct {

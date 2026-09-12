@@ -647,7 +647,14 @@ func (m *Manager) checkSessions(parent context.Context) {
 			m.markExpired(id)
 			continue
 		}
-		m.markChecked(id)
+		if shouldMarkSessionChecked(err) {
+			m.markChecked(id)
+			continue
+		}
+		// A timeout or unavailable proxy does not prove the authorization is
+		// healthy. Keep the prior successful check time intact rather than
+		// presenting a failed network probe as a fresh validation.
+		applog.Info("telegram", "session_check_failed", "account_id", id, "error", err.Error())
 	}
 }
 
@@ -669,6 +676,8 @@ func (m *Manager) Stop() {
 func isAuthKeyUnregistered(err error) bool {
 	return err != nil && (tgerr.Is(err, "AUTH_KEY_UNREGISTERED") || strings.Contains(err.Error(), "AUTH_KEY_UNREGISTERED"))
 }
+
+func shouldMarkSessionChecked(err error) bool { return err == nil }
 
 func (m *Manager) markChecked(id string) {
 	m.update(id, func(a *Account) { a.CheckedAt = time.Now().UTC().Format(time.RFC3339) })

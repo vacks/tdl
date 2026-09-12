@@ -2,12 +2,22 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/gotd/td/tg"
 )
+
+func TestSessionCheckOnlyMarksSuccessfulProbe(t *testing.T) {
+	if !shouldMarkSessionChecked(nil) {
+		t.Fatal("successful probe was not accepted")
+	}
+	if shouldMarkSessionChecked(errors.New("proxy timeout")) {
+		t.Fatal("failed network probe was accepted as a session check")
+	}
+}
 
 func TestAccountStoreSeparatesSessionAndUpstreamState(t *testing.T) {
 	root := t.TempDir()
