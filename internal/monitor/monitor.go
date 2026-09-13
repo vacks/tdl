@@ -13,7 +13,7 @@ import (
 )
 
 // Sample is an in-memory point for the dashboard; it is intentionally never
-// persisted and therefore has no impact on download SQLite activity.
+// persisted and therefore has no impact on download database activity.
 type Sample struct {
 	At          string  `json:"at"`
 	CPUPercent  float64 `json:"cpuPercent"`

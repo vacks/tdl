@@ -33,7 +33,7 @@ INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES
 INSERT INTO download_items(job_id, dialog_id, message_id, original_name, status) VALUES ('legacy-job', 42, 7, 'legacy.bin', 'completed');`); err != nil {
 		t.Fatalf("prepare legacy database: %v", err)
 	}
-	m := &Manager{db: db}
+	m := &Manager{db: newSQLiteDatabase(db)}
 	if err := m.migrate(); err != nil {
 		t.Fatalf("migrate(): %v", err)
 	}
@@ -87,7 +87,7 @@ func TestChatJobsAreStoredSeparatelyFromMessageJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestMigrateQueuesCompletedChatWhenNewMediaStreamIsAdded(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestQueueIndexedChatMediaKeepsNonDuplicateMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{db: db, settings: store, wake: make(chan struct{}, 1), events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), settings: store, wake: make(chan struct{}, 1), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestCleanupHistoryRemovesTerminalChatIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestDeleteChatPreservesChildReferencedByAnotherChat(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus(), downloadDir: dir}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestChatControlsPropagateToOwnedDownloadJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus(), downloadDir: dir}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +321,7 @@ func TestChatControlRejectsStaleParentState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus(), downloadDir: dir}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestDeleteChatRemovesChildRequestHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus(), downloadDir: dir}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestCleanupHistoryPreservesChildReferencedByRetainedChat(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus(), downloadDir: dir}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestCleanupHistoryCollectsStandaloneJobAfterChatReferenceExpires(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), downloadDir: dir}
+	m := &Manager{db: newSQLiteDatabase(db), events: newEventBus(), downloadDir: dir}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +536,7 @@ func TestEnqueueIntentAttachesDuplicateRequestToExistingJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{db: db, settings: store, wake: make(chan struct{}, 1), events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), settings: store, wake: make(chan struct{}, 1), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestCancelledTaskReactivatesForRepeatedLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{db: db, settings: store, wake: make(chan struct{}, 1), events: newEventBus(), cancels: make(map[string]context.CancelFunc)}
+	m := &Manager{db: newSQLiteDatabase(db), settings: store, wake: make(chan struct{}, 1), events: newEventBus(), cancels: make(map[string]context.CancelFunc)}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +621,7 @@ func TestCancelledReactionCanBeTriggeredAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, wake: make(chan struct{}, 1), events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), wake: make(chan struct{}, 1), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func TestReactionInboxPersistsAndLeasesEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, wake: make(chan struct{}, 1), events: newEventBus()}
+	m := &Manager{db: newSQLiteDatabase(db), wake: make(chan struct{}, 1), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +690,7 @@ func TestListCursorReturnsSummariesWithoutItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db}
+	m := &Manager{db: newSQLiteDatabase(db)}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +721,7 @@ func TestCleanupHistoryProcessesMoreThanOneBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db}
+	m := &Manager{db: newSQLiteDatabase(db)}
 	if err := m.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -764,7 +764,7 @@ func TestDatabaseInstanceIDIsStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	first := &Manager{db: db}
+	first := &Manager{db: newSQLiteDatabase(db)}
 	if err := first.migrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -774,7 +774,7 @@ func TestDatabaseInstanceIDIsStable(t *testing.T) {
 	if first.InstanceID() == "" {
 		t.Fatal("database instance ID is empty")
 	}
-	second := &Manager{db: db}
+	second := &Manager{db: newSQLiteDatabase(db)}
 	if err := second.loadInstanceID(); err != nil {
 		t.Fatal(err)
 	}

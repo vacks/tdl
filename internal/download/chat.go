@@ -316,7 +316,7 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		result, err := tx.Exec(`INSERT OR IGNORE INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, dialog_type, dialog_id, grouped_id, message_text, original_name, size, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, chatID, item.DialogKey, item.MessageID, existingJob, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginalName, item.Size, now)
+		result, err := tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, dialog_type, dialog_id, grouped_id, message_text, original_name, size, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, existingJob, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginalName, item.Size, now)
 		if err != nil {
 			return err
 		}
@@ -352,6 +352,13 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 // pressure predictable even when a user creates many large chat tasks.
 func (m *Manager) chatWorker() {
 	for {
+		if !m.DatabaseAvailable() {
+			select {
+			case <-m.chatWake:
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
 		if err := m.scanOneChat(); err != nil {
 			applog.Error("chat_download", "media_index_failed", "error", err.Error())
 		}
@@ -978,7 +985,7 @@ func (m *Manager) DeleteChat(id string) error {
 // chatExclusiveChildJobIDs returns parent-owned child jobs that are not also
 // referenced by another chat parent. Standalone jobs are excluded because
 // they have no parent_chat_id.
-func chatExclusiveChildJobIDs(tx *sql.Tx, chatIDs []string) ([]string, error) {
+func chatExclusiveChildJobIDs(tx *databaseTx, chatIDs []string) ([]string, error) {
 	if len(chatIDs) == 0 {
 		return nil, nil
 	}

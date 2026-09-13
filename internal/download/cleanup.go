@@ -1,7 +1,6 @@
 package download
 
 import (
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -34,9 +33,13 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// CleanupHistory removes terminal database history older than retentionDays.
-// It never removes final files under the download directory.
+// CleanupHistory retains download history and permanent de-duplication in
+// PostgreSQL. Only auxiliary event, request, inbox and reset records expire.
+// The legacy SQLite path remains only for isolated unit fixtures.
 func (m *Manager) CleanupHistory(retentionDays int) (CleanupResult, error) {
+	if m.db.isPostgres() {
+		return m.cleanupPostgresHistory(retentionDays)
+	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339Nano)
 	result := CleanupResult{}
 	for {
@@ -85,6 +88,63 @@ func (m *Manager) CleanupHistory(retentionDays int) (CleanupResult, error) {
 		m.touch()
 	}
 	return result, nil
+}
+
+func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, error) {
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339Nano)
+	result := CleanupResult{}
+	for {
+		count, err := m.cleanupPostgresBatch(`DELETE FROM download_events WHERE id IN (SELECT id FROM download_events WHERE created_at < ? ORDER BY id LIMIT ?)`, cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.Events += count
+		if count == 0 {
+			break
+		}
+	}
+	for {
+		count, err := m.cleanupPostgresBatch(`DELETE FROM download_requests WHERE id IN (SELECT id FROM download_requests WHERE created_at < ? ORDER BY id LIMIT ?)`, cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.Requests += count
+		if count == 0 {
+			break
+		}
+	}
+	for {
+		count, err := m.cleanupPostgresBatch(`DELETE FROM reaction_inbox WHERE id IN (SELECT id FROM reaction_inbox WHERE status IN ('done', 'failed') AND updated_at < ? ORDER BY id LIMIT ?)`, cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.ReactionEvents += count
+		if count == 0 {
+			break
+		}
+	}
+	for {
+		count, err := m.cleanupPostgresBatch(`DELETE FROM download_resets WHERE (account_id, source_url) IN (SELECT account_id, source_url FROM download_resets WHERE created_at < ? ORDER BY created_at LIMIT ?)`, cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.Resets += count
+		if count == 0 {
+			break
+		}
+	}
+	if result.Events > 0 || result.Requests > 0 || result.ReactionEvents > 0 || result.Resets > 0 {
+		m.touch()
+	}
+	return result, nil
+}
+
+func (m *Manager) cleanupPostgresBatch(query, cutoff string) (int64, error) {
+	result, err := m.db.Exec(query, cutoff, cleanupBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // cleanupChatJobsBatch removes a terminal chat parent together with its
@@ -260,7 +320,7 @@ func placeholders(ids []string) (string, []any) {
 	return marks, args
 }
 
-func deleteCount(tx *sql.Tx, query string, args ...any) (int64, error) {
+func deleteCount(tx *databaseTx, query string, args ...any) (int64, error) {
 	result, err := tx.Exec(query, args...)
 	if err != nil {
 		return 0, err

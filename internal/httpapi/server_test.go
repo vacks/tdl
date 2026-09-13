@@ -81,6 +81,7 @@ func newTestServer(t *testing.T) *Server {
 	cfg := config.Config{
 		DataDir:         filepath.Join(root, "data"),
 		DownloadDir:     filepath.Join(root, "downloads"),
+		DatabaseURL:     "sqlite://" + filepath.Join(root, "test.db"),
 		AdminUsername:   "admin",
 		InitialPassword: "test-password",
 	}

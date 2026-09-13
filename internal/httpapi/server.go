@@ -68,7 +68,7 @@ func New(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	downloads, err := download.Open(cfg.DataDir, cfg.DownloadDir, settingsStore, telegram)
+	downloads, err := download.Open(cfg.DataDir, cfg.DownloadDir, cfg.DatabaseURL, settingsStore, telegram)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +234,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dashboard(w http.ResponseWriter, _ *http.Request) {
 	active, completedItems, failedItems := s.downloads.Summary()
 	current, trend := s.monitor.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "reactions": s.reactions.Health(), "downloads": map[string]int{"active": active, "completedItems": completedItems, "failedItems": failedItems}, "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
+	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "database": s.downloads.DatabaseHealth(), "reactions": s.reactions.Health(), "downloads": map[string]int{"active": active, "completedItems": completedItems, "failedItems": failedItems}, "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
 }
 
 func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
@@ -476,7 +476,7 @@ func (s *Server) chatDownloadControlAPI(w http.ResponseWriter, r *http.Request) 
 }
 
 // downloadProgressSSE streams in-memory progress. Download chunks never write
-// SQLite; this endpoint is intentionally ephemeral and reconnect-safe.
+// PostgreSQL; this endpoint is intentionally ephemeral and reconnect-safe.
 func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)

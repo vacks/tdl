@@ -261,6 +261,12 @@ func (s *Service) processInbox(worker int) {
 		if s.ctx.Err() != nil {
 			return
 		}
+		if !s.downloads.DatabaseAvailable() {
+			if !waitContext(s.ctx, 5*time.Second) {
+				return
+			}
+			continue
+		}
 		events, err := s.downloads.ClaimReactionInbox(1)
 		if err != nil {
 			applog.Error("reaction", "inbox_claim_failed", "worker", worker, "error", err.Error())

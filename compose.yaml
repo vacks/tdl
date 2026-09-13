@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${TDL_POSTGRES_DB:-tdl}
+      POSTGRES_USER: ${TDL_POSTGRES_USER:-tdl}
+      POSTGRES_PASSWORD: ${TDL_POSTGRES_PASSWORD:-tdl-change-me}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   app:
     build: .
     env_file: .env
@@ -8,10 +25,14 @@ services:
       TDL_DATA_DIR: /data
       TDL_DOWNLOAD_DIR: /downloads
       TDL_LISTEN_ADDR: :8080
+      TDL_DATABASE_URL: ${TDL_DATABASE_URL:-postgres://tdl:tdl-change-me@postgres:5432/tdl?sslmode=disable}
     volumes:
       - ./data:/data
       - ./downloads:/downloads
     networks: [internal]
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 networks:

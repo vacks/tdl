@@ -43,7 +43,7 @@ async function save() {
   try { await api('/api/config', { method: 'PUT', body: JSON.stringify(form) }); userIDs.value = form.bot.controlUserIds.map(String); ElMessage.success('配置已保存，新建 Telegram 登录和后续下载任务将使用这些设置') }
   catch (error) { ElMessage.error(error instanceof Error ? error.message : '保存失败') } finally { saving.value = false }
 }
-async function cleanupNow() { try { const result = await api<{ jobs: number; chatJobs: number; requests: number; events: number; reactionEvents: number }>('/api/maintenance/cleanup', { method: 'POST', body: JSON.stringify({ retentionDays: form.cleanup.retentionDays }) }); ElMessage.success(`已清理 ${result.jobs} 条消息任务、${result.chatJobs || 0} 条会话任务、${result.events} 条状态事件`) } catch (error) { ElMessage.error(error instanceof Error ? error.message : '清理失败') } }
+async function cleanupNow() { try { const result = await api<{ requests: number; events: number; reactionEvents: number; resets: number }>('/api/maintenance/cleanup', { method: 'POST', body: JSON.stringify({ retentionDays: form.cleanup.retentionDays }) }); ElMessage.success(`已清理 ${result.events} 条状态事件、${result.requests} 条请求记录和 ${result.reactionEvents} 条表情收件箱记录`) } catch (error) { ElMessage.error(error instanceof Error ? error.message : '清理失败') } }
 function parsedUserIDs(value: unknown): number[] { const entries = Array.isArray(value) ? value : [value]; return [...new Set(entries.flatMap((entry) => String(entry ?? '').split(/[\s,]+/)).map((entry) => Number(entry.trim())).filter((entry) => Number.isSafeInteger(entry) && entry > 0))] }
 function addUserIDs() { const added = userIDInput.value.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean); if (added.length === 0) return; if (added.some((value) => !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) <= 0)) return void ElMessage.error('控制用户 ID 必须是正整数'); userIDs.value = [...new Set([...userIDs.value, ...added])]; userIDInput.value = '' }
 function removeUserID(id: string) { userIDs.value = userIDs.value.filter((value) => value !== id) }
@@ -87,7 +87,7 @@ onMounted(async () => { try { const session = await api<{ authenticated: boolean
             <p v-pre><strong>条件语法 <code>if</code>：</strong><code>{{ if .MessageText }}{{ .MessageText }}_{{ end }}</code> 是一个完整区块：消息正文不为空时输出“正文和下划线”，为空时整段不输出。也可写成 <code>{{ if .MessageText }}有正文{{ else }}无正文{{ end }}</code>。</p>
           </div>
         </el-form></el-card>
-        <el-card shadow="never" class="settings-card"><template #header><strong>历史数据清理</strong></template><el-form label-position="top" @submit.prevent><el-form-item label="历史保留天数"><el-input-number v-model="form.cleanup.retentionDays" :min="1" :max="3650" /></el-form-item><p class="field-help">清理完成、失败、部分完成或已取消的任务记录，以及对应请求、状态事件和表情收件箱历史；不会删除已下载的最终文件。保存后策略生效，可随时立即执行一次清理。</p><el-button @click="cleanupNow">立即清理</el-button></el-form></el-card>
+        <el-card shadow="never" class="settings-card"><template #header><strong>辅助历史清理</strong></template><el-form label-position="top" @submit.prevent><el-form-item label="辅助记录保留天数"><el-input-number v-model="form.cleanup.retentionDays" :min="1" :max="3650" /></el-form-item><p class="field-help">下载任务、文件清单和永久去重记录不会删除。此操作仅清理较早的状态事件、创建请求、已处理表情收件箱和重置标记；不会删除最终文件。</p><el-button @click="cleanupNow">立即清理</el-button></el-form></el-card>
       </el-main>
     </el-container>
   </el-container>

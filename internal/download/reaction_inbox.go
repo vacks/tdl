@@ -32,8 +32,8 @@ func (m *Manager) QueueReaction(intent DownloadIntent, emoji string) (queued boo
 	}
 	_, key, _ := dialogIdentity(intent.Message.InputPeer, intent.AccountID)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := m.db.Exec(`INSERT OR IGNORE INTO reaction_inbox(account_id, dialog_key, dialog_name, dialog_id, message_id, source_url, peer_type, peer_id, peer_hash, emoji, status, attempts, next_attempt_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
+	result, err := m.db.Exec(`INSERT INTO reaction_inbox(account_id, dialog_key, dialog_name, dialog_id, message_id, source_url, peer_type, peer_id, peer_hash, emoji, status, attempts, next_attempt_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account_id, dialog_key, message_id, emoji) DO NOTHING`,
 		intent.AccountID, key, intent.Message.DialogName, intent.Message.DialogID, intent.Message.MessageID, intent.Message.SourceURL, direct.kind, direct.id, direct.hash, emoji, now, now, now)
 	if err != nil {
 		return false, err

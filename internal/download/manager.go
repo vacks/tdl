@@ -31,7 +31,6 @@ import (
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 	"golang.org/x/sys/unix"
-	_ "modernc.org/sqlite"
 )
 
 var (
@@ -166,7 +165,7 @@ func messageMediaType(message *tg.Message) string {
 }
 
 type Manager struct {
-	db            *sql.DB
+	db            *database
 	instanceID    string
 	downloadDir   string
 	settings      *settings.Store
@@ -184,17 +183,23 @@ type Manager struct {
 	activeJobs    int
 	jobLocks      [64]sync.Mutex
 	revision      atomic.Uint64
+	dbHealthMu    sync.RWMutex
+	dbHealth      DatabaseHealth
+	dbMonitorStop context.CancelFunc
+	dbOutage      atomic.Bool
 }
 
-func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram.Manager) (*Manager, error) {
+type DatabaseHealth struct {
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+	CheckedAt string `json:"checkedAt"`
+}
+
+func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accounts *telegram.Manager) (*Manager, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
-	// WAL allows the Web UI to read task state while the worker writes it. The
-	// busy timeout turns short writer contention into a wait instead of an HTTP
-	// error, which is especially common just after retrying a task.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", filepath.ToSlash(filepath.Join(dataDir, "tdl.db")))
-	db, err := sql.Open("sqlite", dsn)
+	db, err := openDatabase(context.Background(), databaseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +211,10 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	if err := m.loadInstanceID(); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if err := m.reconcilePublishedItems(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("reconcile published files: %w", err)
 	}
 	// Retain the upstream temporary files and resume keys. A worker will resume
 	// these jobs using the account originally selected at enqueue time.
@@ -237,10 +246,96 @@ func Open(dataDir, downloadDir string, store *settings.Store, accounts *telegram
 	go m.chatWorker()
 	go m.chatEventWorker()
 	go m.cleanupLoop()
+	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
+	m.dbMonitorStop = cancelMonitor
+	m.updateDatabaseHealth()
+	go m.databaseMonitor(monitorCtx)
 	return m, nil
 }
 
-func (m *Manager) migrate() error {
+func (m *Manager) databaseMonitor(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.updateDatabaseHealth()
+		}
+	}
+}
+
+func (m *Manager) updateDatabaseHealth() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := m.db.PingContext(ctx)
+	cancel()
+	health := DatabaseHealth{Status: "connected", CheckedAt: time.Now().UTC().Format(time.RFC3339)}
+	if err != nil {
+		health.Status, health.Error = "unavailable", "数据库暂时不可用，服务将自动重连"
+		if !m.dbOutage.Swap(true) {
+			applog.Error("database", "connection_lost", "error", err.Error())
+			m.cancelTransfersForDatabaseOutage()
+		}
+	} else if m.dbOutage.Swap(false) {
+		if recoverErr := m.recoverAfterDatabaseOutage(); recoverErr != nil {
+			health.Status, health.Error = "unavailable", "数据库已连接，任务状态恢复中"
+			m.dbOutage.Store(true)
+			applog.Error("database", "recovery_failed", "error", recoverErr.Error())
+		} else {
+			applog.Info("database", "connection_recovered")
+		}
+	}
+	m.dbHealthMu.Lock()
+	m.dbHealth = health
+	m.dbHealthMu.Unlock()
+}
+
+func (m *Manager) cancelTransfersForDatabaseOutage() {
+	m.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.cancels))
+	for _, cancel := range m.cancels {
+		cancels = append(cancels, cancel)
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (m *Manager) recoverAfterDatabaseOutage() error {
+	if err := m.reconcilePublishedItems(); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`UPDATE download_items SET status = 'queued', started_at = '', finished_at = '' WHERE status = 'running'`); err != nil {
+		return err
+	}
+	if _, err := m.db.Exec(`UPDATE download_jobs SET status = 'queued', error = '数据库连接恢复，任务等待继续', updated_at = ? WHERE status = 'running'`, now); err != nil {
+		return err
+	}
+	m.touch()
+	for worker := 0; worker < workerCount; worker++ {
+		m.signal()
+	}
+	return nil
+}
+
+func (m *Manager) DatabaseHealth() DatabaseHealth {
+	m.dbHealthMu.RLock()
+	defer m.dbHealthMu.RUnlock()
+	return m.dbHealth
+}
+
+func (m *Manager) DatabaseAvailable() bool {
+	return !m.dbOutage.Load() && m.DatabaseHealth().Status == "connected"
+}
+
+func (m *Manager) migrate() error { return m.migratePostgres() }
+
+// migrateSQLiteLegacy is retained only to support the isolated SQLite unit
+// fixtures while the production application uses PostgreSQL exclusively.
+func (m *Manager) migrateSQLiteLegacy() error {
 	_, err := m.db.Exec(`
 CREATE TABLE IF NOT EXISTS download_jobs (
  id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id INTEGER NOT NULL DEFAULT 0, direct_peer_hash INTEGER NOT NULL DEFAULT 0, parent_chat_id TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -393,7 +488,11 @@ CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_j
 	// media stream was introduced. Add the missing durable cursors without
 	// disturbing streams that have already completed.
 	for _, kind := range chatStreamKinds {
-		result, err := m.db.Exec(`INSERT OR IGNORE INTO chat_download_streams(chat_job_id, stream_kind) SELECT id, ? FROM chat_download_jobs`, kind)
+		statement := `INSERT INTO chat_download_streams(chat_job_id, stream_kind) SELECT id, ? FROM chat_download_jobs ON CONFLICT(chat_job_id, stream_kind) DO NOTHING`
+		if !m.db.isPostgres() {
+			statement = `INSERT OR IGNORE INTO chat_download_streams(chat_job_id, stream_kind) SELECT id, ? FROM chat_download_jobs`
+		}
+		result, err := m.db.Exec(statement, kind)
 		if err != nil {
 			return err
 		}
@@ -529,7 +628,7 @@ func (m *Manager) migrateItemIdentity() error {
 
 // SaveBotLifecycleMessage stores the one lifecycle card shown to a Bot user.
 func (m *Manager) SaveBotLifecycleMessage(jobID string, ref BotMessageRef) error {
-	_, err := m.db.Exec(`INSERT OR REPLACE INTO bot_lifecycle_messages(job_id, chat_id, message_id, message_text, token_hash) VALUES (?, ?, ?, ?, ?)`, jobID, ref.ChatID, ref.MessageID, ref.Text, ref.TokenHash)
+	_, err := m.db.Exec(`INSERT INTO bot_lifecycle_messages(job_id, chat_id, message_id, message_text, token_hash) VALUES (?, ?, ?, ?, ?) ON CONFLICT(job_id, chat_id) DO UPDATE SET message_id = EXCLUDED.message_id, message_text = EXCLUDED.message_text, token_hash = EXCLUDED.token_hash`, jobID, ref.ChatID, ref.MessageID, ref.Text, ref.TokenHash)
 	return err
 }
 
@@ -606,7 +705,7 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 		pageSize = 50
 	}
 	var total int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = ''`).Scan(&total); err != nil {
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = '' AND status != 'deleted'`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	if total == 0 {
@@ -617,7 +716,7 @@ func (m *Manager) ListPage(page, pageSize int) ([]Job, int, error) {
 		page = pages
 	}
 	offset := (page - 1) * pageSize
-	return m.listSummaries("WHERE j.parent_chat_id = ''", `ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?`, []any{pageSize, offset}, total)
+	return m.listSummaries("WHERE j.parent_chat_id = '' AND j.status != 'deleted'", `ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?`, []any{pageSize, offset}, total)
 }
 
 // ListCursor is stable when new tasks are inserted: it continues after the
@@ -632,10 +731,10 @@ func (m *Manager) ListCursor(cursor string, pageSize int) ([]Job, int, string, e
 		pageSize = 50
 	}
 	var total int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = ''`).Scan(&total); err != nil {
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = '' AND status != 'deleted'`).Scan(&total); err != nil {
 		return nil, 0, "", err
 	}
-	where := "WHERE j.parent_chat_id = ''"
+	where := "WHERE j.parent_chat_id = '' AND j.status != 'deleted'"
 	pagination := `ORDER BY j.created_at DESC, j.id DESC LIMIT ?`
 	args := []any{pageSize + 1}
 	if cursor != "" {
@@ -731,6 +830,9 @@ func (m *Manager) LiveProgress() []FileProgress {
 // It is called before process shutdown so a restart does not depend on a hard
 // kill to recover task state.
 func (m *Manager) Stop() {
+	if m.dbMonitorStop != nil {
+		m.dbMonitorStop()
+	}
 	m.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(m.cancels))
 	for _, cancel := range m.cancels {
@@ -750,10 +852,13 @@ func (m *Manager) Stop() {
 	for _, cancel := range listeners {
 		cancel()
 	}
+	if m.db != nil {
+		_ = m.db.Close()
+	}
 }
 
 // Revision increases only when persistent task state changes. It lets the UI
-// avoid polling SQLite while still refreshing promptly after state transitions.
+// avoid polling the database while still refreshing promptly after transitions.
 func (m *Manager) Revision() uint64 { return m.revision.Load() }
 func (m *Manager) touch()           { m.revision.Add(1) }
 
@@ -821,9 +926,9 @@ func (m *Manager) enqueueIntentParentSnapshot(intent DownloadIntent, sources []s
 		if err := tx.QueryRow(`SELECT status FROM download_jobs WHERE id = ?`, existingID).Scan(&existingStatus); err != nil {
 			return Submission{}, err
 		}
-		reactivated := existingStatus == "cancelled"
+		reactivated := existingStatus == "cancelled" || existingStatus == "deleted"
 		if reactivated {
-			if _, err := tx.Exec(`UPDATE download_jobs SET status = 'queued', error = '', updated_at = ? WHERE id = ? AND status = 'cancelled'`, now, existingID); err != nil {
+			if _, err := tx.Exec(`UPDATE download_jobs SET status = 'queued', error = '', updated_at = ? WHERE id = ? AND status IN ('cancelled', 'deleted')`, now, existingID); err != nil {
 				return Submission{}, err
 			}
 			// Completed files are already safely published and must never be
@@ -964,7 +1069,7 @@ func (m *Manager) run(job Job, sources []source) {
 		if ctx.Err() != nil || m.status(job.ID) != "running" {
 			return
 		}
-		if item.Status == "completed" {
+		if item.Status == "completed" || (item.Status == "downloaded" && regularFileExists(item.FinalPath)) {
 			continue
 		}
 		pending = append(pending, item)
@@ -1090,6 +1195,12 @@ func (m *Manager) run(job Job, sources []source) {
 		if m.status(job.ID) == "cancelled" {
 			return
 		}
+		// A database outage cancels the upstream context. Recovery may already
+		// have returned this job to the queue by the time this callback exits;
+		// never overwrite that recovery state with a transfer failure.
+		if m.status(job.ID) != "running" {
+			return
+		}
 		// Upstream can return an error while persisting resume metadata after all
 		// media callbacks have already completed and every final move succeeded.
 		// The observable task result is still successful in that case.
@@ -1118,6 +1229,11 @@ func (m *Manager) run(job Job, sources []source) {
 		_ = m.setJob(job.ID, "completed", "")
 		_ = os.RemoveAll(tmpDir)
 	}
+}
+
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 func makeDirectPeer(peer tg.InputPeerClass) directPeer {
@@ -1177,6 +1293,44 @@ func (m *Manager) allItemsCompleted(jobID string) bool {
 	return incomplete == 0
 }
 
+// reconcilePublishedItems completes the narrow crash window between moving a
+// file and persisting its terminal status. A path is trusted only when it is
+// still a regular file; otherwise a normal resumable retry remains possible.
+func (m *Manager) reconcilePublishedItems() error {
+	rows, err := m.db.Query(`SELECT dialog_key, message_id, final_path FROM download_items WHERE status = 'downloaded' AND final_path != ''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type candidate struct {
+		dialogKey string
+		messageID int
+		path      string
+	}
+	items := make([]candidate, 0)
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.dialogKey, &item.messageID, &item.path); err != nil {
+			return err
+		}
+		if info, statErr := os.Stat(item.path); statErr == nil && info.Mode().IsRegular() {
+			items = append(items, item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := m.db.Exec(`UPDATE download_items SET status = 'completed', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ? AND status = 'downloaded'`, time.Now().UTC().Format(time.RFC3339Nano), item.dialogKey, item.messageID); err != nil {
+			return err
+		}
+	}
+	if len(items) > 0 {
+		_, err = m.db.Exec(`UPDATE download_jobs SET status = 'completed', error = '', updated_at = ? WHERE status IN ('queued', 'running', 'failed', 'partial') AND NOT EXISTS (SELECT 1 FROM download_items WHERE download_items.job_id = download_jobs.id AND download_items.status != 'completed')`, time.Now().UTC().Format(time.RFC3339Nano))
+	}
+	return err
+}
+
 // publishItem moves a file only after upstream tdl has closed and finalized
 // its temporary file. It runs outside the upstream download worker.
 func (m *Manager) publishItem(jobID, path string, item source, config settings.Values) error {
@@ -1192,6 +1346,12 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 	}
 	if _, statErr := os.Stat(finalPath); statErr == nil {
 		return m.setItem(item, "failed", "", "目标文件已存在，未覆盖")
+	}
+	// Persist the selected final path before the irreversible move. If the
+	// database disconnects after a successful move, reconciliation can verify
+	// the path instead of downloading this media again.
+	if err := m.setItem(item, "downloaded", finalPath, ""); err != nil {
+		return fmt.Errorf("保存待发布状态: %w", err)
 	}
 	if err := publishNoReplace(path, finalPath); err != nil {
 		if errors.Is(err, unix.EEXIST) {
@@ -1361,7 +1521,7 @@ func (m *Manager) Pause(id string) error {
 		return errors.New("当前任务不能暂停")
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if err := m.transitionItems(id, status, "paused", "已暂停，可继续恢复", `UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('queued', 'running', 'downloaded')`, now, id); err != nil {
+	if err := m.transitionItems(id, status, "paused", "已暂停，可继续恢复", m.pauseItemsSQL(), now, id); err != nil {
 		return fmt.Errorf("暂停任务: %w", err)
 	}
 	m.mu.Lock()
@@ -1371,6 +1531,13 @@ func (m *Manager) Pause(id string) error {
 		cancel()
 	}
 	return nil
+}
+
+func (m *Manager) pauseItemsSQL() string {
+	if m.db.isPostgres() {
+		return `UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END, started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('queued', 'running', 'downloaded')`
+	}
+	return `UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('queued', 'running', 'downloaded')`
 }
 func (m *Manager) Resume(id string) error {
 	lock := m.jobLock(id)
@@ -1428,7 +1595,7 @@ func (m *Manager) Cancel(id string) error {
 	return nil
 }
 
-// transitionItems updates the task and its non-final file rows in one SQLite
+// transitionItems updates the task and its non-final file rows in one database
 // transaction. A control request therefore never leaves a task marked as
 // paused/cancelled/queued while its file rows still describe a different
 // durable state.
@@ -1460,9 +1627,10 @@ func (m *Manager) transitionItems(id, expected, next, message, itemSQL string, a
 	return nil
 }
 
-// Delete removes the task record and only its temporary directory. Final files
-// are intentionally never removed. A terminal task is required so a worker
-// cannot still be writing files while its record is being removed.
+// Delete hides a terminal task and removes only its temporary directory. The
+// task, media identities and audit records remain as permanent history; a
+// later matching submission reactivates this same task instead of creating a
+// second media identity.
 func (m *Manager) Delete(id string) error {
 	status := m.status(id)
 	if status != "completed" && status != "failed" && status != "partial" && status != "cancelled" {
@@ -1481,23 +1649,11 @@ func (m *Manager) Delete(id string) error {
 		return err
 	}
 	if accountID != "" {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO download_resets(account_id, source_url, created_at) VALUES (?, ?, ?)`, accountID, sourceURL, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.Exec(`INSERT INTO download_resets(account_id, source_url, created_at) VALUES (?, ?, ?) ON CONFLICT(account_id, source_url) DO UPDATE SET created_at = EXCLUDED.created_at`, accountID, sourceURL, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}
-	// These are historical/audit child records. They deliberately retain no
-	// foreign-key cascade for old databases, so delete them explicitly in the
-	// same transaction before removing their task.
-	if _, err := tx.Exec(`DELETE FROM download_events WHERE job_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM download_requests WHERE job_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM download_items WHERE job_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM download_jobs WHERE id = ?`, id); err != nil {
+	if _, err := tx.Exec(`UPDATE download_jobs SET status = 'deleted', error = '任务已删除', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1505,7 +1661,7 @@ func (m *Manager) Delete(id string) error {
 	}
 	m.touch()
 	if err := os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", id)); err != nil {
-		return fmt.Errorf("任务记录已删除，但清理临时目录失败: %w", err)
+		return fmt.Errorf("任务已删除，但清理临时目录失败: %w", err)
 	}
 	return nil
 }
@@ -1562,7 +1718,9 @@ func (m *Manager) beginItemAttempt(item source) error {
 }
 func (m *Manager) pauseItem(item source) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	m.execItemState("item_pause_save_failed", `UPDATE download_items SET status = 'paused', error = '', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE 0 END, started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ? AND status IN ('queued', 'running')`, now, item.DialogKey, item.MessageID)
+	query := m.pauseItemsSQL()
+	query = strings.Replace(query, "WHERE job_id = ? AND status IN ('queued', 'running', 'downloaded')", "WHERE dialog_key = ? AND message_id = ? AND status IN ('queued', 'running')", 1)
+	m.execItemState("item_pause_save_failed", query, now, item.DialogKey, item.MessageID)
 }
 func (m *Manager) markItemStarted(item source) error {
 	return m.execItemState("item_start_save_failed", `UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
@@ -1581,7 +1739,7 @@ func (m *Manager) execItemState(event, query string, args ...any) error {
 }
 func (m *Manager) fail(id string, sources []source, err error) {
 	for _, item := range sources {
-		if m.itemStatus(item.DialogKey, item.MessageID) == "completed" {
+		if status := m.itemStatus(item.DialogKey, item.MessageID); status == "completed" || status == "downloaded" {
 			continue
 		}
 		_ = m.setItem(item, "failed", "", err.Error())

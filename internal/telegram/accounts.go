@@ -463,7 +463,7 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 
 func dispatchReactionEvent(onEvent func(context.Context, ReactionEvent), event ReactionEvent) {
 	// The consumer owns bounded buffering. Do not create one goroutine for each
-	// update: a busy group plus a slow SQLite write would otherwise grow memory
+	// update: a busy group plus a slow database write would otherwise grow memory
 	// without limit.
 	onEvent(context.Background(), event)
 }

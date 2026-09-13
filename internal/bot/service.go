@@ -703,7 +703,7 @@ func (s *Service) editChatList(cfg settings.Bot, chatID, messageID int64, page i
 	s.edit(cfg.Token, chatID, messageID, text, buttons)
 }
 
-// The Bot API callback payload is bounded, so the opaque SQLite cursor used
+// The Bot API callback payload is bounded, so the opaque database cursor used
 // by the Web is intentionally not exposed here. Bot lists have small pages;
 // page-number access is translated through the manager's presentation helper.
 func (s *Service) chatTaskList(page int) (string, [][]button, error) {
@@ -901,7 +901,7 @@ func (s *Service) refresh(cfg settings.Bot) {
 		s.lifecycleMu.Lock()
 		if !s.isDeleted(job.ID) {
 			if ready && !exists {
-				// Lifecycle cards survive restarts in SQLite. Reload them before
+				// Lifecycle cards survive restarts in the database. Reload them before
 				// deciding whether a first post-restart event needs a new card.
 				if len(s.lifecycleRefs(job.ID)) > 0 {
 					s.updateLifecycle(cfg, job)

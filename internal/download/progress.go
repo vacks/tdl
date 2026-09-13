@@ -9,7 +9,7 @@ import (
 )
 
 // FileProgress is live, non-persistent download state. It intentionally stays
-// out of SQLite: upstream invokes the callback for every completed chunk.
+// out of PostgreSQL: upstream invokes the callback for every completed chunk.
 type FileProgress struct {
 	DialogType string  `json:"dialogType"`
 	DialogKey  string  `json:"dialogKey"`

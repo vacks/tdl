@@ -3,6 +3,7 @@
 .DS_Store
 data/
 downloads/
+postgres/
 web/node_modules/
 web/dist/
 internal/httpapi/static/*

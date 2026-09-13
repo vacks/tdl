@@ -9,7 +9,7 @@ import (
 
 // Event is a lightweight domain notification. Persistent history lives in
 // download_events; subscribers are best-effort and always reload canonical
-// task state from SQLite when necessary.
+// task state from PostgreSQL when necessary.
 type Event struct {
 	ID        int64     `json:"id"`
 	JobID     string    `json:"jobId"`
@@ -72,6 +72,10 @@ func (m *Manager) emit(jobID, requestID, kind, status string) {
 		m.events.publish(event)
 		return
 	}
-	event.ID, _ = result.LastInsertId()
+	// PostgreSQL's database/sql driver does not expose LastInsertId. Event IDs
+	// are audit-only for live delivery, so leave the in-memory ID at zero there.
+	if !m.db.isPostgres() {
+		event.ID, _ = result.LastInsertId()
+	}
 	m.events.publish(event)
 }
