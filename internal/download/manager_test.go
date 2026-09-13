@@ -341,7 +341,7 @@ func TestChatControlRejectsStaleParentState(t *testing.T) {
 	}
 }
 
-func TestDeleteChatRemovesChildRequestHistory(t *testing.T) {
+func TestDeleteChatRetainsChildRequestHistory(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "tdl.db"))+"?_pragma=foreign_keys(ON)")
 	if err != nil {
@@ -374,9 +374,19 @@ func TestDeleteChatRemovesChildRequestHistory(t *testing.T) {
 	if err := m.DeleteChat("chat-delete"); err != nil {
 		t.Fatalf("DeleteChat(): %v", err)
 	}
+	for query, want := range map[string]string{
+		`SELECT status FROM chat_download_jobs WHERE id = 'chat-delete'`: "deleted",
+		`SELECT status FROM download_jobs WHERE id = 'child-delete'`:     "deleted",
+	} {
+		var status string
+		if err := db.QueryRow(query).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != want {
+			t.Fatalf("status for %q = %q, want %q", query, status, want)
+		}
+	}
 	for _, query := range []string{
-		`SELECT COUNT(1) FROM chat_download_jobs WHERE id = 'chat-delete'`,
-		`SELECT COUNT(1) FROM download_jobs WHERE id = 'child-delete'`,
 		`SELECT COUNT(1) FROM download_requests WHERE id = 'request-delete'`,
 		`SELECT COUNT(1) FROM download_events WHERE job_id = 'child-delete'`,
 	} {
@@ -384,8 +394,8 @@ func TestDeleteChatRemovesChildRequestHistory(t *testing.T) {
 		if err := db.QueryRow(query).Scan(&count); err != nil {
 			t.Fatal(err)
 		}
-		if count != 0 {
-			t.Fatalf("rows remain after DeleteChat for query %q: %d", query, count)
+		if count != 1 {
+			t.Fatalf("history missing after DeleteChat for query %q: %d", query, count)
 		}
 	}
 }

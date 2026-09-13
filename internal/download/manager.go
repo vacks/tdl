@@ -805,12 +805,11 @@ func decodeJobCursor(cursor string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
-func (m *Manager) Summary() (active, completedItems, failedItems int) {
-	_ = m.db.QueryRow(`SELECT
- COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'downloaded', 'paused') THEN 1 ELSE 0 END), 0),
- COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
- COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
- FROM download_items`).Scan(&active, &completedItems, &failedItems)
+func (m *Manager) Summary() (active, failedItems int) {
+	// Dashboard refreshes frequently. Do not aggregate permanent completed
+	// history here: at multi-million scale that would force repeated scans.
+	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'running', 'downloaded', 'paused')`).Scan(&active)
+	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status = 'failed'`).Scan(&failedItems)
 	return
 }
 

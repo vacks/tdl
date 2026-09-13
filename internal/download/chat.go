@@ -56,6 +56,7 @@ const (
 	ChatStatusFailed      = "failed"
 	ChatStatusPartial     = "partial"
 	ChatStatusCompleted   = "completed"
+	ChatStatusDeleted     = "deleted"
 )
 
 const (
@@ -147,17 +148,17 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 		pageSize = 10
 	}
 	var total int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM chat_download_jobs`).Scan(&total); err != nil {
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM chat_download_jobs WHERE status != ?`, ChatStatusDeleted).Scan(&total); err != nil {
 		return nil, 0, "", err
 	}
-	where, args := "", []any{pageSize + 1}
+	where, args := "WHERE c.status != ?", []any{ChatStatusDeleted, pageSize + 1}
 	if cursor != "" {
 		createdAt, id, err := decodeChatCursor(cursor)
 		if err != nil {
 			return nil, 0, "", errors.New("分页游标无效，请返回第一页")
 		}
-		where = "WHERE (c.created_at < ? OR (c.created_at = ? AND c.id < ?))"
-		args = []any{createdAt, createdAt, id, pageSize + 1}
+		where += " AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))"
+		args = []any{ChatStatusDeleted, createdAt, createdAt, id, pageSize + 1}
 	}
 	rows, err := m.db.Query(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
  COUNT(i.message_id), COALESCE(SUM(CASE WHEN d.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN d.status IN ('failed', 'partial') THEN 1 ELSE 0 END), 0)
@@ -750,7 +751,7 @@ func searchMessages(result tg.MessagesMessagesClass) []tg.MessageClass {
 }
 
 func (m *Manager) refreshChatStates() {
-	rows, err := m.db.Query(`SELECT id, listen_new, status, scan_state FROM chat_download_jobs WHERE status NOT IN (?, ?, ?)`, ChatStatusPaused, ChatStatusCancelled, ChatStatusFailed)
+	rows, err := m.db.Query(`SELECT id, listen_new, status, scan_state FROM chat_download_jobs WHERE status NOT IN (?, ?, ?, ?)`, ChatStatusPaused, ChatStatusCancelled, ChatStatusFailed, ChatStatusDeleted)
 	if err != nil {
 		return
 	}
@@ -941,35 +942,19 @@ func (m *Manager) DeleteChat(id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	// Overlapping chat ranges may deliberately share a child task. Preserve a
-	// child while another parent still references it, otherwise deleting one
-	// history record would also erase the other's progress and retry handle.
+	// Overlapping chat ranges may deliberately share a child task. Only mark a
+	// child deleted when no other visible parent references it; physical rows
+	// remain permanent history and global media de-duplication evidence.
 	children, err := chatExclusiveChildJobIDs(tx, []string{id})
 	if err != nil {
 		return err
 	}
-	// download_requests and download_events intentionally support old database
-	// layouts without ON DELETE CASCADE. Remove every dependent row before the
-	// child job itself; otherwise a terminal chat with request history cannot be
-	// deleted because SQLite correctly rejects the dangling foreign key.
 	for _, child := range children {
-		if _, err := tx.Exec(`DELETE FROM download_events WHERE job_id = ?`, child); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM download_requests WHERE job_id = ?`, child); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM bot_lifecycle_messages WHERE job_id = ?`, child); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM download_items WHERE job_id = ?`, child); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM download_jobs WHERE id = ? AND parent_chat_id = ?`, child, id); err != nil {
+		if _, err := tx.Exec(`UPDATE download_jobs SET status = 'deleted', error = '所属会话任务已删除', updated_at = ? WHERE id = ? AND parent_chat_id = ? AND status != 'completed'`, time.Now().UTC().Format(time.RFC3339Nano), child, id); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id = ?`, id); err != nil {
+	if _, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = '会话任务已删除', updated_at = ? WHERE id = ?`, ChatStatusDeleted, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

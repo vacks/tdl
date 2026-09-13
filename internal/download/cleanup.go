@@ -17,6 +17,7 @@ type CleanupResult struct {
 	Events         int64 `json:"events"`
 	ReactionEvents int64 `json:"reactionEvents"`
 	Resets         int64 `json:"resets"`
+	BotMessages    int64 `json:"botMessages"`
 }
 
 func (m *Manager) cleanupLoop() {
@@ -133,7 +134,17 @@ func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, erro
 			break
 		}
 	}
-	if result.Events > 0 || result.Requests > 0 || result.ReactionEvents > 0 || result.Resets > 0 {
+	for {
+		count, err := m.cleanupPostgresBatch(`DELETE FROM bot_lifecycle_messages WHERE (job_id, chat_id) IN (SELECT b.job_id, b.chat_id FROM bot_lifecycle_messages b JOIN download_jobs j ON j.id = b.job_id WHERE j.status IN ('completed', 'failed', 'partial', 'cancelled', 'deleted') AND j.updated_at < ? ORDER BY j.updated_at, b.job_id LIMIT ?)`, cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.BotMessages += count
+		if count == 0 {
+			break
+		}
+	}
+	if result.Events > 0 || result.Requests > 0 || result.ReactionEvents > 0 || result.Resets > 0 || result.BotMessages > 0 {
 		m.touch()
 	}
 	return result, nil
