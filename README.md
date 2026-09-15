@@ -1,6 +1,6 @@
 # TDL 管理
 
-`TDL 管理 v1.0.0` 是基于 [iyear/tdl](https://github.com/iyear/tdl) `v0.20.4` 的 Telegram 下载管理服务。它将上游 tdl 的登录与下载能力封装为 Web 管理台，并提供 Telegram Bot 和表情触发入口。
+`TDL 管理` 是基于 [iyear/tdl](https://github.com/iyear/tdl) `v0.20.4` 的 Telegram 下载管理服务。它将上游 tdl 的登录与下载能力封装为 Web 管理台，并提供 Telegram Bot 和表情触发入口。
 
 项目面向自托管：应用、PostgreSQL、Telegram 会话、下载历史和最终文件均由部署者持有。默认 Compose 仅监听宿主机回环地址；公网访问应始终经由你自己的 HTTPS 反向代理。
 
@@ -17,14 +17,6 @@
 - 表情触发：监听所有已授权 Telegram 账户本人作出的匹配 Unicode 表情，支持私聊、群组、频道和收藏消息；
 - 仪表盘、结构化应用日志、数据库健康检查；文件进度通过 SSE 内存推送，不高频写 PostgreSQL。
 
-## 重要限制
-
-- 仅支持普通 Unicode 表情，不能把自定义 Premium 表情作为触发条件；
-- 下载失败不会盲目自动重试，避免 Telegram 故障或限流时产生额外请求；
-- 管理员 Web 会话保存在内存，服务重启、更新或改密码后需重新登录；Telegram 账户会话和下载历史不会丢失；
-- 不提供下载记录导出；
-- 上游 tdl 的实时进度和取消控制由版本锁定补丁提供。构建会校验上游版本和受影响源码的校验和；不匹配即失败，不会产出不可靠镜像；
-- 上游 tdl 使用 AGPL-3.0。发布或以网络服务方式提供本项目时，请履行相应的源代码提供义务。
 
 ## 数据与目录
 
@@ -40,7 +32,7 @@
 
 ## 部署前准备
 
-- Docker Engine 26+ 与 Docker Compose v2；OrbStack、Docker Desktop、NAS 的 Compose 图形界面均可；
+- Docker Engine 26+ 与 Docker Compose v2；
 - 首次构建和运行建议至少预留 2 GB 内存；
 - 一个用于保存下载文件的宿主机目录；
 - 首次 Telegram 登录需要能够访问 Telegram；需要时可在 Web 的“配置管理”中设置代理；
