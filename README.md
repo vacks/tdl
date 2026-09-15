@@ -50,77 +50,97 @@
 
 ## 方式一：Docker Compose（推荐）
 
-适用于命令行、OrbStack、Docker Desktop 和 NAS 的 Stack / Compose 项目功能。
+适用于 OrbStack、Docker Desktop、命令行和 NAS 的 Stack / Compose 项目功能。获取源码后进入项目目录；仓库内已提供相同的 `compose.yaml` 与 `.env.example`。
 
-1. 获取源码并进入目录：
+**`.env` 完整示例：**
 
-   ```bash
-   git clone <你发布后的仓库地址> tdl
-   cd tdl
-   ```
+```dotenv
+TDL_ADMIN_USERNAME=admin
+TDL_ADMIN_INITIAL_PASSWORD=替换为强管理员密码
 
-2. 创建配置文件：
+TDL_DATA_DIR=/data
+TDL_DOWNLOAD_DIR=/downloads
+TDL_LISTEN_ADDR=:8080
 
-   ```bash
-   cp .env.example .env
-   ```
+TDL_POSTGRES_DB=tdl
+TDL_POSTGRES_USER=tdl
+TDL_POSTGRES_PASSWORD=替换为长随机数据库密码
+TDL_DATABASE_URL=postgres://tdl:替换为长随机数据库密码@postgres:5432/tdl?sslmode=disable
 
-3. **手动编辑 `.env`**。至少替换以下项目；数据库密码必须与连接串内的密码完全相同：
-
-   ```dotenv
-   TDL_ADMIN_USERNAME=admin
-   TDL_ADMIN_INITIAL_PASSWORD=请设置强管理员密码
-
-   TDL_POSTGRES_PASSWORD=请设置另一条长随机数据库密码
-   TDL_DATABASE_URL=postgres://tdl:请设置另一条长随机数据库密码@postgres:5432/tdl?sslmode=disable
-   ```
-
-   `TDL_ADMIN_INITIAL_PASSWORD` 每次启动都必须非空，但仅在 `data/admin.json` 不存在时用于创建管理员。首次创建后，以 Web 中修改后的管理员密码为准。请不要把 `.env` 提交到 Git。
-
-4. 启动：
-
-   ```bash
-   docker compose up -d --build
-   ```
-
-5. 查看状态和日志：
-
-   ```bash
-   docker compose ps
-   docker compose logs -f app
-   ```
-
-6. 在部署主机访问 `http://127.0.0.1:8080`，使用 `.env` 中的管理员账号和首次密码登录。完成 Telegram 登录后，再在 Web 中配置下载规则、Bot 或表情触发。
-
-停止服务但保留数据：
-
-```bash
-docker compose down
+# 本地访问保持 false；HTTPS 反向代理部署时改为 true。
+TDL_COOKIE_SECURE=false
+TDL_TRUSTED_ORIGINS=
+TDL_TRUST_PROXY=false
 ```
 
-更新版本：
+`TDL_POSTGRES_PASSWORD` 与连接串中的密码必须完全相同；如果密码含有 `@`、`:`、`/`、`?`、`#` 等 URL 特殊字符，需要先做 URL 编码。
+
+**`compose.yaml` 完整示例：**
+
+```yaml
+services:
+  postgres:
+    image: postgres:17-alpine
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${TDL_POSTGRES_DB:?set TDL_POSTGRES_DB in .env}
+      POSTGRES_USER: ${TDL_POSTGRES_USER:?set TDL_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${TDL_POSTGRES_PASSWORD:?set TDL_POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  app:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      TDL_DATA_DIR: /data
+      TDL_DOWNLOAD_DIR: /downloads
+      TDL_LISTEN_ADDR: :8080
+      TDL_DATABASE_URL: ${TDL_DATABASE_URL:?set TDL_DATABASE_URL in .env}
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    networks: [internal]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
+```
+
+启动和更新：
 
 ```bash
+# 首次：复制并编辑 .env 后启动
+docker compose up -d --build
+
+# 查看状态、日志与健康状态
+docker compose ps
+docker compose logs -f app
+curl -fsS http://127.0.0.1:8080/api/health
+
+# 更新源码后的重建
 git pull
 docker compose up -d --build
 ```
 
-不要执行 `docker compose down -v`，也不要删除 `data/`、`postgres/` 或 `downloads/`，除非你明确希望丢弃相应数据。
+访问 `http://127.0.0.1:8080`，使用 `.env` 中的管理员账号和首次密码登录。`TDL_ADMIN_INITIAL_PASSWORD` 每次启动都必须非空，但仅在 `data/admin.json` 不存在时用于创建管理员；之后以 Web 中修改后的密码为准。
 
-### NAS / Compose 图形界面
+NAS 若不支持相对挂载，直接把 `./data`、`./postgres`、`./downloads` 改为绝对路径，例如 `/volume1/docker/tdl/data:/data`、`/volume1/docker/tdl/postgres:/var/lib/postgresql/data`、`/volume1/downloads/telegram:/downloads`。容器内的 `/data`、`/downloads` 和 PostgreSQL 目标路径不要改。
 
-将项目目录上传或通过 Git 克隆到 NAS。创建 Stack 时选择仓库内的 `compose.yaml`，并在图形界面填写与 `.env.example` 相同的变量。
-
-Compose 默认使用相对挂载：`./data`、`./postgres`、`./downloads`。如果 NAS 不允许相对路径，请在 `compose.yaml` 中改为绝对宿主机路径，例如：
-
-```yaml
-volumes:
-  - /volume1/docker/tdl/data:/data
-  - /volume1/docker/tdl/postgres:/var/lib/postgresql/data
-  - /volume1/downloads/telegram:/downloads
-```
-
-容器内目标路径不要修改；确保 Docker 对这些宿主机目录有读写权限。
+不要执行 `docker compose down -v`，也不要删除 `data/`、`postgres/` 或 `downloads/`，除非你明确希望丢弃对应数据。
 
 ## 方式二：Docker 命令
 
