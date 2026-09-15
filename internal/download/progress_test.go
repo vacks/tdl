@@ -54,3 +54,35 @@ func TestProgressStoreRestartsMeasurementWhenBytesReset(t *testing.T) {
 		t.Fatalf("reset progress = %#v, want 10 bytes and no inherited speed", progress)
 	}
 }
+
+func TestProgressStoreUsesTaskWideRateAndDropsFinishedFiles(t *testing.T) {
+	store := newProgressStore()
+	first := Item{DialogKey: "channel:42", MessageID: 7}
+	second := Item{DialogKey: "channel:42", MessageID: 8}
+	store.Update("chat-a", first, upstreamDL.ProgressUpdate{MessageID: 7, Downloaded: 100, Total: 100})
+
+	// Advance the shared sample window without sleeping. The second small file
+	// completes in its first callback, which previously had no per-file rate at
+	// all; the task-wide meter must still account for both files.
+	store.mu.Lock()
+	job := store.jobs["chat-a"]
+	job.lastSampleAt = time.Now().Add(-2 * time.Second)
+	store.jobs["chat-a"] = job
+	store.mu.Unlock()
+	store.Update("chat-a", second, upstreamDL.ProgressUpdate{MessageID: 8, Downloaded: 100, Total: 100, Completed: true})
+
+	files, speed := store.Aggregate("chat-a")
+	if files != 2 || speed <= 0 {
+		t.Fatalf("aggregate files=%d speed=%f, want two live files and positive task rate", files, speed)
+	}
+	store.ClearItem("chat-a", first)
+	files, afterClear := store.Aggregate("chat-a")
+	if files != 1 || afterClear != speed {
+		t.Fatalf("after ClearItem files=%d speed=%f, want one live file and retained task sample=%f", files, afterClear, speed)
+	}
+	store.ClearJob("chat-a")
+	files, speed = store.Aggregate("chat-a")
+	if files != 0 || speed != 0 {
+		t.Fatalf("after ClearJob files=%d speed=%f, want zeroes", files, speed)
+	}
+}

@@ -132,32 +132,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/downloads/", s.requireAuth(s.downloadControlAPI))
 	s.mux.HandleFunc("/api/chat-downloads", s.requireAuth(s.chatDownloadsAPI))
 	s.mux.HandleFunc("/api/chat-downloads/", s.requireAuth(s.chatDownloadControlAPI))
-	s.mux.HandleFunc("/api/maintenance/cleanup", s.requireAuth(s.cleanupHistory))
 	s.mux.HandleFunc("/", s.app)
-}
-
-func (s *Server) cleanupHistory(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	var input struct {
-		RetentionDays int `json:"retentionDays"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式无效"})
-		return
-	}
-	if input.RetentionDays < 1 || input.RetentionDays > 3650 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "历史保留天数需在 1 至 3650 天之间"})
-		return
-	}
-	result, err := s.downloads.CleanupHistory(input.RetentionDays)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -361,8 +336,13 @@ func (s *Server) downloadsAPI(w http.ResponseWriter, r *http.Request) {
 		if pageSize < 1 {
 			pageSize = 10
 		}
+		status, err := download.NormalizeTaskStatusFilter(r.URL.Query().Get("status"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		revision := s.downloads.Revision()
-		jobs, total, nextCursor, err := s.downloads.ListCursor(r.URL.Query().Get("cursor"), pageSize)
+		jobs, total, nextCursor, err := s.downloads.ListCursor(r.URL.Query().Get("cursor"), pageSize, status)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -438,6 +418,12 @@ func (s *Server) chatDownloadControlAPI(w http.ResponseWriter, r *http.Request) 
 	}
 	var err error
 	switch parts[1] {
+	case "purge":
+		if r.Method != http.MethodDelete {
+			methodNotAllowed(w, http.MethodDelete)
+			return
+		}
+		err = s.downloads.PurgeChat(parts[0])
 	case "delete":
 		if r.Method != http.MethodDelete {
 			methodNotAllowed(w, http.MethodDelete)
@@ -468,6 +454,19 @@ func (s *Server) chatDownloadControlAPI(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		err = s.downloads.CancelChat(parts[0])
+	case "listen":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		var input struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&input); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式无效"})
+			return
+		}
+		err = s.downloads.SetChatListening(parts[0], input.Enabled)
 	default:
 		http.NotFound(w, r)
 		return

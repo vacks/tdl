@@ -14,9 +14,14 @@ COPY go.mod go.sum go.work ./
 COPY scripts/prepare-upstream-progress.sh ./scripts/prepare-upstream-progress.sh
 COPY patches/tdl-progress-0.20.4.patch ./patches/tdl-progress-0.20.4.patch
 COPY patches/tdl-runtime-options-0.20.4.patch ./patches/tdl-runtime-options-0.20.4.patch
+COPY patches/tdl-cancel-0.20.4.patch ./patches/tdl-cancel-0.20.4.patch
 RUN sh ./scripts/prepare-upstream-progress.sh && go mod download
-COPY . ./
-RUN go test ./...
+# Keep the Go test layer independent from Web source changes. The static Web
+# bundle is embedded only for the final binary build below.
+COPY cmd ./cmd
+COPY internal ./internal
+ARG RUN_TESTS=1
+RUN if [ "$RUN_TESTS" = "1" ]; then go test ./...; fi
 COPY --from=frontend /src/web/dist ./internal/httpapi/static
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tdl ./cmd/tdl
 

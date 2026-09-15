@@ -54,10 +54,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account
 			return false, err
 		}
 		if changed == 0 {
-			// A second application of the same emoji is a fresh user action only
-			// when its previous task was cancelled. Do not revive completed jobs
-			// because Telegram redelivered an ordinary message update.
-			result, err = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND status = 'done' AND job_id IN (SELECT id FROM download_jobs WHERE status = 'cancelled')`, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
+			// A second application of the same emoji is a fresh user action when
+			// its earlier task was cancelled or deleted. Completed jobs remain
+			// idempotent so an ordinary redelivered Telegram update cannot revive
+			// them.
+			result, err = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND status = 'done' AND job_id IN (SELECT id FROM download_jobs WHERE status IN ('cancelled', 'deleted'))`, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
 			if err != nil {
 				return false, err
 			}

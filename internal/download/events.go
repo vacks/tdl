@@ -64,18 +64,13 @@ func (m *Manager) SubscribeEvents() (<-chan Event, func()) { return m.events.Sub
 func (m *Manager) emit(jobID, requestID, kind, status string) {
 	now := time.Now().UTC()
 	event := Event{JobID: jobID, RequestID: requestID, Kind: kind, Status: status, CreatedAt: now}
-	result, err := m.db.Exec(`INSERT INTO download_events(job_id, request_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?)`, jobID, requestID, kind, status, now.Format(time.RFC3339Nano))
+	_, err := m.db.Exec(`INSERT INTO download_events(job_id, request_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?)`, jobID, requestID, kind, status, now.Format(time.RFC3339Nano))
 	if err != nil {
 		// Delivery adapters need the state wake-up even if the historical audit
 		// row cannot be written. Canonical state remains in the task tables.
 		applog.Error("download", "event_record_failed", "job_id", jobID, "kind", kind, "error", err.Error())
 		m.events.publish(event)
 		return
-	}
-	// PostgreSQL's database/sql driver does not expose LastInsertId. Event IDs
-	// are audit-only for live delivery, so leave the in-memory ID at zero there.
-	if !m.db.isPostgres() {
-		event.ID, _ = result.LastInsertId()
 	}
 	m.events.publish(event)
 }

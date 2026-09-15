@@ -3,25 +3,43 @@ package download
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
 )
 
-// database centralizes SQL binding and connection lifecycle. Production uses
-// PostgreSQL; the SQLite branch exists only for isolated unit tests and is not
-// selected by application configuration.
+const databaseOperationTimeout = 30 * time.Second
+
+// database centralizes PostgreSQL SQL binding and connection lifecycle.
 type database struct {
-	db       *sql.DB
-	postgres bool
+	db *sql.DB
 }
 
 type databaseTx struct {
-	tx       *sql.Tx
-	postgres bool
+	tx *sql.Tx
+}
+
+type databaseRows struct {
+	*sql.Rows
+	cancel context.CancelFunc
+}
+
+func (r *databaseRows) Close() error {
+	r.cancel()
+	return r.Rows.Close()
+}
+
+type databaseRow struct {
+	row    *sql.Row
+	cancel context.CancelFunc
+}
+
+func (r *databaseRow) Scan(dest ...any) error {
+	defer r.cancel()
+	return r.row.Scan(dest...)
 }
 
 func openPostgresDatabase(ctx context.Context, url string) (*database, error) {
@@ -39,69 +57,84 @@ func openPostgresDatabase(ctx context.Context, url string) (*database, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &database{db: db, postgres: true}, nil
+	return &database{db: db}, nil
 }
 
-// openDatabase only accepts PostgreSQL in application configuration. The
-// SQLite branch is deliberately limited to Go unit fixtures.
+// openDatabase accepts PostgreSQL only. Keeping one SQL dialect eliminates
+// divergent production behaviour and makes all schema guarantees testable.
 func openDatabase(ctx context.Context, url string) (*database, error) {
-	if strings.HasPrefix(url, "sqlite://") {
-		db, err := sql.Open("sqlite", strings.TrimPrefix(url, "sqlite://"))
-		if err != nil {
-			return nil, err
-		}
-		return newSQLiteDatabase(db), nil
+	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
+		return nil, fmt.Errorf("TDL_DATABASE_URL 必须是 PostgreSQL 连接串")
 	}
 	return openPostgresDatabase(ctx, url)
 }
-
-func newSQLiteDatabase(db *sql.DB) *database { return &database{db: db} }
 
 func (d *database) Close() error { return d.db.Close() }
 
 func (d *database) PingContext(ctx context.Context) error { return d.db.PingContext(ctx) }
 
 func (d *database) Exec(query string, args ...any) (sql.Result, error) {
-	return d.db.Exec(d.bind(query), args...)
+	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	defer cancel()
+	return d.db.ExecContext(ctx, d.bind(query), args...)
 }
 
-func (d *database) Query(query string, args ...any) (*sql.Rows, error) {
-	return d.db.Query(d.bind(query), args...)
+func (d *database) Query(query string, args ...any) (*databaseRows, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	rows, err := d.db.QueryContext(ctx, d.bind(query), args...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &databaseRows{Rows: rows, cancel: cancel}, nil
 }
 
-func (d *database) QueryRow(query string, args ...any) *sql.Row {
-	return d.db.QueryRow(d.bind(query), args...)
+func (d *database) QueryRow(query string, args ...any) *databaseRow {
+	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	return &databaseRow{row: d.db.QueryRowContext(ctx, d.bind(query), args...), cancel: cancel}
 }
 
 func (d *database) Begin() (*databaseTx, error) {
+	// Transactions can span a complete multi-file state transition. Their
+	// caller owns commit/rollback, so the generic point-operation timeout must
+	// not cancel a valid transaction immediately after it is opened.
 	tx, err := d.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	return &databaseTx{tx: tx, postgres: d.postgres}, nil
+	return &databaseTx{tx: tx}, nil
 }
 
 func (tx *databaseTx) Exec(query string, args ...any) (sql.Result, error) {
-	return tx.tx.Exec(bindSQL(query, tx.postgres), args...)
+	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	defer cancel()
+	return tx.tx.ExecContext(ctx, bindSQL(query), args...)
 }
 
-func (tx *databaseTx) Query(query string, args ...any) (*sql.Rows, error) {
-	return tx.tx.Query(bindSQL(query, tx.postgres), args...)
+func (tx *databaseTx) Query(query string, args ...any) (*databaseRows, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	rows, err := tx.tx.QueryContext(ctx, bindSQL(query), args...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &databaseRows{Rows: rows, cancel: cancel}, nil
 }
 
-func (tx *databaseTx) QueryRow(query string, args ...any) *sql.Row {
-	return tx.tx.QueryRow(bindSQL(query, tx.postgres), args...)
+func (tx *databaseTx) QueryRow(query string, args ...any) *databaseRow {
+	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
+	return &databaseRow{row: tx.tx.QueryRowContext(ctx, bindSQL(query), args...), cancel: cancel}
 }
 
 func (tx *databaseTx) Commit() error   { return tx.tx.Commit() }
 func (tx *databaseTx) Rollback() error { return tx.tx.Rollback() }
 
-func (d *database) bind(query string) string { return bindSQL(query, d.postgres) }
+func (d *database) bind(query string) string { return bindSQL(query) }
 
 // bindSQL converts question-mark placeholders at the database boundary. SQL
 // literals are preserved, so user-facing messages may safely contain '?'.
-func bindSQL(query string, postgres bool) string {
-	if !postgres || !strings.Contains(query, "?") {
+func bindSQL(query string) string {
+	if !strings.Contains(query, "?") {
 		return query
 	}
 	var out strings.Builder
@@ -131,4 +164,10 @@ func bindSQL(query string, postgres bool) string {
 	return out.String()
 }
 
-func (d *database) isPostgres() bool { return d != nil && d.postgres }
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "unique constraint") || strings.Contains(text, "duplicate key")
+}

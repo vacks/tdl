@@ -3,9 +3,9 @@ services:
     image: postgres:17-alpine
     env_file: .env
     environment:
-      POSTGRES_DB: ${TDL_POSTGRES_DB:-tdl}
-      POSTGRES_USER: ${TDL_POSTGRES_USER:-tdl}
-      POSTGRES_PASSWORD: ${TDL_POSTGRES_PASSWORD:-tdl-change-me}
+      POSTGRES_DB: ${TDL_POSTGRES_DB:?set TDL_POSTGRES_DB in .env}
+      POSTGRES_USER: ${TDL_POSTGRES_USER:?set TDL_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${TDL_POSTGRES_PASSWORD:?set TDL_POSTGRES_PASSWORD in .env}
     volumes:
       - ./postgres:/var/lib/postgresql/data
     networks: [internal]
@@ -25,7 +25,7 @@ services:
       TDL_DATA_DIR: /data
       TDL_DOWNLOAD_DIR: /downloads
       TDL_LISTEN_ADDR: :8080
-      TDL_DATABASE_URL: ${TDL_DATABASE_URL:-postgres://tdl:tdl-change-me@postgres:5432/tdl?sslmode=disable}
+      TDL_DATABASE_URL: ${TDL_DATABASE_URL:?set TDL_DATABASE_URL in .env}
     volumes:
       - ./data:/data
       - ./downloads:/downloads

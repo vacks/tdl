@@ -29,6 +29,7 @@ function resetForm() {
 }
 
 async function changePassword() {
+  if (saving.value) return
   if (!currentPassword.value || !newPassword.value || !confirmation.value) {
     ElMessage.error('请填写全部密码字段')
     return
@@ -69,9 +70,9 @@ watch(() => route.fullPath, () => { void loadSession() }, { immediate: true })
 
   <el-dialog v-model="visible" title="修改管理员密码" width="400px" :close-on-click-modal="false" @closed="resetForm">
     <el-form label-position="top" @submit.prevent="changePassword">
-      <el-form-item label="当前密码"><el-input v-model="currentPassword" type="password" show-password autocomplete="current-password" @keyup.enter="changePassword" /></el-form-item>
-      <el-form-item label="新密码"><el-input v-model="newPassword" type="password" show-password autocomplete="new-password" @keyup.enter="changePassword" /></el-form-item>
-      <el-form-item label="确认新密码"><el-input v-model="confirmation" type="password" show-password autocomplete="new-password" @keyup.enter="changePassword" /></el-form-item>
+      <el-form-item label="当前密码"><el-input v-model="currentPassword" type="password" show-password autocomplete="current-password" /></el-form-item>
+      <el-form-item label="新密码"><el-input v-model="newPassword" type="password" show-password autocomplete="new-password" /></el-form-item>
+      <el-form-item label="确认新密码"><el-input v-model="confirmation" type="password" show-password autocomplete="new-password" /></el-form-item>
     </el-form>
     <template #footer><el-button @click="visible = false">取消</el-button><el-button type="primary" :loading="saving" @click="changePassword">确认修改</el-button></template>
   </el-dialog>

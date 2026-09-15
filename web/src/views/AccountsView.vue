@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { APIError, api } from '@/api'
+import { projectVersion } from '@/buildInfo'
 
 type Account = {
   id: string; telegramId?: number; firstName?: string; lastName?: string; username?: string
@@ -108,10 +109,10 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
 
 <template>
   <el-container class="shell">
-    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/accounts" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>v0.1.0</b></span></div></el-aside>
+    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/accounts" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>{{ projectVersion }}</b></span></div></el-aside>
     <el-container><el-header><span>登录管理</span><el-button text @click="logout">退出管理台</el-button></el-header>
       <el-main class="accounts-page">
-        <section class="page-heading"><div><p class="eyebrow">ACCOUNT MANAGEMENT</p><h1>Telegram 登录管理</h1><p class="subtle">每个账户独立保存会话，可随时切换当前用于下载和 Bot 功能的账户。</p></div><el-button type="primary" :loading="loading" @click="startLogin">添加 Telegram 账户</el-button></section>
+        <section class="page-heading"><div><p class="eyebrow">ACCOUNT MANAGEMENT</p><h1>Telegram 登录管理</h1><p class="subtle">每个账户独立保存会话；切换当前账户会影响后续从 Web 或 Bot 链接新建的下载任务。</p></div><el-button type="primary" :loading="loading" @click="startLogin">添加 Telegram 账户</el-button></section>
         <el-alert title="请用已登录的 Telegram 手机客户端扫描二维码。" type="info" show-icon :closable="false" />
         <el-empty v-if="!accounts.length" description="还没有 Telegram 账户，点击右上角添加。" />
         <section v-else class="account-list"><el-card v-for="account in accounts" :key="account.id" shadow="never" class="account-card"><div class="account-row"><div><strong>{{ displayName(account) }}</strong><p v-if="account.username" class="subtle">@{{ account.username }}</p><p v-if="account.telegramId" class="subtle">ID: {{ account.telegramId }}</p><p v-if="account.checkedAt" class="subtle">会话最近检查：{{ account.checkedAt }}</p><p v-if="account.error" class="account-error">{{ account.error }}</p></div><div class="account-actions"><el-tag :type="stateType(account.state) as any">{{ stateText(account.state) }}</el-tag><el-tag v-if="currentId === account.id" type="primary">当前账户</el-tag><el-button v-if="account.state === 'expired'" type="primary" plain @click="renewAccount(account)">重新登录</el-button><el-button v-else-if="account.state !== 'authorized' && account.state !== 'stopped'" text type="primary" @click="loginAccountId = account.id">继续登录</el-button><el-button v-if="account.state === 'authorized' && currentId !== account.id" type="primary" plain @click="selectAccount(account.id)">切换为当前账户</el-button><el-button type="danger" text @click="removeAccount(account)">移除</el-button></div></div></el-card></section>

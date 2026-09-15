@@ -14,36 +14,39 @@ import (
 
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	upstreamDL "github.com/iyear/tdl/app/dl"
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tmedia"
+	"github.com/iyear/tdl/pkg/tmessage"
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
 
-// ChatJob is a long-lived parent task for one channel or group. Its children
-// are ordinary download jobs, intentionally hidden from the message task UI.
-// This keeps the existing per-file download engine reusable while making the
-// chat lifecycle and its media index independently manageable.
+// ChatJob is the single durable task for one channel or group. Its media index
+// is an implementation detail, not a collection of child download tasks.
 type ChatJob struct {
-	ID             string `json:"id"`
-	SourceURL      string `json:"sourceUrl"`
-	DialogType     string `json:"dialogType"`
-	DialogKey      string `json:"dialogKey"`
-	DialogID       int64  `json:"dialogId"`
-	DialogName     string `json:"dialogName"`
-	AccountID      string `json:"accountId"`
-	StartMessageID int    `json:"startMessageId"`
-	UpperMessageID int    `json:"upperMessageId"`
-	ListenNew      bool   `json:"listenNew"`
-	Status         string `json:"status"`
-	ScanState      string `json:"scanState"`
-	Error          string `json:"error,omitempty"`
-	CreatedAt      string `json:"createdAt"`
-	UpdatedAt      string `json:"updatedAt"`
-	Discovered     int    `json:"discovered"`
-	Completed      int    `json:"completed"`
-	Failed         int    `json:"failed"`
+	ID              string  `json:"id"`
+	SourceURL       string  `json:"sourceUrl"`
+	DialogType      string  `json:"dialogType"`
+	DialogKey       string  `json:"dialogKey"`
+	DialogID        int64   `json:"dialogId"`
+	DialogName      string  `json:"dialogName"`
+	AccountID       string  `json:"accountId"`
+	StartMessageID  int     `json:"startMessageId"`
+	UpperMessageID  int     `json:"upperMessageId"`
+	ListenNew       bool    `json:"listenNew"`
+	Status          string  `json:"status"`
+	ScanState       string  `json:"scanState"`
+	Error           string  `json:"error,omitempty"`
+	CreatedAt       string  `json:"createdAt"`
+	UpdatedAt       string  `json:"updatedAt"`
+	Discovered      int     `json:"discovered"`
+	Completed       int     `json:"completed"`
+	Failed          int     `json:"failed"`
+	EarliestMediaID int     `json:"earliestMediaId"`
+	ActiveFiles     int     `json:"activeFiles"`
+	SpeedBPS        float64 `json:"speedBps"`
 }
 
 const (
@@ -63,6 +66,7 @@ const (
 	chatScanPending   = "pending"
 	chatScanIndexing  = "indexing"
 	chatScanCompleted = "completed"
+	chatBatchSize     = 64
 )
 
 // Telegram exposes the media gallery as separate server-side filters. These
@@ -101,6 +105,9 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, start_message_id, upper_message_id, listen_new, status, scan_state, error, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`, job.ID, job.SourceURL, job.DialogType, job.DialogKey, job.DialogID, job.DialogName, job.AccountID, direct.kind, direct.id, direct.hash, job.StartMessageID, job.UpperMessageID, boolInt(job.ListenNew), job.Status, job.ScanState, configJSON, now, now); err != nil {
+		if isUniqueConstraintError(err) {
+			return ChatJob{}, errors.New("该会话下载任务已存在，请在会话下载列表中管理")
+		}
 		return ChatJob{}, err
 	}
 	for _, kind := range chatStreamKinds {
@@ -111,6 +118,7 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 	if err := tx.Commit(); err != nil {
 		return ChatJob{}, err
 	}
+	m.visibleChats.Add(1)
 	m.touch()
 	return job, nil
 }
@@ -128,9 +136,9 @@ func (m *Manager) GetChat(id string) (ChatJob, error) {
 	var job ChatJob
 	var listen int
 	err := m.db.QueryRow(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
- COUNT(i.message_id), COALESCE(SUM(CASE WHEN d.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN d.status IN ('failed', 'partial') THEN 1 ELSE 0 END), 0)
- FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id LEFT JOIN download_items d ON d.dialog_key = i.dialog_key AND d.message_id = i.message_id
- WHERE c.id = ? GROUP BY c.id`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed)
+ COUNT(i.message_id), COALESCE(SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END), 0), COALESCE(MIN(i.message_id), 0)
+ FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id
+	WHERE c.id = ? GROUP BY c.id`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed, &job.EarliestMediaID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ChatJob{}, errors.New("会话下载任务不存在")
 	}
@@ -138,6 +146,7 @@ func (m *Manager) GetChat(id string) (ChatJob, error) {
 		return ChatJob{}, err
 	}
 	job.ListenNew = listen != 0
+	job.ActiveFiles, job.SpeedBPS = m.progress.Aggregate(job.ID)
 	return job, nil
 }
 
@@ -147,10 +156,7 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 10
 	}
-	var total int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM chat_download_jobs WHERE status != ?`, ChatStatusDeleted).Scan(&total); err != nil {
-		return nil, 0, "", err
-	}
+	total := m.visibleChatCount()
 	where, args := "WHERE c.status != ?", []any{ChatStatusDeleted, pageSize + 1}
 	if cursor != "" {
 		createdAt, id, err := decodeChatCursor(cursor)
@@ -161,8 +167,8 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 		args = []any{ChatStatusDeleted, createdAt, createdAt, id, pageSize + 1}
 	}
 	rows, err := m.db.Query(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
- COUNT(i.message_id), COALESCE(SUM(CASE WHEN d.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN d.status IN ('failed', 'partial') THEN 1 ELSE 0 END), 0)
- FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id LEFT JOIN download_items d ON d.dialog_key = i.dialog_key AND d.message_id = i.message_id `+where+`
+ COUNT(i.message_id), COALESCE(SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END), 0), COALESCE(MIN(i.message_id), 0)
+ FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id `+where+`
  GROUP BY c.id ORDER BY c.created_at DESC, c.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, 0, "", err
@@ -172,10 +178,11 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 	for rows.Next() {
 		var job ChatJob
 		var listen int
-		if err := rows.Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed); err != nil {
+		if err := rows.Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed, &job.EarliestMediaID); err != nil {
 			return nil, 0, "", err
 		}
 		job.ListenNew = listen != 0
+		job.ActiveFiles, job.SpeedBPS = m.progress.Aggregate(job.ID)
 		jobs = append(jobs, job)
 	}
 	if err := rows.Err(); err != nil {
@@ -248,6 +255,39 @@ type chatListener struct {
 	proxy  string
 }
 
+func (m *Manager) beginChatExecution(id string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.mu.Lock()
+	m.chatCancelSeq++
+	key := m.chatCancelSeq
+	if m.chatCancels[id] == nil {
+		m.chatCancels[id] = make(map[uint64]context.CancelFunc)
+	}
+	m.chatCancels[id][key] = cancel
+	m.mu.Unlock()
+	return ctx, func() {
+		cancel()
+		m.mu.Lock()
+		delete(m.chatCancels[id], key)
+		if len(m.chatCancels[id]) == 0 {
+			delete(m.chatCancels, id)
+		}
+		m.mu.Unlock()
+	}
+}
+
+func (m *Manager) cancelChatExecutions(id string) {
+	m.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.chatCancels[id]))
+	for _, cancel := range m.chatCancels[id] {
+		cancels = append(cancels, cancel)
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 func (m *Manager) chatTarget(id string) (storedChatTarget, error) {
 	var target storedChatTarget
 	var listen int
@@ -280,9 +320,8 @@ func (target storedChatTarget) inputPeer() tg.InputPeerClass {
 	}
 }
 
-// registerChatMedia atomically relates every discovered media message to its
-// chat task. Existing standalone downloads are attached as satisfied records;
-// only genuinely new messages are handed to the normal downloader in batches.
+// registerChatMedia stores each discovered media directly in this task's
+// durable index. It intentionally never creates a download_jobs child.
 func (m *Manager) registerChatMedia(chatID string, candidates []source, startTransfers bool) error {
 	if len(candidates) == 0 {
 		return nil
@@ -304,7 +343,6 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 	if len(candidates) == 0 {
 		return nil
 	}
-	newSources := make([]source, 0, len(candidates))
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := m.db.Begin()
 	if err != nil {
@@ -312,39 +350,64 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 	}
 	defer tx.Rollback()
 	for _, item := range candidates {
-		var existingJob string
-		err := tx.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&existingJob)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
+		var existingStatus, finalPath, ownerKind, ownerID string
+		err := tx.QueryRow(`SELECT status, final_path, owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&existingStatus, &finalPath, &ownerKind, &ownerID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// An absent global claim is the normal first-seen case. The
+			// following branch either adopts an existing message task or creates
+			// a new chat claim, so the original ErrNoRows must not escape this
+			// loop as a fatal indexing error.
+			err = nil
+			// Ordinary message tasks predate the global claim table while they
+			// are running. Treat one as an owner until it reaches a terminal
+			// state; otherwise a newly indexed chat would download it again.
+			var messageStatus, messagePath string
+			messageErr := tx.QueryRow(`SELECT status, final_path FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&messageStatus, &messagePath)
+			if messageErr == nil {
+				if messageStatus == "completed" && messagePath != "" && regularFileExists(messagePath) {
+					if _, err = tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'message', '', ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, item.DialogKey, item.MessageID, messagePath, now); err != nil {
+						return err
+					}
+					existingStatus, finalPath = "completed", messagePath
+				} else {
+					existingStatus, ownerKind, ownerID = "claimed", "message", ""
+				}
+			} else if !errors.Is(messageErr, sql.ErrNoRows) {
+				return messageErr
+			}
 		}
-		result, err := tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, child_job_id, dialog_type, dialog_id, grouped_id, message_text, original_name, size, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, existingJob, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginalName, item.Size, now)
 		if err != nil {
 			return err
 		}
-		inserted, _ := result.RowsAffected()
-		if existingJob == "" && startTransfers && inserted != 0 {
-			newSources = append(newSources, item)
+		if existingStatus == "" {
+			result, claimErr := tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, item.DialogKey, item.MessageID, chatID, now)
+			if claimErr != nil {
+				return claimErr
+			}
+			claimed, _ := result.RowsAffected()
+			if claimed == 1 {
+				existingStatus, ownerKind, ownerID = "claimed", "chat", chatID
+			} else if err = tx.QueryRow(`SELECT status, final_path, owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&existingStatus, &finalPath, &ownerKind, &ownerID); err != nil {
+				return err
+			}
+		}
+		status := "queued"
+		if existingStatus == "completed" && finalPath != "" && regularFileExists(finalPath) {
+			status = "completed"
+		}
+		if existingStatus == "claimed" && (ownerKind != "chat" || ownerID != chatID) {
+			status = "waiting"
+		}
+		_, err = tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, grouped_id, message_text, original_name, size, final_path, status, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginalName, item.Size, finalPath, status, now)
+		if err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if len(newSources) == 0 {
-		m.touch()
-		return nil
-	}
-	if target.inputPeer() == nil {
-		return errors.New("会话下载任务缺少 Telegram 会话引用")
-	}
-	// Bound batches keep upstream's iterator and resume metadata small while
-	// avoiding one visible task per media file. Grouped albums are collapsed by
-	// the scanner before reaching this point.
-	for _, batch := range chatSourceBatches(newSources, 64) {
-		if err := m.enqueueChatBatch(target, chatID, batch); err != nil {
-			return err
-		}
-	}
 	m.touch()
+	m.signalChat()
 	return nil
 }
 
@@ -363,6 +426,7 @@ func (m *Manager) chatWorker() {
 		if err := m.scanOneChat(); err != nil {
 			applog.Error("chat_download", "media_index_failed", "error", err.Error())
 		}
+		m.reconcileChatClaims()
 		m.refreshChatStates()
 		m.reconcileChatListeners()
 		select {
@@ -370,6 +434,378 @@ func (m *Manager) chatWorker() {
 		case <-time.After(3 * time.Second):
 		}
 	}
+}
+
+func (m *Manager) chatDownloadWorker() {
+	for {
+		if m.DatabaseAvailable() {
+			if err := m.runOneChatBatch(); err != nil {
+				applog.Error("chat_download", "media_transfer_failed", "error", err.Error())
+			}
+		}
+		select {
+		case <-m.chatWake:
+		case <-time.After(750 * time.Millisecond):
+		}
+	}
+}
+
+// reconcileChatClaims wakes media that was held by another active task. A
+// completed claim is adopted without another download; a released claim is
+// atomically acquired on the next pass.
+func (m *Manager) reconcileChatClaims() {
+	rows, err := m.db.Query(`SELECT i.chat_job_id, i.dialog_key, i.message_id, m.status, m.final_path FROM chat_download_items i LEFT JOIN downloaded_media m ON m.dialog_key = i.dialog_key AND m.message_id = i.message_id WHERE i.status = 'waiting' LIMIT 256`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var chatID, key, status, path string
+		var messageID int
+		if rows.Scan(&chatID, &key, &messageID, &status, &path) != nil {
+			continue
+		}
+		if status == "completed" && path != "" && regularFileExists(path) {
+			if result, err := m.db.Exec(`UPDATE chat_download_items SET status = 'completed', final_path = ?, error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, path, chatID, key, messageID); err == nil {
+				if changed, _ := result.RowsAffected(); changed == 1 {
+					m.touch()
+				}
+			}
+			continue
+		}
+		if status != "" {
+			continue
+		}
+		var messageStatus, messagePath string
+		messageErr := m.db.QueryRow(`SELECT status, final_path FROM download_items WHERE dialog_key = ? AND message_id = ?`, key, messageID).Scan(&messageStatus, &messagePath)
+		if messageErr == nil {
+			if messageStatus == "completed" && messagePath != "" && regularFileExists(messagePath) {
+				_, _ = m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'message', '', ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, key, messageID, messagePath, time.Now().UTC().Format(time.RFC3339Nano))
+				if result, err := m.db.Exec(`UPDATE chat_download_items SET status = 'completed', final_path = ?, error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, messagePath, chatID, key, messageID); err == nil {
+					if changed, _ := result.RowsAffected(); changed == 1 {
+						m.touch()
+					}
+				}
+			}
+			// A queued/running/paused regular task remains the owner. A terminal
+			// failure or cancellation releases the media to this chat task.
+			if messageStatus != "failed" && messageStatus != "cancelled" && messageStatus != "deleted" {
+				continue
+			}
+		}
+		if messageErr != nil && !errors.Is(messageErr, sql.ErrNoRows) {
+			continue
+		}
+		result, claimErr := m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, key, messageID, chatID, time.Now().UTC().Format(time.RFC3339Nano))
+		if claimErr == nil {
+			if changed, _ := result.RowsAffected(); changed == 1 {
+				if result, err := m.db.Exec(`UPDATE chat_download_items SET status = 'queued', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, chatID, key, messageID); err == nil {
+					if updated, _ := result.RowsAffected(); updated == 1 {
+						m.touch()
+						m.signalChat()
+					}
+				}
+			}
+		}
+	}
+}
+
+// claimChatMedia validates a queued media row immediately before transferring
+// it. Retried rows reacquire their claim; completed rows are adopted instead
+// of being downloaded a second time.
+func (m *Manager) claimChatMedia(chatID string, item source) (string, string, error) {
+	return m.claimMedia("chat", chatID, item)
+}
+
+// runOneChatBatch claims only a bounded slice of the media index. New media
+// is made eligible as soon as it is indexed; within that visible queue, newer
+// message IDs always take precedence. There is no per-media download task:
+// the chat job owns the context, temporary directory and all durable item
+// state.
+func (m *Manager) runOneChatBatch() error {
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE status IN ('scanning', 'downloading', 'listening') AND EXISTS (SELECT 1 FROM chat_download_items i WHERE i.chat_job_id = chat_download_jobs.id AND i.status = 'queued') ORDER BY created_at LIMIT 16`)
+	if err != nil {
+		return err
+	}
+	var id string
+	for rows.Next() {
+		var candidate string
+		if rows.Scan(&candidate) == nil {
+			m.mu.Lock()
+			_, busy := m.chatActive[candidate]
+			if !busy {
+				m.chatActive[candidate] = struct{}{}
+				id = candidate
+			}
+			m.mu.Unlock()
+			if id != "" {
+				break
+			}
+		}
+	}
+	_ = rows.Close()
+	if id == "" {
+		return nil
+	}
+	defer func() { m.mu.Lock(); delete(m.chatActive, id); m.mu.Unlock() }()
+	target, err := m.chatTarget(id)
+	if err != nil {
+		return err
+	}
+	if target.inputPeer() == nil {
+		return errors.New("会话下载任务缺少 Telegram 会话引用")
+	}
+	rows, err = m.db.Query(`SELECT dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size FROM chat_download_items WHERE chat_job_id = ? AND status = 'queued' ORDER BY message_id DESC LIMIT ?`, id, chatBatchSize)
+	if err != nil {
+		return err
+	}
+	batch := make([]source, 0, chatBatchSize)
+	for rows.Next() {
+		var item Item
+		if err := rows.Scan(&item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginalName, &item.Size); err != nil {
+			rows.Close()
+			return err
+		}
+		batch = append(batch, source{Item: item, DialogName: target.DialogName})
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	transfer := make([]source, 0, len(batch))
+	for _, item := range batch {
+		claim, path, err := m.claimChatMedia(id, item)
+		if err != nil {
+			return err
+		}
+		switch claim {
+		case "completed":
+			if err := m.setChatItem(id, item, "completed", path, ""); err != nil {
+				return err
+			}
+		case "waiting":
+			if _, err := m.db.Exec(`UPDATE chat_download_items SET status = 'waiting', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
+				return err
+			}
+		default:
+			transfer = append(transfer, item)
+		}
+	}
+	batch = transfer
+	if len(batch) == 0 {
+		return nil
+	}
+	for _, item := range batch {
+		if _, err := m.db.Exec(`UPDATE chat_download_items SET attempts = attempts + 1, error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
+			return err
+		}
+	}
+	ctx, release := m.beginChatExecution(id)
+	defer func() { release(); m.progress.ClearJob(id) }()
+	transferCtx, stopTransfer := context.WithCancel(ctx)
+	defer stopTransfer()
+	config := m.settings.Get()
+	if target.configJSON != "" {
+		if err := json.Unmarshal([]byte(target.configJSON), &config.Download); err != nil {
+			return fmt.Errorf("会话下载配置快照无效: %w", err)
+		}
+	}
+	byMessage := make(map[int]source, len(batch))
+	ids := make([]int, 0, len(batch))
+	groups := map[int64]struct{}{}
+	for _, item := range batch {
+		byMessage[item.MessageID] = item
+		if item.GroupedID != 0 {
+			if _, ok := groups[item.GroupedID]; ok {
+				continue
+			}
+			groups[item.GroupedID] = struct{}{}
+		}
+		ids = append(ids, item.MessageID)
+	}
+	tmpDir := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return err
+	}
+	watchdog := startTransferWatchdog(transferCtx, upstreamWatchPeriod, upstreamInitialTimeout, upstreamIdleTimeout, stopTransfer, func() bool {
+		status := m.chatStatus(id)
+		return status == ChatStatusScanning || status == ChatStatusDownloading || status == ChatStatusListening
+	}, func(timeout time.Duration) {
+		applog.Info("chat_download", "batch_no_progress_timeout", "chat_job_id", id, "item_count", len(batch), "timeout", timeout.String())
+	})
+	defer watchdog.Close()
+	err = m.accounts.Run(transferCtx, target.AccountID, func(runCtx context.Context, client *gotd.Client, kvd storage.Storage) error {
+		opts := upstreamDL.Options{Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: target.inputPeer(), Messages: ids}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
+			item, ok := byMessage[update.MessageID]
+			if !ok {
+				return
+			}
+			watchdog.Touch()
+			started, _ := m.progress.Update(id, item.Item, update)
+			if started {
+				_, _ = m.db.Exec(`UPDATE chat_download_items SET status='running', started_at=? WHERE chat_job_id=? AND dialog_key=? AND message_id=? AND status='queued'`, time.Now().UTC().Format(time.RFC3339Nano), id, item.DialogKey, item.MessageID)
+			}
+		}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
+			item, ok := byMessage[update.MessageID]
+			if !ok {
+				return
+			}
+			watchdog.Touch()
+			defer m.progress.ClearItem(id, item.Item)
+			_ = m.publishChatItem(id, update.Path, item, config)
+		}}
+		return upstreamDL.Run(runCtx, client, kvd, opts)
+	})
+	if watchdog.Stalled() && (m.chatStatus(id) == ChatStatusScanning || m.chatStatus(id) == ChatStatusDownloading || m.chatStatus(id) == ChatStatusListening) {
+		return m.requeueStalledChatBatch(id, batch)
+	}
+	if err != nil && m.chatStatus(id) != ChatStatusPaused && m.chatStatus(id) != ChatStatusCancelled {
+		for _, item := range batch {
+			// Another file in this upstream call can fail after this one has
+			// completed its final move. Never overwrite that completed state.
+			if state := m.chatItemStatus(id, item); state != "completed" && state != "downloaded" {
+				_ = m.setChatItem(id, item, "failed", "", err.Error())
+			}
+		}
+		return err
+	}
+	m.touch()
+	return nil
+}
+
+// requeueStalledChatBatch leaves completed rows untouched and gives the
+// remaining media back to the bounded chat queue. Its global claims are
+// released in the same transaction so another valid request may also adopt
+// them; this task will reclaim them on its next batch attempt.
+func (m *Manager) requeueStalledChatBatch(chatID string, batch []source) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, item := range batch {
+		if _, err := tx.Exec(`UPDATE chat_download_items
+SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'queued' END,
+    error = CASE WHEN attempts >= ? THEN '连续无进度，已停止自动重试' ELSE '下载长时间无进度，已自动重试' END,
+    elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END,
+    started_at = '', finished_at = CASE WHEN attempts >= ? AND finished_at = '' THEN ? ELSE finished_at END
+WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status IN ('queued', 'running')`, maxStalledAttempts, maxStalledAttempts, now, maxStalledAttempts, now, chatID, item.DialogKey, item.MessageID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, item.DialogKey, item.MessageID, chatID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.touch()
+	m.signalChat()
+	applog.Info("chat_download", "stalled_batch_requeued", "chat_job_id", chatID, "item_count", len(batch))
+	return nil
+}
+
+func (m *Manager) chatStatus(id string) string {
+	var status string
+	_ = m.db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = ?`, id).Scan(&status)
+	return status
+}
+
+func (m *Manager) chatItemStatus(chatID string, item source) string {
+	var status string
+	_ = m.db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ?`, chatID, item.DialogKey, item.MessageID).Scan(&status)
+	return status
+}
+
+func (m *Manager) setChatItem(chatID string, item source, status, path, message string) error {
+	finished := ""
+	if status == "completed" || status == "failed" || status == "cancelled" {
+		finished = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	_, err := m.db.Exec(`UPDATE chat_download_items SET status=?, final_path=?, error=?, finished_at=CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id=? AND dialog_key=? AND message_id=?`, status, path, message, finished, finished, chatID, item.DialogKey, item.MessageID)
+	if err != nil {
+		return err
+	}
+	if status == "failed" || status == "cancelled" {
+		_, err = m.db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, item.DialogKey, item.MessageID, chatID)
+		return err
+	}
+	if status != "completed" {
+		return nil
+	}
+	_, err = m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`, item.DialogKey, item.MessageID, path, chatID, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// reconcileChatPublishedItems closes the crash window after a final file move
+// but before the media index and global ownership record were committed.
+func (m *Manager) reconcileChatPublishedItems() error {
+	rows, err := m.db.Query(`SELECT chat_job_id, dialog_key, message_id, final_path FROM chat_download_items WHERE status = 'downloaded' AND final_path <> ''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type candidate struct {
+		chatID    string
+		dialogKey string
+		messageID int
+		path      string
+	}
+	items := make([]candidate, 0)
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.chatID, &item.dialogKey, &item.messageID, &item.path); err != nil {
+			return err
+		}
+		if regularFileExists(item.path) {
+			items = append(items, item)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, item := range items {
+		tx, err := m.db.Begin()
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`UPDATE chat_download_items SET status = 'completed', error = '', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'downloaded'`, now, item.chatID, item.dialogKey, item.messageID)
+		if err == nil {
+			_, err = tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`, item.dialogKey, item.messageID, item.path, item.chatID, now)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) publishChatItem(chatID, path string, item source, config settings.Values) error {
+	if status := m.chatStatus(chatID); status != ChatStatusScanning && status != ChatStatusDownloading && status != ChatStatusListening {
+		return nil
+	}
+	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
+	if err != nil {
+		return m.setChatItem(chatID, item, "failed", "", err.Error())
+	}
+	if _, err := os.Stat(finalPath); err == nil {
+		return m.setChatItem(chatID, item, "failed", "", "目标文件已存在，未覆盖")
+	}
+	if err := m.setChatItem(chatID, item, "downloaded", finalPath, ""); err != nil {
+		return err
+	}
+	if err := publishNoReplace(path, finalPath); err != nil {
+		return m.setChatItem(chatID, item, "failed", "", err.Error())
+	}
+	return m.setChatItem(chatID, item, "completed", finalPath, "")
 }
 
 func (m *Manager) reconcileChatListeners() {
@@ -441,7 +877,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) {
 		return
 	}
 	_, dialogKey, _ := dialogIdentity(event.InputPeer, event.AccountID)
-	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, event.AccountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status = ?`, event.AccountID, dialogKey, chatScanCompleted, ChatStatusListening)
 	if err != nil {
 		return
 	}
@@ -490,7 +926,9 @@ func (m *Manager) scanOneChat() error {
 	if err != nil {
 		return err
 	}
-	err = m.accounts.Run(context.Background(), target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+	ctx, release := m.beginChatExecution(id)
+	defer release()
+	err = m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
 		for _, kind := range chatStreamKinds {
 			if err := m.scanChatStream(ctx, client, target, kind); err != nil {
 				return err
@@ -512,146 +950,11 @@ func (m *Manager) scanOneChat() error {
 		// remaining indexed media after the parent has stopped accepting work.
 		return nil
 	}
-	if err := m.queueIndexedChatMedia(id); err != nil {
-		_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, ChatStatusFailed, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id)
-		m.touch()
-		return err
-	}
 	_, err = m.db.Exec(`UPDATE chat_download_jobs SET scan_state = ?, status = ?, error = '', updated_at = ? WHERE id = ? AND status = ?`, chatScanCompleted, ChatStatusDownloading, time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning)
 	if err == nil {
 		m.touch()
 	}
 	return err
-}
-
-// queueIndexedChatMedia runs only after both media-only search streams have
-// reached the frozen lower bound. Sorting by message ID makes a “from earliest”
-// task actually transfer media from oldest to newest, while the durable index
-// still allows an interrupted scan to resume safely.
-func (m *Manager) queueIndexedChatMedia(chatID string) error {
-	target, err := m.chatTarget(chatID)
-	if err != nil {
-		return err
-	}
-	rows, err := m.db.Query(`SELECT dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size FROM chat_download_items WHERE chat_job_id = ? AND child_job_id = '' ORDER BY message_id ASC`, chatID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	candidates := make([]source, 0)
-	for rows.Next() {
-		var item Item
-		if err := rows.Scan(&item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginalName, &item.Size); err != nil {
-			return err
-		}
-		if item.OriginalName == "" {
-			continue
-		}
-		candidates = append(candidates, source{Item: item, DialogName: target.DialogName})
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, batch := range chatSourceBatches(candidates, 64) {
-		if err := m.enqueueChatBatch(target, chatID, batch); err != nil {
-			return err
-		}
-	}
-	m.signal()
-	return nil
-}
-
-// chatSourceBatches keeps every Telegram album in exactly one upstream
-// invocation. The upstream downloader expands grouped media itself; splitting
-// an album across two 64-item batches would otherwise request it twice.
-func chatSourceBatches(items []source, limit int) [][]source {
-	if limit < 1 {
-		limit = 64
-	}
-	batches := make([][]source, 0, (len(items)+limit-1)/limit)
-	current := make([]source, 0, limit)
-	for index := 0; index < len(items); {
-		end := index + 1
-		if group := items[index].GroupedID; group != 0 {
-			for end < len(items) && items[end].GroupedID == group {
-				end++
-			}
-		}
-		group := items[index:end]
-		if len(current) > 0 && len(current)+len(group) > limit {
-			batches = append(batches, current)
-			current = make([]source, 0, limit)
-		}
-		current = append(current, group...)
-		index = end
-	}
-	if len(current) > 0 {
-		batches = append(batches, current)
-	}
-	return batches
-}
-
-// enqueueChatBatch never silently drops the non-conflicting members of a
-// batch when another entry point (Web, Bot or a reaction) wins one media
-// identity concurrently. A duplicate batch is reconciled and any still
-// unmapped media is retried individually, preserving global message de-dupe.
-func (m *Manager) enqueueChatBatch(target storedChatTarget, chatID string, batch []source) error {
-	if len(batch) == 0 {
-		return nil
-	}
-	intent := DownloadIntent{Source: SourceAPI, AccountID: target.AccountID, URL: fmt.Sprintf("tg://chat/%s/%d", chatID, batch[0].MessageID)}
-	submission, err := m.enqueueIntentParentSnapshot(intent, batch, target.direct, chatID, targetConfigJSON(target))
-	if err != nil {
-		return err
-	}
-	if submission.Created {
-		return m.linkChatItems(chatID, submission.Job.ID, batch)
-	}
-	remaining := make([]source, 0, len(batch))
-	for _, item := range batch {
-		var jobID string
-		err := m.db.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&jobID)
-		if err == nil && jobID != "" {
-			if err := m.linkChatItems(chatID, jobID, []source{item}); err != nil {
-				return err
-			}
-			continue
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		remaining = append(remaining, item)
-	}
-	for _, item := range remaining {
-		oneIntent := DownloadIntent{Source: SourceAPI, AccountID: target.AccountID, URL: fmt.Sprintf("tg://chat/%s/%d", chatID, item.MessageID)}
-		one, err := m.enqueueIntentParentSnapshot(oneIntent, []source{item}, target.direct, chatID, targetConfigJSON(target))
-		if err != nil {
-			return err
-		}
-		if one.Created {
-			if err := m.linkChatItems(chatID, one.Job.ID, []source{item}); err != nil {
-				return err
-			}
-			continue
-		}
-		var jobID string
-		if err := m.db.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&jobID); err != nil || jobID == "" {
-			return errors.New("并发去重后无法关联会话媒体")
-		}
-		if err := m.linkChatItems(chatID, jobID, []source{item}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (m *Manager) linkChatItems(chatID, childID string, items []source) error {
-	for _, item := range items {
-		if _, err := m.db.Exec(`UPDATE chat_download_items SET child_job_id = ? WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND child_job_id = ''`, childID, chatID, item.DialogKey, item.MessageID); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // scanChatStream uses messages.search with a media-only filter. OffsetID is
@@ -684,7 +987,7 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 		}
 		result, err := client.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{Peer: target.inputPeer(), Q: "", Filter: filter, OffsetID: offset, Limit: 100, MinID: minID, MaxID: target.UpperMessageID + 1})
 		if err != nil {
-			return fmt.Errorf("搜索%s媒体: %w", label, err)
+			return fmt.Errorf("搜索%s文件: %w", label, err)
 		}
 		messages := searchMessages(result)
 		if len(messages) == 0 {
@@ -712,7 +1015,7 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 			return err
 		}
 		if nextOffset == 0 || nextOffset == offset {
-			return errors.New("Telegram 媒体搜索未推进分页游标")
+			return errors.New("Telegram 文件搜索未推进分页游标")
 		}
 		offset = nextOffset
 		if _, err := m.db.Exec(`UPDATE chat_download_streams SET offset_message_id = ? WHERE chat_job_id = ? AND stream_kind = ?`, offset, target.ID, kind); err != nil {
@@ -733,7 +1036,7 @@ func chatStreamFilter(kind string) (tg.MessagesFilterClass, string, error) {
 	case "round_voice":
 		return &tg.InputMessagesFilterRoundVoice{}, "语音和圆形视频", nil
 	default:
-		return nil, "", fmt.Errorf("未知会话媒体筛选器: %s", kind)
+		return nil, "", fmt.Errorf("未知会话文件筛选器: %s", kind)
 	}
 }
 
@@ -765,12 +1068,12 @@ func (m *Manager) refreshChatStates() {
 		if scan != chatScanCompleted {
 			continue
 		}
-		var active, failed int
-		if err := m.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN d.status IN ('queued', 'running', 'paused') THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN d.status IN ('failed', 'partial', 'cancelled') THEN 1 ELSE 0 END), 0) FROM chat_download_items i LEFT JOIN download_items d ON d.dialog_key = i.dialog_key AND d.message_id = i.message_id WHERE i.chat_job_id = ?`, id).Scan(&active, &failed); err != nil {
+		var active, failed, pending int
+		if err := m.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'downloaded') THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) FROM chat_download_items WHERE chat_job_id = ?`, id).Scan(&active, &failed, &pending); err != nil {
 			continue
 		}
 		next := ChatStatusCompleted
-		if active > 0 {
+		if active > 0 || pending > 0 {
 			next = ChatStatusDownloading
 		} else if listen != 0 {
 			next = ChatStatusListening
@@ -781,13 +1084,21 @@ func (m *Manager) refreshChatStates() {
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id)
 			m.touch()
 		}
+		if next == ChatStatusListening && failed > 0 {
+			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("历史下载有 %d 个文件失败，可重新开始失败项", failed), id)
+		}
+		if pending > 0 {
+			m.signalChat()
+		}
 	}
 }
 
-// PauseChat and the other parent controls always operate on the child jobs as
-// well. A parent record is never merely a cosmetic wrapper: once paused or
-// cancelled it prevents both further indexing and any queued media transfer.
+// PauseChat stops both indexing and active transfers for this one visible
+// task. Its global claims remain reserved while it is merely paused.
 func (m *Manager) PauseChat(id string) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	target, err := m.chatTarget(id)
 	if err != nil {
 		return err
@@ -795,22 +1106,21 @@ func (m *Manager) PauseChat(id string) error {
 	if target.Status != ChatStatusQueued && target.Status != ChatStatusScanning && target.Status != ChatStatusDownloading && target.Status != ChatStatusListening {
 		return errors.New("当前会话任务不能暂停")
 	}
-	if err := m.updateChatStatus(id, target.Status, ChatStatusPaused, ""); err != nil {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// The parent and media index transition together. The scanner and listener
+	// observe the durable parent state, while a failed media update rolls the
+	// whole operation back instead of leaving a half-paused task.
+	if err := m.transitionChatItems(id, target.Status, ChatStatusPaused, "", `UPDATE chat_download_items SET status = 'paused', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END, started_at = '' WHERE chat_job_id = ? AND status IN ('queued','running','downloaded')`, nil, now, id); err != nil {
 		return err
 	}
-	if err := m.applyChatChildren(id, "暂停", func(child string) error {
-		if status := m.status(child); status == "queued" || status == "running" {
-			return m.Pause(child)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	m.touch()
+	m.cancelChatExecutions(id)
 	return nil
 }
 
 func (m *Manager) ResumeChat(id string) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	target, err := m.chatTarget(id)
 	if err != nil {
 		return err
@@ -822,24 +1132,18 @@ func (m *Manager) ResumeChat(id string) error {
 	if target.ScanState == chatScanCompleted {
 		next = ChatStatusDownloading
 	}
-	if err := m.updateChatStatus(id, ChatStatusPaused, next, ""); err != nil {
+	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND status = 'paused'`, nil, id); err != nil {
 		return err
 	}
-	if err := m.applyChatChildren(id, "恢复", func(child string) error {
-		if m.status(child) == "paused" {
-			return m.Resume(child)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	m.touch()
 	m.signalChat()
 	m.signal()
 	return nil
 }
 
 func (m *Manager) RetryChat(id string) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	target, err := m.chatTarget(id)
 	if err != nil {
 		return err
@@ -851,24 +1155,18 @@ func (m *Manager) RetryChat(id string) error {
 	if target.ScanState == chatScanCompleted {
 		next = ChatStatusDownloading
 	}
-	if err := m.updateChatStatus(id, target.Status, next, ""); err != nil {
+	if err := m.transitionChatItems(id, target.Status, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE chat_job_id = ? AND status != 'completed'`, nil, id); err != nil {
 		return err
 	}
-	if err := m.applyChatChildren(id, "重新开始", func(child string) error {
-		if status := m.status(child); status == "failed" || status == "partial" || status == "cancelled" {
-			return m.Retry(child)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	m.touch()
 	m.signalChat()
 	m.signal()
 	return nil
 }
 
 func (m *Manager) CancelChat(id string) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	target, err := m.chatTarget(id)
 	if err != nil {
 		return err
@@ -876,15 +1174,93 @@ func (m *Manager) CancelChat(id string) error {
 	if target.Status == ChatStatusCompleted || target.Status == ChatStatusFailed || target.Status == ChatStatusPartial || target.Status == ChatStatusCancelled {
 		return errors.New("当前会话任务不能取消")
 	}
-	if err := m.updateChatStatus(id, target.Status, ChatStatusCancelled, "已取消，可重新开始"); err != nil {
+	if err := m.transitionChatItems(id, target.Status, ChatStatusCancelled, "已取消，可重新开始", `UPDATE chat_download_items SET status = 'cancelled', finished_at = ? WHERE chat_job_id = ? AND status != 'completed'`, func(tx *databaseTx) error {
+		_, err := tx.Exec(`DELETE FROM downloaded_media WHERE status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, id)
+		return err
+	}, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 		return err
 	}
-	if err := m.applyChatChildren(id, "取消", func(child string) error {
-		if status := m.status(child); status == "queued" || status == "running" || status == "paused" {
-			return m.Cancel(child)
+	m.cancelChatExecutions(id)
+	return nil
+}
+
+// SetChatListening changes only whether new messages are accepted after the
+// historical range has been indexed. Enabling it never scans history again.
+func (m *Manager) SetChatListening(id string, enabled bool) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	target, err := m.chatTarget(id)
+	if err != nil {
+		return err
+	}
+	if target.ScanState != chatScanCompleted {
+		return errors.New("历史下载尚未完成索引，暂时不能修改消息监听")
+	}
+	if enabled {
+		if target.ListenNew {
+			return nil
 		}
-		return nil
-	}); err != nil {
+		if target.Status != ChatStatusCompleted && target.Status != ChatStatusPartial && target.Status != ChatStatusFailed {
+			return errors.New("当前会话任务不能开启消息监听")
+		}
+		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 1, status = ?, error = '', updated_at = ? WHERE id = ?`, ChatStatusListening, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+			return err
+		}
+	} else {
+		if !target.ListenNew {
+			return nil
+		}
+		next := target.Status
+		if target.Status == ChatStatusListening {
+			var failed int
+			if err := m.db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = ? AND status = 'failed'`, id).Scan(&failed); err != nil {
+				return err
+			}
+			if failed > 0 {
+				next = ChatStatusPartial
+			} else {
+				next = ChatStatusCompleted
+			}
+		}
+		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 0, status = ?, error = '', updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+			return err
+		}
+	}
+	m.touch()
+	m.signalChat()
+	return nil
+}
+
+// transitionChatItems makes a chat parent and its indexed media change state
+// atomically. The optional after hook is used for ownership changes that must
+// commit with cancellation.
+func (m *Manager) transitionChatItems(id, expected, next, message, itemSQL string, after func(*databaseTx) error, args ...any) error {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, next, message, time.Now().UTC().Format(time.RFC3339Nano), id, expected)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errors.New("会话任务状态已变化，请刷新后重试")
+	}
+	if _, err := tx.Exec(itemSQL, args...); err != nil {
+		return err
+	}
+	if after != nil {
+		if err := after(tx); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	m.touch()
@@ -908,28 +1284,10 @@ func (m *Manager) updateChatStatus(id, expected, next, message string) error {
 	return nil
 }
 
-// applyChatChildren never discards a child-control failure. The parent state
-// already prevents further indexing, and its error field records any child
-// that needs a later retry instead of presenting a misleading clean result.
-func (m *Manager) applyChatChildren(chatID, action string, apply func(string) error) error {
-	var failures []error
-	for _, child := range m.chatChildJobIDs(chatID) {
-		if err := apply(child); err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", child, err))
-		}
-	}
-	if len(failures) == 0 {
-		return nil
-	}
-	message := fmt.Sprintf("会话已%s，但 %d 个子任务未完成对应操作", action, len(failures))
-	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET error = ?, updated_at = ? WHERE id = ?`, message, time.Now().UTC().Format(time.RFC3339Nano), chatID); err != nil {
-		failures = append(failures, fmt.Errorf("记录会话任务错误: %w", err))
-	}
-	m.touch()
-	return errors.Join(failures...)
-}
-
 func (m *Manager) DeleteChat(id string) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
 	target, err := m.chatTarget(id)
 	if err != nil {
 		return err
@@ -942,90 +1300,54 @@ func (m *Manager) DeleteChat(id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	// Overlapping chat ranges may deliberately share a child task. Only mark a
-	// child deleted when no other visible parent references it; physical rows
-	// remain permanent history and global media de-duplication evidence.
-	children, err := chatExclusiveChildJobIDs(tx, []string{id})
+	result, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = '会话任务已删除', updated_at = ? WHERE id = ? AND status IN (?, ?, ?, ?)`, ChatStatusDeleted, time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusCompleted, ChatStatusFailed, ChatStatusPartial, ChatStatusCancelled)
 	if err != nil {
 		return err
 	}
-	for _, child := range children {
-		if _, err := tx.Exec(`UPDATE download_jobs SET status = 'deleted', error = '所属会话任务已删除', updated_at = ? WHERE id = ? AND parent_chat_id = ? AND status != 'completed'`, time.Now().UTC().Format(time.RFC3339Nano), child, id); err != nil {
-			return err
-		}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
 	}
-	if _, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = '会话任务已删除', updated_at = ? WHERE id = ?`, ChatStatusDeleted, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if changed != 1 {
+		return errors.New("会话任务状态已变化，请刷新后重试")
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.visibleChats.Add(-1)
+	_ = os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id))
+	m.touch()
+	return nil
+}
+
+// PurgeChat permanently removes a terminal chat task and its media index. It
+// never removes final files; only claims exclusively owned by this task go.
+func (m *Manager) PurgeChat(id string) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	target, err := m.chatTarget(id)
+	if err != nil {
+		return err
+	}
+	if target.Status != ChatStatusCompleted && target.Status != ChatStatusFailed && target.Status != ChatStatusPartial && target.Status != ChatStatusCancelled && target.Status != ChatStatusDeleted {
+		return errors.New("请先取消或等待会话任务结束后再彻底删除")
+	}
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id = ?`, id); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	for _, child := range children {
-		_ = os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", child))
+	if target.Status != ChatStatusDeleted {
+		m.visibleChats.Add(-1)
 	}
+	_ = os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id))
 	m.touch()
 	return nil
-}
-
-// chatExclusiveChildJobIDs returns parent-owned child jobs that are not also
-// referenced by another chat parent. Standalone jobs are excluded because
-// they have no parent_chat_id.
-func chatExclusiveChildJobIDs(tx *databaseTx, chatIDs []string) ([]string, error) {
-	if len(chatIDs) == 0 {
-		return nil, nil
-	}
-	marks := strings.TrimRight(strings.Repeat("?,", len(chatIDs)), ",")
-	args := make([]any, 0, len(chatIDs)*2)
-	for _, id := range chatIDs {
-		args = append(args, id)
-	}
-	for _, id := range chatIDs {
-		args = append(args, id)
-	}
-	rows, err := tx.Query(`SELECT DISTINCT j.id
- FROM download_jobs j
- WHERE j.parent_chat_id IN (`+marks+`)
-   AND NOT EXISTS (
-     SELECT 1 FROM chat_download_items i
-     WHERE i.child_job_id = j.id AND i.chat_job_id NOT IN (`+marks+`)
-   )`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	ids := make([]string, 0)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-func (m *Manager) chatChildJobIDs(chatID string) []string {
-	rows, err := m.db.Query(`SELECT id FROM download_jobs WHERE parent_chat_id = ?`, chatID)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	ids := make([]string, 0)
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
-		}
-	}
-	return ids
-}
-
-// IsChatChild lets delivery adapters keep implementation-detail child jobs out
-// of their normal task feeds. The chat parent is the sole user-visible unit.
-func (m *Manager) IsChatChild(jobID string) bool {
-	var parent string
-	if err := m.db.QueryRow(`SELECT parent_chat_id FROM download_jobs WHERE id = ?`, jobID).Scan(&parent); err != nil {
-		return false
-	}
-	return parent != ""
 }

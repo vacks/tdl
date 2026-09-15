@@ -4,6 +4,7 @@ set -eu
 tdl_version="v0.20.4"
 patch_file="patches/tdl-progress-0.20.4.patch"
 runtime_patch="patches/tdl-runtime-options-0.20.4.patch"
+cancel_patch="patches/tdl-cancel-0.20.4.patch"
 target_dir=".upstream/tdl"
 
 if [ ! -f "$patch_file" ]; then
@@ -12,6 +13,10 @@ if [ ! -f "$patch_file" ]; then
 fi
 if [ ! -f "$runtime_patch" ]; then
   echo "missing upstream runtime options patch: $runtime_patch" >&2
+  exit 1
+fi
+if [ ! -f "$cancel_patch" ]; then
+  echo "missing upstream cancellation patch: $cancel_patch" >&2
   exit 1
 fi
 
@@ -53,6 +58,11 @@ if ! (cd "$target_dir" && patch --batch --forward -p1 < "../../$patch_file"); th
 fi
 if ! (cd "$target_dir" && patch --batch --forward -p1 < "../../$runtime_patch"); then
   echo "tdl runtime options patch did not apply; refusing to build an unsafe concurrent image" >&2
+  rm -rf "$target_dir"
+  exit 1
+fi
+if ! (cd "$target_dir" && patch --batch --forward -p1 < "../../$cancel_patch"); then
+  echo "tdl cancellation patch did not apply; refusing to build an unsafe cancellation image" >&2
   rm -rf "$target_dir"
   exit 1
 fi

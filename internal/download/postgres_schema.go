@@ -1,15 +1,16 @@
 package download
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // migratePostgres creates the durable PostgreSQL schema. Download jobs and
 // item identities are intentionally never removed by retention maintenance:
 // they are the permanent history and de-duplication source of truth.
 func (m *Manager) migratePostgres() error {
-	if !m.db.isPostgres() {
-		return m.migrateSQLiteLegacy()
-	}
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS download_jobs (
  id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL DEFAULT '', dialog_name TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '', direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id BIGINT NOT NULL DEFAULT 0, direct_peer_hash BIGINT NOT NULL DEFAULT 0, parent_chat_id TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 )`,
@@ -36,14 +37,20 @@ func (m *Manager) migratePostgres() error {
  id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_id BIGINT NOT NULL, dialog_name TEXT NOT NULL, account_id TEXT NOT NULL, direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id BIGINT NOT NULL DEFAULT 0, direct_peer_hash BIGINT NOT NULL DEFAULT 0, start_message_id INTEGER NOT NULL DEFAULT 0, upper_message_id INTEGER NOT NULL DEFAULT 0, listen_new SMALLINT NOT NULL DEFAULT 0, status TEXT NOT NULL, scan_state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_download_items (
- chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '', dialog_type TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, grouped_id BIGINT NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL DEFAULT '', size BIGINT NOT NULL DEFAULT 0, discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+ chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '', dialog_type TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, grouped_id BIGINT NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL DEFAULT '', size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'queued', error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_download_streams (
  chat_job_id TEXT NOT NULL, stream_kind TEXT NOT NULL, offset_message_id INTEGER NOT NULL DEFAULT 0, initialized SMALLINT NOT NULL DEFAULT 0, completed SMALLINT NOT NULL DEFAULT 0, PRIMARY KEY(chat_job_id, stream_kind), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 )`,
+		`CREATE TABLE IF NOT EXISTS downloaded_media (
+ dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, final_path TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, owner_kind TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(dialog_key, message_id)
+)`,
 		`CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
 		`CREATE INDEX IF NOT EXISTS download_items_status ON download_items(status)`,
+		`CREATE INDEX IF NOT EXISTS download_items_failed_finished_at ON download_items(status, finished_at) WHERE status = 'failed'`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS download_jobs_visible_created_id ON download_jobs(created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+		`CREATE INDEX IF NOT EXISTS download_jobs_visible_status_created_id ON download_jobs(status, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_status_updated_id ON download_jobs(status, updated_at, id)`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_parent_created_id ON download_jobs(parent_chat_id, created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS download_requests_job_id ON download_requests(job_id)`,
@@ -53,19 +60,123 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
 		`CREATE INDEX IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
 		`CREATE INDEX IF NOT EXISTS download_resets_created ON download_resets(created_at)`,
-		`CREATE INDEX IF NOT EXISTS bot_lifecycle_messages_cleanup ON bot_lifecycle_messages(job_id, chat_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS chat_download_jobs_active_unique ON chat_download_jobs(account_id, dialog_key, start_message_id) WHERE status IN ('queued', 'scanning', 'downloading', 'listening', 'paused')`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_created_id ON chat_download_jobs(created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS chat_download_jobs_visible_created_id ON chat_download_jobs(created_at DESC, id DESC) WHERE status != 'deleted'`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_account_status ON chat_download_jobs(account_id, status, updated_at)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_scan ON chat_download_jobs(status, scan_state, created_at)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_listener ON chat_download_jobs(account_id, dialog_key, listen_new, scan_state, status)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_job_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_child_job ON chat_download_items(child_job_id)`,
+		`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := m.db.Exec(statement); err != nil {
 			return fmt.Errorf("initialize PostgreSQL schema: %w", err)
 		}
+	}
+	if err := m.applyPostgresMigrations(); err != nil {
+		return err
+	}
+	// This was an exact duplicate of the primary key (job_id, chat_id).
+	if _, err := m.db.Exec(`DROP INDEX IF EXISTS bot_lifecycle_messages_cleanup`); err != nil {
+		return fmt.Errorf("remove redundant PostgreSQL index: %w", err)
+	}
+	return nil
+}
+
+type postgresMigration struct {
+	version    int
+	statements []string
+}
+
+// Keep every post-v1 structure change here. The base CREATE IF NOT EXISTS
+// statements bootstrap a fresh database; upgrades are recorded one version at
+// a time so an existing PostgreSQL volume can never silently miss a change.
+var postgresMigrations = []postgresMigration{
+	{
+		version: 1,
+	},
+	{
+		version: 2,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS download_jobs_account_visible_created_id ON download_jobs(account_id, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+		},
+	},
+	{
+		// v3 makes media rows self-contained.  A chat task can therefore use the
+		// index itself as its bounded work queue instead of manufacturing one
+		// download_jobs row for every media message.
+		version: 3,
+		statements: []string{
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS final_path TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS started_at TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS finished_at TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS elapsed_ms BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued'`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS chat_download_items_ready ON chat_download_items(chat_job_id, status, message_id)`,
+		},
+	},
+	{
+		// v4 permanently severs the legacy parent/child execution relation.
+		// The column stays temporarily so upgrading a live PostgreSQL volume is
+		// non-destructive, but no current task can observe or control it.
+		version: 4,
+		statements: []string{
+			`UPDATE download_items SET status = 'cancelled', error = '会话下载架构升级，旧子任务已停止', finished_at = CASE WHEN finished_at = '' THEN NOW()::text ELSE finished_at END WHERE job_id IN (SELECT id FROM download_jobs WHERE parent_chat_id <> '') AND status NOT IN ('completed', 'cancelled')`,
+			`UPDATE download_jobs SET status = 'cancelled', error = '会话下载架构升级，旧子任务已停止', updated_at = NOW()::text WHERE parent_chat_id <> '' AND status IN ('queued', 'running', 'paused')`,
+			`UPDATE chat_download_items SET child_job_id = '' WHERE child_job_id <> ''`,
+			`UPDATE download_jobs SET parent_chat_id = '' WHERE parent_chat_id <> ''`,
+		},
+	},
+	{
+		version: 5,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS downloaded_media (dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, final_path TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, owner_kind TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(dialog_key, message_id))`,
+			`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
+			`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) SELECT dialog_key, message_id, final_path, status, 'message', job_id, NOW()::text FROM download_items WHERE status = 'completed' AND final_path <> '' ON CONFLICT(dialog_key, message_id) DO NOTHING`,
+		},
+	},
+	{
+		// v6 makes status-filtered task pages an index range scan even when the
+		// permanent task history contains tens of millions of rows.
+		version: 6,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS download_jobs_visible_status_created_id ON download_jobs(status, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+		},
+	},
+}
+
+func (m *Manager) applyPostgresMigrations() error {
+	var current int
+	if err := m.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
+		return fmt.Errorf("read PostgreSQL schema version: %w", err)
+	}
+	for _, migration := range postgresMigrations {
+		if migration.version <= current {
+			continue
+		}
+		tx, err := m.db.Begin()
+		if err != nil {
+			return fmt.Errorf("start PostgreSQL migration %d: %w", migration.version, err)
+		}
+		for _, statement := range migration.statements {
+			if _, err := tx.Exec(statement); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("apply PostgreSQL migration %d: %w", migration.version, err)
+			}
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, migration.version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record PostgreSQL migration %d: %w", migration.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit PostgreSQL migration %d: %w", migration.version, err)
+		}
+		current = migration.version
 	}
 	return nil
 }

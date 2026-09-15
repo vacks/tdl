@@ -84,6 +84,20 @@ type loginJob struct {
 	password chan string
 }
 
+// updateHub owns the single long-lived Telegram update connection for one
+// account. Reaction and new-message consumers subscribe to this hub instead
+// of opening competing connections with the same authorization key.
+type updateHub struct {
+	cancel    context.CancelFunc
+	done      chan struct{}
+	proxy     string
+	ready     bool
+	nextID    uint64
+	reactions map[uint64]func(context.Context, ReactionEvent)
+	messages  map[uint64]func(context.Context, NewMessageEvent)
+	readies   map[uint64]func()
+}
+
 // Manager owns account metadata and keeps each Telegram session in its own private file.
 // The session format itself is handled by upstream tdl's tclient adapter.
 type Manager struct {
@@ -99,6 +113,8 @@ type Manager struct {
 	proxyURL   func() string
 	ctx        context.Context
 	cancel     context.CancelFunc
+	updatesMu  sync.Mutex
+	updates    map[string]*updateHub
 }
 
 func Open(dataDir string, proxyURL func() string) (*Manager, error) {
@@ -110,7 +126,7 @@ func Open(dataDir string, proxyURL func() string) (*Manager, error) {
 		return nil, fmt.Errorf("create Telegram state directory: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Manager{root: root, path: filepath.Join(root, "accounts.json"), jobs: make(map[string]*loginJob), operations: make(map[string]*sync.RWMutex), stores: make(map[string]*sync.RWMutex), proxyURL: proxyURL, ctx: ctx, cancel: cancel}
+	m := &Manager{root: root, path: filepath.Join(root, "accounts.json"), jobs: make(map[string]*loginJob), operations: make(map[string]*sync.RWMutex), stores: make(map[string]*sync.RWMutex), proxyURL: proxyURL, ctx: ctx, cancel: cancel, updates: make(map[string]*updateHub)}
 	if data, err := os.ReadFile(m.path); err == nil {
 		var saved persisted
 		if err := json.Unmarshal(data, &saved); err != nil {
@@ -293,91 +309,127 @@ func (m *Manager) CurrentID() (string, error) {
 	return account.ID, nil
 }
 
-// ListenReactions keeps a separate MTProto connection open for one account
-// and reports only reactions Telegram marks as sent by that account (My).
-// Download operations remain short-lived and use their existing connection;
-// this listener must never hold the account operation mutex for its lifetime.
+// ListenReactions subscribes to the account's shared Telegram update
+// connection and reports only reactions made by that account.
 func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(context.Context, ReactionEvent), onReady func()) error {
+	return m.listenUpdates(ctx, id, onEvent, nil, onReady)
+}
+
+// ListenNewMessages subscribes to the same shared update connection used by
+// reaction triggers. One account therefore has exactly one update consumer.
+func (m *Manager) ListenNewMessages(ctx context.Context, id string, onEvent func(context.Context, NewMessageEvent), onReady func()) error {
+	return m.listenUpdates(ctx, id, nil, onEvent, onReady)
+}
+
+func (m *Manager) listenUpdates(ctx context.Context, id string, onReaction func(context.Context, ReactionEvent), onMessage func(context.Context, NewMessageEvent), onReady func()) error {
 	m.mu.RLock()
 	account, ok := m.accountLocked(id)
-	proxyURL := m.proxyURL
 	m.mu.RUnlock()
 	if !ok || account.State != "authorized" {
 		return ErrNotAuthorized
 	}
 
-	store := m.accountStore(id)
+	m.updatesMu.Lock()
+	hub := m.updates[id]
+	if hub == nil {
+		hubCtx, cancel := context.WithCancel(m.ctx)
+		hub = &updateHub{cancel: cancel, done: make(chan struct{}), proxy: m.proxyURL(), reactions: make(map[uint64]func(context.Context, ReactionEvent)), messages: make(map[uint64]func(context.Context, NewMessageEvent)), readies: make(map[uint64]func())}
+		m.updates[id] = hub
+		go m.runUpdateHub(hubCtx, id, hub)
+	}
+	hub.nextID++
+	subscriptionID := hub.nextID
+	if onReaction != nil {
+		hub.reactions[subscriptionID] = onReaction
+	}
+	if onMessage != nil {
+		hub.messages[subscriptionID] = onMessage
+	}
+	if onReady != nil {
+		hub.readies[subscriptionID] = onReady
+		if hub.ready {
+			go onReady()
+		}
+	}
+	m.updatesMu.Unlock()
+
+	<-ctx.Done()
+	m.removeUpdateSubscription(id, hub, subscriptionID)
+	return ctx.Err()
+}
+
+func (m *Manager) removeUpdateSubscription(id string, hub *updateHub, subscriptionID uint64) {
+	m.updatesMu.Lock()
+	defer m.updatesMu.Unlock()
+	if m.updates[id] != hub {
+		return
+	}
+	delete(hub.reactions, subscriptionID)
+	delete(hub.messages, subscriptionID)
+	delete(hub.readies, subscriptionID)
+	if len(hub.reactions) == 0 && len(hub.messages) == 0 {
+		delete(m.updates, id)
+		hub.cancel()
+	}
+}
+
+func (m *Manager) runUpdateHub(ctx context.Context, accountID string, hub *updateHub) {
+	defer close(hub.done)
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := m.runUpdateConnection(ctx, accountID, hub); err != nil && ctx.Err() == nil {
+			delay := time.Duration(1<<min(attempt, 5)) * time.Second
+			applog.Error("telegram", "update_listener_retry_scheduled", "account_id", accountID, "attempt", attempt+1, "retry_after", delay.String(), "error", err.Error())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			continue
+		}
+		return
+	}
+}
+
+func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub *updateHub) error {
+	store := m.accountStore(accountID)
 	dispatcher := tg.NewUpdateDispatcher()
 	var client *gotd.Client
-	// Telegram sends reaction changes for different cloud dialog types through
-	// different update constructors. Private chats commonly arrive as edited
-	// messages; channels can use either constructor. Both are normalized below.
+	dispatchReaction := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass, updateType string) {
+		m.dispatchEditedReaction(updateCtx, accountID, updateType, entities, raw, client, func(_ context.Context, event ReactionEvent) { m.dispatchReaction(accountID, event) })
+	}
 	dispatcher.OnEditMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditMessage) error {
-		m.dispatchEditedReaction(updateCtx, id, "edit_message", entities, update.Message, client, onEvent)
+		dispatchReaction(updateCtx, entities, update.Message, "edit_message")
 		return nil
 	})
 	dispatcher.OnEditChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditChannelMessage) error {
-		m.dispatchEditedReaction(updateCtx, id, "edit_channel_message", entities, update.Message, client, onEvent)
+		dispatchReaction(updateCtx, entities, update.Message, "edit_channel_message")
 		return nil
 	})
 	dispatcher.OnMessageReactions(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateMessageReactions) error {
 		reactions := &update.Reactions
 		emojis := ownReactionEmojis(reactions)
 		if len(emojis) == 0 {
-			applog.Info("reaction", "update_ignored_not_own", "account_id", id, "message_id", update.MsgID, "summary", reactions.Min)
 			return nil
 		}
-		event, ok := m.reactionEvent(updateCtx, id, entities, update.Peer, update.MsgID, emojis, client)
+		event, ok := m.reactionEvent(updateCtx, accountID, entities, update.Peer, update.MsgID, emojis, client)
 		if !ok {
 			return nil
 		}
-		applog.Info("reaction", "own_reaction_received", "account_id", id, "dialog_id", event.DialogID, "message_id", update.MsgID, "emojis", emojis, "summary", reactions.Min)
-		dispatchReactionEvent(onEvent, event)
+		applog.Info("reaction", "own_reaction_received", "account_id", accountID, "dialog_id", event.DialogID, "message_id", update.MsgID, "emojis", emojis, "summary", reactions.Min)
+		m.dispatchReaction(accountID, event)
 		return nil
 	})
-
-	var err error
-	client, err = upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: proxyURL(), UpdateHandler: dispatcher}, false)
-	if err != nil {
-		applog.Error("reaction", "listener_connect_failed", "account_id", id, "error", err.Error())
-		return fmt.Errorf("创建表情监听连接失败: %w", err)
-	}
-	applog.Info("reaction", "listener_connected", "account_id", id)
-	return client.Run(ctx, func(runCtx context.Context) error {
-		if _, err := client.Self(runCtx); err != nil {
-			applog.Error("reaction", "listener_authorization_check_failed", "account_id", id, "error", err.Error())
-			return err
-		}
-		if onReady != nil {
-			onReady()
-		}
-		<-runCtx.Done()
-		return nil
-	})
-}
-
-// ListenNewMessages holds one update connection for an account and normalizes
-// both ordinary group and channel update constructors. Callers multiplex their
-// own subscriptions on this one connection.
-func (m *Manager) ListenNewMessages(ctx context.Context, id string, onEvent func(context.Context, NewMessageEvent), onReady func()) error {
-	m.mu.RLock()
-	account, ok := m.accountLocked(id)
-	proxyURL := m.proxyURL
-	m.mu.RUnlock()
-	if !ok || account.State != "authorized" {
-		return ErrNotAuthorized
-	}
-	store := m.accountStore(id)
-	dispatcher := tg.NewUpdateDispatcher()
-	var client *gotd.Client
-	dispatch := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass) {
+	dispatchMessage := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass) {
 		message, ok := raw.(*tg.Message)
 		if !ok {
 			return
 		}
 		input, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
 		if err != nil {
-			applog.Info("chat_download", "new_message_peer_extract_failed", "account_id", id, "message_id", message.ID, "error", err.Error())
+			applog.Info("chat_download", "new_message_peer_extract_failed", "account_id", accountID, "message_id", message.ID, "error", err.Error())
 			return
 		}
 		name := "会话"
@@ -386,32 +438,77 @@ func (m *Manager) ListenNewMessages(ctx context.Context, id string, onEvent func
 			input, name = peer.InputPeer(), peer.VisibleName()
 		}
 		dialogID, _ := inputPeerInfo(input)
-		onEvent(context.Background(), NewMessageEvent{AccountID: id, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input})
+		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input})
 	}
 	dispatcher.OnNewMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
-		dispatch(updateCtx, entities, update.Message)
+		dispatchMessage(updateCtx, entities, update.Message)
 		return nil
 	})
 	dispatcher.OnNewChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewChannelMessage) error {
-		dispatch(updateCtx, entities, update.Message)
+		dispatchMessage(updateCtx, entities, update.Message)
 		return nil
 	})
-	var err error
-	client, err = upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: proxyURL(), UpdateHandler: dispatcher}, false)
+
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, false)
 	if err != nil {
-		return fmt.Errorf("创建新媒体监听连接: %w", err)
+		return fmt.Errorf("创建 Telegram 更新监听连接: %w", err)
 	}
-	applog.Info("chat_download", "new_message_listener_connected", "account_id", id)
+	applog.Info("telegram", "update_listener_connected", "account_id", accountID)
 	return client.Run(ctx, func(runCtx context.Context) error {
 		if _, err := client.Self(runCtx); err != nil {
 			return err
 		}
-		if onReady != nil {
-			onReady()
-		}
+		m.markUpdateHubReady(accountID, hub)
 		<-runCtx.Done()
 		return nil
 	})
+}
+
+func (m *Manager) markUpdateHubReady(accountID string, hub *updateHub) {
+	m.updatesMu.Lock()
+	if m.updates[accountID] != hub {
+		m.updatesMu.Unlock()
+		return
+	}
+	hub.ready = true
+	callbacks := make([]func(), 0, len(hub.readies))
+	for _, callback := range hub.readies {
+		callbacks = append(callbacks, callback)
+	}
+	m.updatesMu.Unlock()
+	for _, callback := range callbacks {
+		callback()
+	}
+}
+
+func (m *Manager) dispatchReaction(accountID string, event ReactionEvent) {
+	m.updatesMu.Lock()
+	hub := m.updates[accountID]
+	callbacks := make([]func(context.Context, ReactionEvent), 0)
+	if hub != nil {
+		for _, callback := range hub.reactions {
+			callbacks = append(callbacks, callback)
+		}
+	}
+	m.updatesMu.Unlock()
+	for _, callback := range callbacks {
+		callback(context.Background(), event)
+	}
+}
+
+func (m *Manager) dispatchMessage(accountID string, event NewMessageEvent) {
+	m.updatesMu.Lock()
+	hub := m.updates[accountID]
+	callbacks := make([]func(context.Context, NewMessageEvent), 0)
+	if hub != nil {
+		for _, callback := range hub.messages {
+			callbacks = append(callbacks, callback)
+		}
+	}
+	m.updatesMu.Unlock()
+	for _, callback := range callbacks {
+		callback(context.Background(), event)
+	}
 }
 
 func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateType string, entities tg.Entities, raw tg.MessageClass, client *gotd.Client, onEvent func(context.Context, ReactionEvent)) {

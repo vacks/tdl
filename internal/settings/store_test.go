@@ -78,7 +78,7 @@ func TestUpdateNormalizesAndPersistsConfiguration(t *testing.T) {
 	if len(got.Bot.ControlUserIDs) != 2 || got.Bot.ControlUserIDs[0] != 7 || got.Bot.ControlUserIDs[1] != 9 || got.Bot.ControlUserID != 0 {
 		t.Fatalf("normalized control users = %#v, legacy=%d", got.Bot.ControlUserIDs, got.Bot.ControlUserID)
 	}
-	if len(got.Reaction.Emojis) != 2 || got.Reaction.Emojis[0] != "❤" || got.Reaction.Emojis[1] != "👍" {
+	if len(got.Reaction.Emojis) != 2 || got.Reaction.Emojis[0] != "❤️" || got.Reaction.Emojis[1] != "👍" {
 		t.Fatalf("normalized emojis = %#v", got.Reaction.Emojis)
 	}
 	reopened, err := Open(filepath.Clean(dir))

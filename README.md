@@ -1,62 +1,238 @@
-# tdl Web
+# TDL 管理
 
-基于 [iyear/tdl](https://github.com/iyear/tdl) `v0.20.4` 构建的 Telegram Web 管理服务。
+`TDL 管理 v1.0.0` 是基于 [iyear/tdl](https://github.com/iyear/tdl) `v0.20.4` 的 Telegram 下载管理服务。它将上游 tdl 的登录与下载能力封装为 Web 管理台，并提供 Telegram Bot 和表情触发入口。
 
-## 已实现功能
+项目面向自托管：应用、PostgreSQL、Telegram 会话、下载历史和最终文件均由部署者持有。默认 Compose 仅监听宿主机回环地址；公网访问应始终经由你自己的 HTTPS 反向代理。
 
-- Vue 3 + TypeScript + Element Plus 管理界面；
-- WebUI 管理员账号密码登录，使用 Argon2id 密码哈希和服务端会话 Cookie；
-- 多个 Telegram 账号的二维码登录、两步验证、当前账号切换与删除；
-- HTTP、HTTPS、SOCKS5、SOCKS5H 代理配置，支持 `user:password@host:port` 形式；
-- tdl 下载默认参数：线程数、任务限制、连接池、下载间隔与文件命名模板；
-- 下载管理：粘贴 Telegram 消息链接后调用上游 tdl 下载，支持相册/媒体组；任务、媒体记录与创建时绑定的 Telegram 账号持久保存在 PostgreSQL；
-- PostgreSQL 永久下载记录：以 Telegram 的 `DialogID + MessageID` 唯一约束登记每个媒体消息，重复提交同一消息或相册成员会被拒绝。下载历史与去重记录不会因自动清理而删除；
-- 两层文件命名：临时文件模板仅使用上游 tdl 支持的变量和函数；最终文件模板由本项目处理，支持 `DialogID`、`DialogName`、`MessageID`、`MessageText`、`FileName` 和 `FileExt`（含点），且变量值会自动按 Linux 规则清理。下载先写入临时目录，再按最终模板落到下载目录；`MessageText` 按 Telegram 客户端视觉相册规则计算：媒体组中只有一条非空正文时使用该正文；零条或多条正文时为空；
-- 下载队列：可配置多个任务并行执行，支持暂停、恢复、取消和失败后的手动重试；重启时运行中的任务会重新入队，并复用上游 tdl 的恢复记录和临时文件。完成项目不会再次下载；
-- 文件实时进度与速率：通过 SSE 推送内存中的分块字节进度，不会高频写入 PostgreSQL。该能力由 `patches/tdl-progress-0.20.4.patch` 为上游 `tdl v0.20.4` 增加的可选回调提供；构建脚本会校验版本和受影响源码文件的 SHA-256，不匹配即中止构建；
-- 安全最终落盘：自动创建临时与最终目录，拒绝绝对路径、`..` 路径段和跳出下载目录的符号链接；最终文件使用不覆盖的原子发布方式；
-- Telegram 会话健康检查：每 30 分钟以一个轻量 `Self` 请求检查已授权账号，避免与下载并行使用同一会话；失效账号会在界面标记为需要重新登录；
-- Bot 控制：多控制用户、任务列表与详情、状态/配置查询、链接创建任务、生命周期通知和服务重启；
-- 表情实时监听：仅处理当前已登录账号自己作出的匹配 Unicode 表情，支持私聊、群组、频道与收藏消息；
-- 辅助历史清理：可配置保留天数并分批清理状态事件、请求和表情触发收件箱；任务历史与去重记录永久保留；
-- 仅本机绑定的 Docker Compose 配置，生产环境可由 NAS 的现有反向代理提供 HTTPS。
+## 功能
 
-## 当前限制
+- 管理员 Web 登录：Argon2id 密码哈希、HttpOnly 会话 Cookie、登录限流和来源校验；
+- Telegram 多账户：二维码登录、两步验证、当前账户切换、会话健康检查与失效提示；
+- 消息下载：消息链接、相册/媒体组、暂停/恢复/取消/重试、实时文件进度与速率；
+- 会话下载：频道和群组历史下载、消息监听、可恢复的索引进度与会话级控制；
+- 下载规则：HTTP/HTTPS/SOCKS5/SOCKS5H 代理、并发/连接池、文件体积与类型筛选、临时和最终命名模板；
+- 文件安全：自动建目录、Linux 文件名清理、超长名称收缩、最终文件原子落盘且不覆盖已有文件；
+- PostgreSQL 永久去重：按 Telegram 对话与消息记录下载状态。自动清理不删除下载历史、去重记录或最终文件；
+- Bot 控制：多位授权用户、`/help`、`/tasks`、`/chats`、`/status`、`/config`、`/restart`、任务详情与通知；
+- 表情触发：监听所有已授权 Telegram 账户本人作出的匹配 Unicode 表情，支持私聊、群组、频道和收藏消息；
+- 仪表盘、结构化应用日志、数据库健康检查；文件进度通过 SSE 内存推送，不高频写 PostgreSQL。
 
-- 重试为管理员手动触发，不会对 Telegram 错误进行盲目自动重试；
-- 暂不提供下载记录导出；
-- 自定义 Premium 表情不能作为文本配置的触发表情。
+## 重要限制
+
+- 仅支持普通 Unicode 表情，不能把自定义 Premium 表情作为触发条件；
+- 下载失败不会盲目自动重试，避免 Telegram 故障或限流时产生额外请求；
+- 管理员 Web 会话保存在内存，服务重启、更新或改密码后需重新登录；Telegram 账户会话和下载历史不会丢失；
+- 不提供下载记录导出；
+- 上游 tdl 的实时进度和取消控制由版本锁定补丁提供。构建会校验上游版本和受影响源码的校验和；不匹配即失败，不会产出不可靠镜像；
+- 上游 tdl 使用 AGPL-3.0。发布或以网络服务方式提供本项目时，请履行相应的源代码提供义务。
+
+## 数据与目录
+
+以下目录是持久化数据，不要随意删除：
+
+| 目录 | 内容 | 影响 |
+| --- | --- | --- |
+| `data/` | 管理员密码哈希、Telegram 会话、Bot 游标、设置和运行状态 | 删除后需要重新初始化和登录 |
+| `postgres/` | 下载历史、去重记录、会话索引和任务状态 | 删除后会失去历史和去重能力 |
+| `downloads/` | 最终文件和上游临时下载文件 | 按你的存储策略管理 |
+
+请同时备份 `data/`、`postgres/` 和 `downloads/`。仅备份其中一个无法完整恢复服务。
+
+## 部署前准备
+
+- Docker Engine 26+ 与 Docker Compose v2；OrbStack、Docker Desktop、NAS 的 Compose 图形界面均可；
+- 首次构建和运行建议至少预留 2 GB 内存；
+- 一个用于保存下载文件的宿主机目录；
+- 首次 Telegram 登录需要能够访问 Telegram；需要时可在 Web 的“配置管理”中设置代理；
+- 公网访问需要域名和现有 HTTPS 反向代理。
+
+首次启动会下载 Go、Node、PostgreSQL 和上游 tdl 依赖；后续更新会使用构建缓存。
+
+## 方式一：Docker Compose（推荐）
+
+适用于命令行、OrbStack、Docker Desktop 和 NAS 的 Stack / Compose 项目功能。
+
+1. 获取源码并进入目录：
+
+   ```bash
+   git clone <你发布后的仓库地址> tdl
+   cd tdl
+   ```
+
+2. 创建配置文件：
+
+   ```bash
+   cp .env.example .env
+   ```
+
+3. **手动编辑 `.env`**。至少替换以下项目；数据库密码必须与连接串内的密码完全相同：
+
+   ```dotenv
+   TDL_ADMIN_USERNAME=admin
+   TDL_ADMIN_INITIAL_PASSWORD=请设置强管理员密码
+
+   TDL_POSTGRES_PASSWORD=请设置另一条长随机数据库密码
+   TDL_DATABASE_URL=postgres://tdl:请设置另一条长随机数据库密码@postgres:5432/tdl?sslmode=disable
+   ```
+
+   `TDL_ADMIN_INITIAL_PASSWORD` 每次启动都必须非空，但仅在 `data/admin.json` 不存在时用于创建管理员。首次创建后，以 Web 中修改后的管理员密码为准。请不要把 `.env` 提交到 Git。
+
+4. 启动：
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+5. 查看状态和日志：
+
+   ```bash
+   docker compose ps
+   docker compose logs -f app
+   ```
+
+6. 在部署主机访问 `http://127.0.0.1:8080`，使用 `.env` 中的管理员账号和首次密码登录。完成 Telegram 登录后，再在 Web 中配置下载规则、Bot 或表情触发。
+
+停止服务但保留数据：
+
+```bash
+docker compose down
+```
+
+更新版本：
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+不要执行 `docker compose down -v`，也不要删除 `data/`、`postgres/` 或 `downloads/`，除非你明确希望丢弃相应数据。
+
+### NAS / Compose 图形界面
+
+将项目目录上传或通过 Git 克隆到 NAS。创建 Stack 时选择仓库内的 `compose.yaml`，并在图形界面填写与 `.env.example` 相同的变量。
+
+Compose 默认使用相对挂载：`./data`、`./postgres`、`./downloads`。如果 NAS 不允许相对路径，请在 `compose.yaml` 中改为绝对宿主机路径，例如：
+
+```yaml
+volumes:
+  - /volume1/docker/tdl/data:/data
+  - /volume1/docker/tdl/postgres:/var/lib/postgresql/data
+  - /volume1/downloads/telegram:/downloads
+```
+
+容器内目标路径不要修改；确保 Docker 对这些宿主机目录有读写权限。
+
+## 方式二：Docker 命令
+
+适用于不使用 Compose 的环境。以下示例创建私有网络和三个持久化卷：
+
+```bash
+docker network create tdl_internal
+docker volume create tdl_postgres
+docker volume create tdl_data
+docker volume create tdl_downloads
+
+docker build -t tdl-manager:1.0.0 .
+
+docker run -d --name tdl-postgres \
+  --network tdl_internal --restart unless-stopped \
+  -e POSTGRES_DB=tdl -e POSTGRES_USER=tdl \
+  -e POSTGRES_PASSWORD='替换为长随机数据库密码' \
+  -v tdl_postgres:/var/lib/postgresql/data postgres:17-alpine
+
+docker run -d --name tdl-app \
+  --network tdl_internal --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -e TDL_DATA_DIR=/data -e TDL_DOWNLOAD_DIR=/downloads -e TDL_LISTEN_ADDR=:8080 \
+  -e TDL_ADMIN_USERNAME=admin \
+  -e TDL_ADMIN_INITIAL_PASSWORD='替换为强管理员密码' \
+  -e 'TDL_DATABASE_URL=postgres://tdl:替换为长随机数据库密码@tdl-postgres:5432/tdl?sslmode=disable' \
+  -v tdl_data:/data -v tdl_downloads:/downloads tdl-manager:1.0.0
+```
+
+若需保存到宿主机指定目录，将最后两个卷替换为明确的路径挂载，例如 `-v /volume1/downloads/telegram:/downloads`。
+
+## HTTPS 反向代理与公网访问
+
+默认端口绑定 `127.0.0.1:8080:8080`，只允许本机或同机反向代理连接。这是预期安全设置；不要直接把应用端口暴露到公网。
+
+在 `.env` 中设置：
+
+```dotenv
+TDL_COOKIE_SECURE=true
+TDL_TRUSTED_ORIGINS=https://tdl.example.com
+# 仅当可信反向代理转发真实客户端 IP 时启用：
+TDL_TRUST_PROXY=true
+```
+
+让反向代理将 HTTPS 域名转发至 `http://127.0.0.1:8080`，并保留 `Host`、`X-Forwarded-For` 与 `X-Forwarded-Proto`。WebSocket 不是必需的，但 SSE 连接需要允许保持较长时间。
+
+若反向代理在另一台机器或另一个 Docker 网络，不能使用 `127.0.0.1` 绑定。仅在可信私有网络中改成反向代理可达的地址，并继续让 HTTPS 反向代理作为唯一公网入口。
+
+## 环境变量参考
+
+| 变量 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `TDL_ADMIN_USERNAME` | 是 | `admin` | 首次创建的管理员名称；之后改此值不会改已有账户 |
+| `TDL_ADMIN_INITIAL_PASSWORD` | 是 | 无 | 首次创建密码；每次启动仍需提供非空值 |
+| `TDL_DATA_DIR` | 是 | `/data` | 会话、配置和管理员信息目录 |
+| `TDL_DOWNLOAD_DIR` | 是 | `/downloads` | 最终下载文件目录 |
+| `TDL_LISTEN_ADDR` | 否 | `:8080` | HTTP 监听地址 |
+| `TDL_POSTGRES_DB` | Compose 是 | `tdl` | PostgreSQL 数据库名 |
+| `TDL_POSTGRES_USER` | Compose 是 | `tdl` | PostgreSQL 用户名 |
+| `TDL_POSTGRES_PASSWORD` | Compose 是 | 无 | PostgreSQL 密码 |
+| `TDL_DATABASE_URL` | 是 | 无 | PostgreSQL 连接串，必须与数据库配置一致 |
+| `TDL_COOKIE_SECURE` | HTTPS 是 | `false` | HTTPS 部署设为 `true` |
+| `TDL_TRUSTED_ORIGINS` | HTTPS 是 | 空 | 写操作允许的页面来源；多个值以逗号分隔 |
+| `TDL_TRUST_PROXY` | 视情况 | `false` | 仅信任自己的反向代理时设为 `true`，用于登录限流真实 IP |
+
+## 健康检查与故障排查
+
+```bash
+curl -fsS http://127.0.0.1:8080/api/health
+docker compose logs --tail=200 app
+docker compose logs --tail=200 postgres
+```
+
+- 返回 `{"status":"ok"}` 代表应用与 PostgreSQL 已连接；
+- 启动失败时，先检查 `.env` 的管理员密码、PostgreSQL 密码和 `TDL_DATABASE_URL` 是否完整且一致；
+- Telegram 登录失败时，先确认网络连通性，再在“配置管理”设置代理；
+- 出现“请求来源校验失败”时，检查 `TDL_TRUSTED_ORIGINS` 是否与浏览器地址完全一致（含 `https://`，不含结尾 `/`）；
+- 迁移或升级失败时不要删除数据库。保留日志和 `postgres/`，回退代码或镜像后再处理。
 
 ## 开发
 
-复制 `.env.example` 为 `.env`，设置强管理员密码与 PostgreSQL 密码，然后在 VS Code 中执行 **Dev Containers: Reopen in Container**。
+安装 VS Code Dev Containers 扩展后，在仓库目录执行 **Dev Containers: Reopen in Container**。开发容器包含 Go、Node 和宿主机 Docker 访问能力。
 
-容器中分别运行：
-
-```bash
-go run ./cmd/tdl
-cd web && npm run dev
-```
-
-## 本地 Compose
+先启动 PostgreSQL 与后端：
 
 ```bash
 cp .env.example .env
-docker compose up --build
+# 编辑 .env 后：
+docker compose up -d postgres
+go run ./cmd/tdl
 ```
 
-默认通过 `http://localhost:8080` 访问。生产部署时可由 NAS 现有的反向代理提供域名和 HTTPS。
+另开一个终端运行前端：
 
-PostgreSQL 仅加入 Compose 内部网络，不映射宿主机端口。请在 `.env` 中保持
-`TDL_POSTGRES_DB`、`TDL_POSTGRES_USER`、`TDL_POSTGRES_PASSWORD` 与
-`TDL_DATABASE_URL` 一致；数据库文件存储于项目目录的 `postgres/`。
+```bash
+cd web
+npm install
+npm run dev
+```
 
-生产环境请在 `.env` 增加 `TDL_COOKIE_SECURE=true`，并设置
-`TDL_TRUSTED_ORIGINS=https://你的域名`。这会启用 HTTPS 专用会话 Cookie，
-并只接受该站点发出的管理操作请求。若应用只经由受信任的反向代理访问，可再设
-`TDL_TRUST_PROXY=true`，让登录限流按转发的真实客户端 IP 生效；不要在应用端口
-直接暴露到公网时启用它。
+访问 `http://localhost:5173`。Vite 会把 `/api` 代理到 `http://localhost:8080`。
+
+发布前常用检查：
+
+```bash
+go test ./...
+cd web && npm run build
+docker compose config --quiet
+```
+
+涉及 PostgreSQL 的集成测试默认跳过。要显式执行，设置 `TDL_TEST_POSTGRES_URL` 指向专用测试数据库，绝不要指向生产数据库。
 
 ## 许可证
 
-本项目依赖 AGPL-3.0 的上游 tdl；发布和对外提供网络服务时，须遵守 AGPL-3.0 的源代码提供义务。
+本项目依赖 AGPL-3.0 的上游 tdl。请在分发、修改或对外提供网络服务前阅读并遵守 [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html)。

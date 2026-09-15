@@ -13,15 +13,59 @@ import (
 
 func TestNormalizeCommand(t *testing.T) {
 	tests := map[string]string{
-		"/help":               "/help",
-		"/help@TDLControlBot": "/help",
-		"/list@TDLControlBot": "/list",
-		"https://t.me/a/1":    "https://t.me/a/1",
-		"/help arguments":     "/help arguments",
+		"/help":                "/help",
+		"/help@TDLControlBot":  "/help",
+		"/tasks@TDLControlBot": "/tasks",
+		"https://t.me/a/1":     "https://t.me/a/1",
+		"/help arguments":      "/help arguments",
 	}
 	for input, want := range tests {
 		if got := normalizeCommand(input); got != want {
 			t.Errorf("normalizeCommand(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestChatTaskPresentationMirrorsWebRangeRules(t *testing.T) {
+	tests := []struct {
+		name string
+		job  download.ChatJob
+		want string
+	}{
+		{name: "not discovered", job: download.ChatJob{UpperMessageID: 99}, want: "最早 — 99"},
+		{name: "discovered while indexing", job: download.ChatJob{EarliestMediaID: 42, UpperMessageID: 99}, want: "42 — 99"},
+		{name: "explicit start", job: download.ChatJob{StartMessageID: 50, EarliestMediaID: 42, UpperMessageID: 99}, want: "50 — 99"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := chatRangeLabel(test.job); got != test.want {
+				t.Fatalf("chatRangeLabel() = %q, want %q", got, test.want)
+			}
+		})
+	}
+	job := download.ChatJob{DialogName: "对话", Status: "scanning", EarliestMediaID: 42, UpperMessageID: 99, Completed: 2, Discovered: 7}
+	text := chatTaskText(job)
+	for _, want := range []string{"42 — 99", "进度：</b>2/7"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("chatTaskText() missing %q: %s", want, text)
+		}
+	}
+	if !strings.Contains(chatTaskText(download.ChatJob{}), "速率：</b>—（0 个文件）") {
+		t.Fatal("chatTaskText() must show an idle speed row")
+	}
+}
+
+func TestChatTaskKeyboardExposesPurgeForTerminalTask(t *testing.T) {
+	keys := chatTaskKeyboard(download.ChatJob{ID: "chat-1", Status: "completed"}, 2)
+	joined := ""
+	for _, row := range keys {
+		for _, key := range row {
+			joined += key.CallbackData + " "
+		}
+	}
+	for _, want := range []string{"c:t:chat-1:delete:2", "c:t:chat-1:purge:2", "c:t:chat-1:listenon:2", "c:l:2"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("chatTaskKeyboard() missing %q: %s", want, joined)
 		}
 	}
 }
@@ -141,5 +185,41 @@ func TestLifecycleAndDeletedMessagesKeepExpectedControls(t *testing.T) {
 	keyboard := deletedTaskKeyboard(3)
 	if len(keyboard) != 1 || keyboard[0][0].CallbackData != "l:3" {
 		t.Fatalf("deletedTaskKeyboard() = %#v", keyboard)
+	}
+}
+
+func TestTaskSourcePresentation(t *testing.T) {
+	tests := []struct {
+		name string
+		job  download.Job
+		want string
+	}{
+		{
+			name: "keeps canonical source link",
+			job:  download.Job{SourceURL: "https://t.me/example/42", DialogType: "channel"},
+			want: `<b>来源：</b><a href="https://t.me/example/42">点击查看</a>`,
+		},
+		{
+			name: "creates private channel link",
+			job:  download.Job{SourceURL: "tg://reaction/channel/100/42", DialogType: "channel", Items: []download.Item{{DialogID: 100, MessageID: 42}}},
+			want: `<b>来源：</b><a href="https://t.me/c/100/42">点击查看</a>`,
+		},
+		{
+			name: "does not expose internal private chat identifier",
+			job:  download.Job{SourceURL: "tg://reaction/user/100/42", DialogType: "user"},
+			want: "<b>来源：</b>私聊不支持跳转",
+		},
+		{
+			name: "saved messages states limitation",
+			job:  download.Job{DialogType: "self"},
+			want: "<b>来源：</b>收藏消息不支持跳转",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sourceLine(test.job); got != test.want {
+				t.Fatalf("sourceLine() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

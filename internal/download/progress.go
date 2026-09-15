@@ -28,13 +28,24 @@ type liveFileProgress struct {
 	lastMeasuredByte int64
 }
 
+// liveJobProgress measures bytes received by the whole visible task. A chat
+// task commonly contains many small files, so summing per-file rates is both
+// misleading and prone to retaining rates for files that have already ended.
+type liveJobProgress struct {
+	lastSampleAt time.Time
+	lastActivity time.Time
+	windowBytes  int64
+	speedBPS     float64
+}
+
 type progressStore struct {
 	mu    sync.RWMutex
 	files map[string]liveFileProgress
+	jobs  map[string]liveJobProgress
 }
 
 func newProgressStore() *progressStore {
-	return &progressStore{files: make(map[string]liveFileProgress)}
+	return &progressStore{files: make(map[string]liveFileProgress), jobs: make(map[string]liveJobProgress)}
 }
 
 func progressKey(dialogKey string, messageID int) string {
@@ -47,10 +58,34 @@ func (p *progressStore) Update(jobID string, item Item, update upstreamDL.Progre
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	previous, exists := p.files[key]
+	previousBytes := int64(0)
+	if exists && previous.jobID == jobID {
+		previousBytes = previous.Downloaded
+	}
 	if !exists || previous.jobID != jobID || update.Downloaded < previous.Downloaded {
 		previous = liveFileProgress{jobID: jobID, lastMeasuredAt: now, lastMeasuredByte: update.Downloaded}
 		started = true
+		if update.Downloaded < previousBytes {
+			previousBytes = 0
+		}
 	}
+	// Maintain a task-wide rolling sample independently of individual files.
+	// Unlike a sum of per-file speeds, this remains meaningful when many small
+	// files start and finish within the one-second per-file sample interval.
+	job := p.jobs[jobID]
+	if job.lastSampleAt.IsZero() {
+		job.lastSampleAt = now
+	}
+	if delta := update.Downloaded - previousBytes; delta > 0 {
+		job.windowBytes += delta
+	}
+	job.lastActivity = now
+	if elapsed := now.Sub(job.lastSampleAt).Seconds(); elapsed >= 1 {
+		job.speedBPS = float64(job.windowBytes) / elapsed
+		job.windowBytes = 0
+		job.lastSampleAt = now
+	}
+	p.jobs[jobID] = job
 
 	// The upstream callback can run once per completed concurrent chunk. Using
 	// neighbouring callbacks therefore turns a few milliseconds into a wildly
@@ -89,4 +124,32 @@ func (p *progressStore) ClearJob(jobID string) {
 			delete(p.files, key)
 		}
 	}
+	delete(p.jobs, jobID)
+}
+
+// ClearItem removes a finished file from the live set immediately. Its bytes
+// remain part of the task-wide rolling window, but its last per-file rate can
+// no longer inflate a chat task's aggregate rate.
+func (p *progressStore) ClearItem(jobID string, item Item) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := progressKey(item.DialogKey, item.MessageID)
+	if state, ok := p.files[key]; ok && state.jobID == jobID {
+		delete(p.files, key)
+	}
+}
+
+func (p *progressStore) Aggregate(jobID string) (files int, speed float64) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, state := range p.files {
+		if state.jobID == jobID {
+			files++
+		}
+	}
+	job, ok := p.jobs[jobID]
+	if !ok || time.Since(job.lastActivity) > 3*time.Second {
+		return files, 0
+	}
+	return files, job.speedBPS
 }

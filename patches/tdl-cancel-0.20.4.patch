@@ -1,0 +1,19 @@
+--- a/app/dl/dl.go
++++ b/app/dl/dl.go
+@@ -200,5 +200,15 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
+ 		}
+ 	}()
+ 
+-	return downloader.New(options).Download(ctx, limit)
++	downloadDone := make(chan error, 1)
++	go func() { downloadDone <- downloader.New(options).Download(ctx, limit) }()
++	select {
++	case err := <-downloadDone:
++		return err
++	case <-ctx.Done():
++		// Returning here runs the deferred pool close immediately, which
++		// closes in-flight MTProto download connections instead of waiting
++		// for a media request to finish naturally.
++		return ctx.Err()
++	}
+ }

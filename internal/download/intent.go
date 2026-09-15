@@ -137,7 +137,7 @@ func (m *Manager) Submit(ctx context.Context, intent DownloadIntent) (Submission
 	}
 	sources = filterSources(sources, m.settings.Get().Download)
 	if len(sources) == 0 {
-		return Submission{}, errors.New("消息中的媒体均不符合当前文件体积或类型筛选条件")
+		return Submission{}, errors.New("消息中的文件均不符合当前文件体积或类型筛选条件")
 	}
 	// A direct Telegram update may not have a public link. Keep a stable,
 	// non-public source value for audit and upstream resume bookkeeping rather
@@ -202,7 +202,7 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 			return err
 		}
 		input := peer.InputPeer()
-		dialogType, dialogKey, dialogID := dialogIdentity(input, accountID)
+		dialogType, dialogKey, dialogID := dialogIdentityForPeer(peer, accountID)
 		if dialogType != "channel" && dialogType != "chat" {
 			return errors.New("会话下载仅支持频道和群组")
 		}

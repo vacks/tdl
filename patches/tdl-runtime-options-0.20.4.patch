@@ -86,4 +86,4 @@
  	}
 -	limit := viper.GetInt(consts.FlagLimit)
  
- 	logctx.From(ctx).Info("Start download",
+	logctx.From(ctx).Info("Start download",

@@ -55,18 +55,11 @@ type Reaction struct {
 	Emojis  []string `json:"emojis"`
 }
 
-// Cleanup controls retention of terminal task history and reaction inbox
-// records. Final downloaded files are never removed by this policy.
-type Cleanup struct {
-	RetentionDays int `json:"retentionDays"`
-}
-
 type Values struct {
 	ProxyURL string   `json:"proxyUrl"`
 	Download Download `json:"download"`
 	Bot      Bot      `json:"bot"`
 	Reaction Reaction `json:"reaction"`
-	Cleanup  Cleanup  `json:"cleanup"`
 }
 
 func Defaults() Values {
@@ -78,8 +71,8 @@ func Defaults() Values {
 		TempFilenameTemplate: "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}",
 		// This is evaluated by the web application after download and therefore
 		// can include our MessageText mapping.
-		FinalFilenameTemplate: "{{ .DialogID }}_{{ .MessageID }}_{{ if .MessageText }}{{ .MessageText }}_{{ end }}{{ .FileName }}",
-	}, Bot: Bot{Notifications: BotNotifications{TaskCreated: true, TaskCompleted: true, TaskPartial: true, TaskFailed: true}}, Reaction: Reaction{Emojis: []string{"👍"}}, Cleanup: Cleanup{RetentionDays: 90}}
+		FinalFilenameTemplate: "{{ .DialogName }}/{{ .GroupedID }}_{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}",
+	}, Bot: Bot{Notifications: BotNotifications{TaskCreated: true, TaskCompleted: true, TaskPartial: true, TaskFailed: true}}, Reaction: Reaction{Emojis: []string{"👍"}}}
 }
 
 type Store struct {
@@ -110,9 +103,17 @@ func Open(dataDir string) (*Store, error) {
 	normalizeDownload(&s.values.Download)
 	normalizeBot(&s.values.Bot)
 	normalizeReaction(&s.values.Reaction)
-	normalizeCleanup(&s.values.Cleanup)
 	if err := Validate(s.values); err != nil {
 		return nil, fmt.Errorf("validate settings: %w", err)
+	}
+	// Rewrite normalized settings so removed auxiliary maintenance options do
+	// not remain in the persisted user-facing configuration.
+	normalized, err := json.MarshalIndent(s.values, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := writePrivateFile(s.path, normalized); err != nil {
+		return nil, fmt.Errorf("rewrite normalized settings: %w", err)
 	}
 	return s, nil
 }
@@ -123,7 +124,6 @@ func (s *Store) Update(values Values) error {
 	normalizeDownload(&values.Download)
 	normalizeBot(&values.Bot)
 	normalizeReaction(&values.Reaction)
-	normalizeCleanup(&values.Cleanup)
 	if err := Validate(values); err != nil {
 		return err
 	}
@@ -209,9 +209,6 @@ func Validate(values Values) error {
 			return errors.New("触发表情仅支持普通 Unicode 表情")
 		}
 	}
-	if values.Cleanup.RetentionDays < 1 || values.Cleanup.RetentionDays > 3650 {
-		return errors.New("历史保留天数需在 1 至 3650 天之间")
-	}
 	return nil
 }
 
@@ -268,12 +265,6 @@ func normalizeDownload(download *Download) {
 	download.FileTypes = types
 }
 
-func normalizeCleanup(cleanup *Cleanup) {
-	if cleanup.RetentionDays == 0 {
-		cleanup.RetentionDays = Defaults().Cleanup.RetentionDays
-	}
-}
-
 func normalizeBot(bot *Bot) {
 	if len(bot.ControlUserIDs) == 0 && bot.ControlUserID != 0 {
 		bot.ControlUserIDs = []int64{bot.ControlUserID}
@@ -296,14 +287,15 @@ func normalizeReaction(reaction *Reaction) {
 	seen := make(map[string]struct{}, len(reaction.Emojis))
 	emojis := make([]string, 0, len(reaction.Emojis))
 	for _, emoji := range reaction.Emojis {
-		emoji = CanonicalReactionEmoji(strings.TrimSpace(emoji))
-		if emoji == "" {
+		emoji = strings.TrimSpace(emoji)
+		canonical := CanonicalReactionEmoji(emoji)
+		if canonical == "" {
 			continue
 		}
-		if _, ok := seen[emoji]; ok {
+		if _, ok := seen[canonical]; ok {
 			continue
 		}
-		seen[emoji] = struct{}{}
+		seen[canonical] = struct{}{}
 		emojis = append(emojis, emoji)
 	}
 	reaction.Emojis = emojis
@@ -314,6 +306,19 @@ func normalizeReaction(reaction *Reaction) {
 // browser stores ❤️; both represent the same standard emoji reaction.
 func CanonicalReactionEmoji(value string) string {
 	return strings.NewReplacer("\ufe0e", "", "\ufe0f", "").Replace(value)
+}
+
+// DisplayReactionEmoji keeps historical canonical values readable in clients
+// while newly saved values retain the user's original Unicode presentation.
+func DisplayReactionEmoji(value string) string {
+	if strings.ContainsAny(value, "\ufe0e\ufe0f") {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) == 1 && runes[0] >= 0x2600 && runes[0] <= 0x27BF {
+		return value + "\ufe0f"
+	}
+	return value
 }
 
 func validReactionEmoji(value string) bool {
