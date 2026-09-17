@@ -35,7 +35,7 @@ func TestPostgresSchemaAndAtomicItemIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db}
+	m := &Manager{db: db, progress: newProgressStore()}
 	if err := m.migratePostgres(); err != nil {
 		t.Fatalf("migratePostgres(): %v", err)
 	}
@@ -152,6 +152,7 @@ func TestPostgresChatControlsUpdateOnlyMediaIndex(t *testing.T) {
 	if err := m.PauseChat("control-chat"); err != nil {
 		t.Fatalf("PauseChat: %v", err)
 	}
+	assertChatStats(t, db, "control-chat", chatStats{discovered: 1, paused: 1})
 	assertStatus := func(table, id, want string) {
 		t.Helper()
 		var got string
@@ -168,6 +169,7 @@ func TestPostgresChatControlsUpdateOnlyMediaIndex(t *testing.T) {
 		t.Fatalf("CancelChat: %v", err)
 	}
 	assertStatus("chat_download_jobs", "control-chat", "cancelled")
+	assertChatStats(t, db, "control-chat", chatStats{discovered: 1, cancelled: 1})
 	if err := db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = 'control-chat' AND message_id = 1`).Scan(&itemStatus); err != nil || itemStatus != "cancelled" {
 		t.Fatalf("media status=%q err=%v", itemStatus, err)
 	}
@@ -189,6 +191,84 @@ func TestPostgresChatControlsUpdateOnlyMediaIndex(t *testing.T) {
 	var owner string
 	if err := db.QueryRow(`SELECT owner_id FROM downloaded_media WHERE dialog_key = 'channel:control' AND message_id = 1`).Scan(&owner); err != nil || owner != "control-chat" {
 		t.Fatalf("reclaimed owner=%q err=%v", owner, err)
+	}
+	assertChatStats(t, db, "control-chat", chatStats{discovered: 1, queued: 1})
+}
+
+type chatStats struct {
+	discovered, queued, waiting, running, downloaded, completed, failed, paused, cancelled int
+}
+
+func assertChatStats(t *testing.T, db *database, chatID string, want chatStats) {
+	t.Helper()
+	var got chatStats
+	err := db.QueryRow(`SELECT discovered, queued, waiting, running, downloaded, completed, failed, paused, cancelled FROM chat_download_stats WHERE chat_job_id = ?`, chatID).Scan(&got.discovered, &got.queued, &got.waiting, &got.running, &got.downloaded, &got.completed, &got.failed, &got.paused, &got.cancelled)
+	if err != nil || got != want {
+		t.Fatalf("chat stats for %s = %#v err=%v, want %#v", chatID, got, err, want)
+	}
+}
+
+// Statement-level summary triggers must handle the mixed bulk transitions
+// used by pause, retry, recovery, and purge without a caller maintaining
+// fragile per-file counter deltas.
+func TestPostgresChatStatsTrackBulkTransitionsAndDeletes(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('stats-chat','tg://chat','channel','channel:stats',1,'stats','account','downloading','completed','{}',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, status, discovered_at) VALUES
+ ('stats-chat','channel:stats',10,'a','queued',?),
+ ('stats-chat','channel:stats',9,'b','waiting',?),
+ ('stats-chat','channel:stats',8,'c','running',?),
+ ('stats-chat','channel:stats',7,'d','completed',?)`, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	assertChatStats(t, db, "stats-chat", chatStats{discovered: 4, queued: 1, waiting: 1, running: 1, completed: 1})
+	job, err := m.GetChat("stats-chat")
+	if err != nil || job.Discovered != 4 || job.Completed != 1 || job.Failed != 0 || job.EarliestMediaID != 7 {
+		t.Fatalf("GetChat summary=%#v err=%v", job, err)
+	}
+	if err := m.loadVisibleCounts(); err != nil {
+		t.Fatal(err)
+	}
+	jobs, total, _, err := m.ListChats("", 10)
+	if err != nil || total != 1 || len(jobs) != 1 || jobs[0].Discovered != 4 || jobs[0].Completed != 1 || jobs[0].EarliestMediaID != 7 {
+		t.Fatalf("ListChats jobs=%#v total=%d err=%v", jobs, total, err)
+	}
+	if _, err := db.Exec(`UPDATE chat_download_items SET status = 'paused' WHERE chat_job_id = 'stats-chat' AND status IN ('queued', 'running')`); err != nil {
+		t.Fatal(err)
+	}
+	assertChatStats(t, db, "stats-chat", chatStats{discovered: 4, waiting: 1, completed: 1, paused: 2})
+	if _, err := db.Exec(`UPDATE chat_download_items SET status = 'queued' WHERE chat_job_id = 'stats-chat' AND status IN ('paused', 'waiting')`); err != nil {
+		t.Fatal(err)
+	}
+	assertChatStats(t, db, "stats-chat", chatStats{discovered: 4, queued: 3, completed: 1})
+	if _, err := db.Exec(`DELETE FROM chat_download_items WHERE chat_job_id = 'stats-chat' AND message_id = 10`); err != nil {
+		t.Fatal(err)
+	}
+	assertChatStats(t, db, "stats-chat", chatStats{discovered: 3, queued: 2, completed: 1})
+	if _, err := db.Exec(`DELETE FROM chat_download_jobs WHERE id = 'stats-chat'`); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_stats WHERE chat_job_id = 'stats-chat'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("purged summary rows=%d err=%v, want 0", count, err)
 	}
 }
 

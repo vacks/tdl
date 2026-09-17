@@ -111,6 +111,9 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 		}
 		return ChatJob{}, err
 	}
+	if _, err := tx.Exec(`INSERT INTO chat_download_stats(chat_job_id, updated_at) VALUES (?, ?)`, job.ID, now); err != nil {
+		return ChatJob{}, err
+	}
 	for _, kind := range chatStreamKinds {
 		if _, err := tx.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind) VALUES (?, ?)`, job.ID, kind); err != nil {
 			return ChatJob{}, err
@@ -131,15 +134,15 @@ func boolInt(value bool) int {
 	return 0
 }
 
-// GetChat returns one parent task together with aggregate state from its
-// child download jobs. Individual media rows are deliberately not loaded here.
+// GetChat returns one parent task and its transactionally maintained summary.
+// Individual media rows are deliberately not loaded here.
 func (m *Manager) GetChat(id string) (ChatJob, error) {
 	var job ChatJob
 	var listen int
 	err := m.db.QueryRow(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
- COUNT(i.message_id), COALESCE(SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END), 0), COALESCE(MIN(i.message_id), 0)
- FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id
-	WHERE c.id = ? GROUP BY c.id`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed, &job.EarliestMediaID)
+ COALESCE(s.discovered, 0), COALESCE(s.completed, 0), COALESCE(s.failed, 0), COALESCE(s.earliest_message_id, 0)
+ FROM chat_download_jobs c LEFT JOIN chat_download_stats s ON s.chat_job_id = c.id
+	WHERE c.id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed, &job.EarliestMediaID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ChatJob{}, errors.New("会话下载任务不存在")
 	}
@@ -167,13 +170,12 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 		where += " AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))"
 		args = []any{ChatStatusDeleted, createdAt, createdAt, id, pageSize + 1}
 	}
-	// Page the parent jobs before touching their potentially very large media
-	// indexes. A grouped join followed by LIMIT can otherwise aggregate every
-	// historical row just to render ten task cards.
+	// The media index can be millions of rows. Its derived one-row summary is
+	// maintained transactionally, so list rendering never aggregates history.
 	rows, err := m.db.Query(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
-	COALESCE(summary.discovered, 0), COALESCE(summary.completed, 0), COALESCE(summary.failed, 0), COALESCE(summary.earliest, 0)
+	COALESCE(s.discovered, 0), COALESCE(s.completed, 0), COALESCE(s.failed, 0), COALESCE(s.earliest_message_id, 0)
 FROM (SELECT * FROM chat_download_jobs c `+where+` ORDER BY created_at DESC, id DESC LIMIT ?) c
-	LEFT JOIN LATERAL (SELECT COUNT(message_id) AS discovered, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed, MIN(message_id) AS earliest FROM chat_download_items WHERE chat_job_id = c.id) summary ON true
+	LEFT JOIN chat_download_stats s ON s.chat_job_id = c.id
 	ORDER BY c.created_at DESC, c.id DESC`, args...)
 	if err != nil {
 		return nil, 0, "", err
@@ -1188,17 +1190,13 @@ func (m *Manager) refreshChatStates() {
 	// Only an actively draining history queue needs aggregation. Completed and
 	// listening-only tasks are stable; a newly persisted listener event switches
 	// its parent back to downloading in registerChatMedia.
-	// Query every active parent in one indexed aggregation. The old loop ran a
-	// separate full per-chat aggregate every worker cadence, which becomes
-	// needlessly expensive when several large histories drain concurrently.
+	// Query one compact cached summary per active parent. Its trigger-maintained
+	// counters cover all single-item and batch state transitions atomically.
 	rows, err := m.db.Query(`SELECT j.id, j.listen_new, j.status,
-	COALESCE(SUM(CASE WHEN i.status IN ('queued', 'running', 'downloaded') THEN 1 ELSE 0 END), 0),
-	COALESCE(SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END), 0),
-	COALESCE(SUM(CASE WHEN i.status = 'queued' THEN 1 ELSE 0 END), 0)
-FROM chat_download_jobs j
-LEFT JOIN chat_download_items i ON i.chat_job_id = j.id AND i.status IN ('queued', 'running', 'downloaded', 'failed')
-WHERE j.status = ? AND j.scan_state = ?
-GROUP BY j.id, j.listen_new, j.status`, ChatStatusDownloading, chatScanCompleted)
+	COALESCE(s.queued, 0) + COALESCE(s.running, 0) + COALESCE(s.downloaded, 0),
+	COALESCE(s.failed, 0), COALESCE(s.queued, 0)
+FROM chat_download_jobs j LEFT JOIN chat_download_stats s ON s.chat_job_id = j.id
+WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanCompleted)
 	if err != nil {
 		return
 	}
@@ -1352,7 +1350,7 @@ func (m *Manager) SetChatListening(id string, enabled bool) error {
 		next := target.Status
 		if target.Status == ChatStatusListening {
 			var failed int
-			if err := m.db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = ? AND status = 'failed'`, id).Scan(&failed); err != nil {
+			if err := m.db.QueryRow(`SELECT COALESCE(failed, 0) FROM chat_download_stats WHERE chat_job_id = ?`, id).Scan(&failed); err != nil {
 				return err
 			}
 			if failed > 0 {

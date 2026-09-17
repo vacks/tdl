@@ -39,6 +39,12 @@ func (m *Manager) migratePostgres() error {
 		`CREATE TABLE IF NOT EXISTS chat_download_items (
  chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '', dialog_type TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, grouped_id BIGINT NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL DEFAULT '', size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'queued', error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 )`,
+		// chat_download_stats is a derived, rebuildable cache for presentation and
+		// parent-state decisions. chat_download_items remains the only source of
+		// truth for file ownership, de-duplication, and recovery.
+		`CREATE TABLE IF NOT EXISTS chat_download_stats (
+ chat_job_id TEXT PRIMARY KEY, discovered BIGINT NOT NULL DEFAULT 0, queued BIGINT NOT NULL DEFAULT 0, waiting BIGINT NOT NULL DEFAULT 0, running BIGINT NOT NULL DEFAULT 0, downloaded BIGINT NOT NULL DEFAULT 0, completed BIGINT NOT NULL DEFAULT 0, failed BIGINT NOT NULL DEFAULT 0, paused BIGINT NOT NULL DEFAULT 0, cancelled BIGINT NOT NULL DEFAULT 0, earliest_message_id INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '', FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+)`,
 		`CREATE TABLE IF NOT EXISTS chat_download_streams (
  chat_job_id TEXT NOT NULL, stream_kind TEXT NOT NULL, offset_message_id INTEGER NOT NULL DEFAULT 0, initialized SMALLINT NOT NULL DEFAULT 0, completed SMALLINT NOT NULL DEFAULT 0, PRIMARY KEY(chat_job_id, stream_kind), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 	)`,
@@ -183,6 +189,79 @@ var postgresMigrations = []postgresMigration{
 		statements: []string{
 			`CREATE INDEX IF NOT EXISTS chat_download_items_active_status ON chat_download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
 			`CREATE INDEX IF NOT EXISTS chat_download_items_state_by_job ON chat_download_items(chat_job_id, status) WHERE status IN ('queued', 'running', 'downloaded', 'failed')`,
+		},
+	},
+	{
+		// v10 replaces repeated full chat-item aggregates in the Web and Bot
+		// presentation paths with a transactionally-maintained, rebuildable
+		// summary. Statement-level triggers cover every existing direct item SQL
+		// update, including batch pause/cancel/recovery operations, without
+		// requiring each caller to remember a hand-written counter delta.
+		version: 10,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS chat_download_stats (
+ chat_job_id TEXT PRIMARY KEY, discovered BIGINT NOT NULL DEFAULT 0, queued BIGINT NOT NULL DEFAULT 0, waiting BIGINT NOT NULL DEFAULT 0, running BIGINT NOT NULL DEFAULT 0, downloaded BIGINT NOT NULL DEFAULT 0, completed BIGINT NOT NULL DEFAULT 0, failed BIGINT NOT NULL DEFAULT 0, paused BIGINT NOT NULL DEFAULT 0, cancelled BIGINT NOT NULL DEFAULT 0, earliest_message_id INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '', FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+)`,
+			`CREATE OR REPLACE FUNCTION tdl_chat_stats_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ INSERT INTO chat_download_stats(chat_job_id, discovered, queued, waiting, running, downloaded, completed, failed, paused, cancelled, earliest_message_id, updated_at)
+ SELECT chat_job_id, COUNT(*), COUNT(*) FILTER (WHERE status = 'queued'), COUNT(*) FILTER (WHERE status = 'waiting'), COUNT(*) FILTER (WHERE status = 'running'), COUNT(*) FILTER (WHERE status = 'downloaded'), COUNT(*) FILTER (WHERE status = 'completed'), COUNT(*) FILTER (WHERE status = 'failed'), COUNT(*) FILTER (WHERE status = 'paused'), COUNT(*) FILTER (WHERE status = 'cancelled'), MIN(message_id), NOW()::text
+ FROM new_rows GROUP BY chat_job_id
+ ON CONFLICT (chat_job_id) DO UPDATE SET
+  discovered = chat_download_stats.discovered + EXCLUDED.discovered,
+  queued = chat_download_stats.queued + EXCLUDED.queued,
+  waiting = chat_download_stats.waiting + EXCLUDED.waiting,
+  running = chat_download_stats.running + EXCLUDED.running,
+  downloaded = chat_download_stats.downloaded + EXCLUDED.downloaded,
+  completed = chat_download_stats.completed + EXCLUDED.completed,
+  failed = chat_download_stats.failed + EXCLUDED.failed,
+  paused = chat_download_stats.paused + EXCLUDED.paused,
+  cancelled = chat_download_stats.cancelled + EXCLUDED.cancelled,
+  earliest_message_id = CASE WHEN chat_download_stats.earliest_message_id = 0 THEN EXCLUDED.earliest_message_id ELSE LEAST(chat_download_stats.earliest_message_id, EXCLUDED.earliest_message_id) END,
+  updated_at = EXCLUDED.updated_at;
+ RETURN NULL;
+END $$`,
+			`CREATE OR REPLACE FUNCTION tdl_chat_stats_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ WITH delta AS (
+  SELECT chat_job_id, COUNT(*) AS discovered, COUNT(*) FILTER (WHERE status = 'queued') AS queued, COUNT(*) FILTER (WHERE status = 'waiting') AS waiting, COUNT(*) FILTER (WHERE status = 'running') AS running, COUNT(*) FILTER (WHERE status = 'downloaded') AS downloaded, COUNT(*) FILTER (WHERE status = 'completed') AS completed, COUNT(*) FILTER (WHERE status = 'failed') AS failed, COUNT(*) FILTER (WHERE status = 'paused') AS paused, COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled
+  FROM old_rows GROUP BY chat_job_id
+ )
+ UPDATE chat_download_stats s SET
+  discovered = GREATEST(0, s.discovered - d.discovered), queued = GREATEST(0, s.queued - d.queued), waiting = GREATEST(0, s.waiting - d.waiting), running = GREATEST(0, s.running - d.running), downloaded = GREATEST(0, s.downloaded - d.downloaded), completed = GREATEST(0, s.completed - d.completed), failed = GREATEST(0, s.failed - d.failed), paused = GREATEST(0, s.paused - d.paused), cancelled = GREATEST(0, s.cancelled - d.cancelled), updated_at = NOW()::text
+ FROM delta d WHERE s.chat_job_id = d.chat_job_id;
+ RETURN NULL;
+END $$`,
+			`CREATE OR REPLACE FUNCTION tdl_chat_stats_update() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ WITH delta AS (
+  SELECT n.chat_job_id,
+   COUNT(*) FILTER (WHERE n.status = 'queued') - COUNT(*) FILTER (WHERE o.status = 'queued') AS queued,
+   COUNT(*) FILTER (WHERE n.status = 'waiting') - COUNT(*) FILTER (WHERE o.status = 'waiting') AS waiting,
+   COUNT(*) FILTER (WHERE n.status = 'running') - COUNT(*) FILTER (WHERE o.status = 'running') AS running,
+   COUNT(*) FILTER (WHERE n.status = 'downloaded') - COUNT(*) FILTER (WHERE o.status = 'downloaded') AS downloaded,
+   COUNT(*) FILTER (WHERE n.status = 'completed') - COUNT(*) FILTER (WHERE o.status = 'completed') AS completed,
+   COUNT(*) FILTER (WHERE n.status = 'failed') - COUNT(*) FILTER (WHERE o.status = 'failed') AS failed,
+   COUNT(*) FILTER (WHERE n.status = 'paused') - COUNT(*) FILTER (WHERE o.status = 'paused') AS paused,
+   COUNT(*) FILTER (WHERE n.status = 'cancelled') - COUNT(*) FILTER (WHERE o.status = 'cancelled') AS cancelled
+  FROM new_rows n JOIN old_rows o USING (chat_job_id, dialog_key, message_id)
+  GROUP BY n.chat_job_id
+ )
+ UPDATE chat_download_stats s SET
+  queued = s.queued + d.queued, waiting = s.waiting + d.waiting, running = s.running + d.running, downloaded = s.downloaded + d.downloaded, completed = s.completed + d.completed, failed = s.failed + d.failed, paused = s.paused + d.paused, cancelled = s.cancelled + d.cancelled, updated_at = NOW()::text
+ FROM delta d WHERE s.chat_job_id = d.chat_job_id;
+ RETURN NULL;
+END $$`,
+			`DROP TRIGGER IF EXISTS tdl_chat_stats_insert_trigger ON chat_download_items`,
+			`DROP TRIGGER IF EXISTS tdl_chat_stats_delete_trigger ON chat_download_items`,
+			`DROP TRIGGER IF EXISTS tdl_chat_stats_update_trigger ON chat_download_items`,
+			`CREATE TRIGGER tdl_chat_stats_insert_trigger AFTER INSERT ON chat_download_items REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION tdl_chat_stats_insert()`,
+			`CREATE TRIGGER tdl_chat_stats_delete_trigger AFTER DELETE ON chat_download_items REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION tdl_chat_stats_delete()`,
+			`CREATE TRIGGER tdl_chat_stats_update_trigger AFTER UPDATE ON chat_download_items REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION tdl_chat_stats_update()`,
+			`INSERT INTO chat_download_stats(chat_job_id, discovered, queued, waiting, running, downloaded, completed, failed, paused, cancelled, earliest_message_id, updated_at)
+ SELECT c.id, COUNT(i.message_id), COUNT(*) FILTER (WHERE i.status = 'queued'), COUNT(*) FILTER (WHERE i.status = 'waiting'), COUNT(*) FILTER (WHERE i.status = 'running'), COUNT(*) FILTER (WHERE i.status = 'downloaded'), COUNT(*) FILTER (WHERE i.status = 'completed'), COUNT(*) FILTER (WHERE i.status = 'failed'), COUNT(*) FILTER (WHERE i.status = 'paused'), COUNT(*) FILTER (WHERE i.status = 'cancelled'), COALESCE(MIN(i.message_id), 0), NOW()::text
+ FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id GROUP BY c.id
+ ON CONFLICT (chat_job_id) DO UPDATE SET discovered = EXCLUDED.discovered, queued = EXCLUDED.queued, waiting = EXCLUDED.waiting, running = EXCLUDED.running, downloaded = EXCLUDED.downloaded, completed = EXCLUDED.completed, failed = EXCLUDED.failed, paused = EXCLUDED.paused, cancelled = EXCLUDED.cancelled, earliest_message_id = EXCLUDED.earliest_message_id, updated_at = EXCLUDED.updated_at`,
 		},
 	},
 }

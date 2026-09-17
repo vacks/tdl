@@ -687,7 +687,7 @@ func (m *Manager) Summary() (active, failedItems int) {
 	// session download is active.
 	_ = m.db.QueryRow(`SELECT
  (SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')) +
- (SELECT COUNT(1) FROM chat_download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused'))`).Scan(&active)
+ (SELECT COALESCE(SUM(queued + waiting + running + downloaded + paused), 0) FROM chat_download_stats)`).Scan(&active)
 	sevenDaysAgo := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
 	_ = m.db.QueryRow(`SELECT
  (SELECT COUNT(1) FROM download_items WHERE status = 'failed' AND finished_at >= ?) +
