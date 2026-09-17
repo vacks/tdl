@@ -108,6 +108,7 @@ type listPageState struct {
 	next     string
 	previous []string
 	page     int
+	updated  time.Time
 }
 type helpRetry struct {
 	next     time.Time
@@ -118,6 +119,12 @@ const (
 	botRequestTimeout  = 12 * time.Second
 	botLongPollTimeout = 25 * time.Second
 	botPollHTTPTimeout = 35 * time.Second
+	// List navigation is convenience state only: canonical tasks remain in
+	// PostgreSQL. Bound both its lifetime and its per-message cursor history so
+	// a long-running Bot cannot retain unbounded memory from old list cards.
+	listPageTTL        = 30 * time.Minute
+	maxListPageEntries = 256
+	maxListPageHistory = 64
 )
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
@@ -236,6 +243,7 @@ func (s *Service) refreshLoop() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
+		s.pruneListPages(time.Now())
 		cfg := s.settings.Get().Bot
 		if cfg.Enabled && strings.TrimSpace(cfg.Token) != "" && len(cfg.ControlUserIDs) > 0 {
 			s.refresh(cfg)
@@ -1051,19 +1059,60 @@ func listPageKey(kind string, chatID, messageID int64) string {
 func (s *Service) getListPage(kind string, chatID, messageID int64) (listPageState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state, ok := s.listPages[listPageKey(kind, chatID, messageID)]
+	now := time.Now()
+	s.pruneListPagesLocked(now)
+	key := listPageKey(kind, chatID, messageID)
+	state, ok := s.listPages[key]
+	if ok {
+		state.updated = now
+		s.listPages[key] = state
+	}
 	return state, ok
 }
 
 func (s *Service) hasListPage(kind string, chatID, messageID int64) bool {
-	_, ok := s.getListPage(kind, chatID, messageID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneListPagesLocked(time.Now())
+	_, ok := s.listPages[listPageKey(kind, chatID, messageID)]
 	return ok
 }
 
 func (s *Service) putListPage(kind string, chatID, messageID int64, state listPageState) {
 	s.mu.Lock()
-	s.listPages[listPageKey(kind, chatID, messageID)] = state
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.pruneListPagesLocked(now)
+	if len(state.previous) > maxListPageHistory {
+		state.previous = append([]string(nil), state.previous[len(state.previous)-maxListPageHistory:]...)
+	}
+	state.updated = now
+	key := listPageKey(kind, chatID, messageID)
+	s.listPages[key] = state
+	for len(s.listPages) > maxListPageEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for candidate, current := range s.listPages {
+			if oldestKey == "" || current.updated.Before(oldest) {
+				oldestKey, oldest = candidate, current.updated
+			}
+		}
+		delete(s.listPages, oldestKey)
+	}
+}
+
+func (s *Service) pruneListPages(now time.Time) {
+	s.mu.Lock()
+	s.pruneListPagesLocked(now)
 	s.mu.Unlock()
+}
+
+func (s *Service) pruneListPagesLocked(now time.Time) {
+	for key, state := range s.listPages {
+		if state.updated.IsZero() || !now.Before(state.updated.Add(listPageTTL)) {
+			delete(s.listPages, key)
+		}
+	}
 }
 
 func moveListPage(state listPageState, direction string) (listPageState, bool) {

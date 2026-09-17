@@ -201,6 +201,33 @@ func TestListPageStateMovesByCursorWithoutOffsets(t *testing.T) {
 	}
 }
 
+func TestListPageStateExpiresAndIsBounded(t *testing.T) {
+	s := &Service{listPages: map[string]listPageState{}}
+	now := time.Now()
+	s.listPages["expired"] = listPageState{updated: now.Add(-listPageTTL)}
+	s.listPages["fresh"] = listPageState{updated: now.Add(-listPageTTL + time.Second)}
+	s.pruneListPages(now)
+	if _, ok := s.listPages["expired"]; ok {
+		t.Fatal("expired list page was retained")
+	}
+	if _, ok := s.listPages["fresh"]; !ok {
+		t.Fatal("fresh list page was removed")
+	}
+
+	for index := 0; index < maxListPageEntries+1; index++ {
+		s.putListPage("task", int64(index), int64(index), listPageState{kind: "task", page: 1})
+	}
+	if len(s.listPages) != maxListPageEntries {
+		t.Fatalf("list page entries=%d, want %d", len(s.listPages), maxListPageEntries)
+	}
+	history := make([]string, maxListPageHistory+5)
+	s.putListPage("task", 999, 999, listPageState{kind: "task", page: 1, previous: history})
+	state, ok := s.getListPage("task", 999, 999)
+	if !ok || len(state.previous) != maxListPageHistory {
+		t.Fatalf("history length=%d exists=%v, want %d/true", len(state.previous), ok, maxListPageHistory)
+	}
+}
+
 func TestTaskSourcePresentation(t *testing.T) {
 	tests := []struct {
 		name string
