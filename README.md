@@ -48,7 +48,7 @@
 
 ```dotenv
 TDL_ADMIN_USERNAME=admin
-TDL_ADMIN_INITIAL_PASSWORD=替换为强管理员密码
+TDL_ADMIN_INITIAL_PASSWORD=admin
 
 TDL_DATA_DIR=/data
 TDL_DOWNLOAD_DIR=/downloads
@@ -71,6 +71,22 @@ TDL_TRUST_PROXY=false
 
 ```yaml
 services:
+  permissions:
+    image: alpine:3.21
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /data /downloads
+        chown -R 65532:65532 /data
+        chown 65532:65532 /downloads
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    networks: [internal]
+    restart: "no"
+
   postgres:
     image: postgres:17-alpine
     env_file: .env
@@ -103,6 +119,8 @@ services:
       - ./downloads:/downloads
     networks: [internal]
     depends_on:
+      permissions:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     restart: unless-stopped
@@ -128,7 +146,9 @@ git pull
 docker compose up -d --build
 ```
 
-访问 `http://127.0.0.1:8080`，使用 `.env` 中的管理员账号和首次密码登录。`TDL_ADMIN_INITIAL_PASSWORD` 每次启动都必须非空，但仅在 `data/admin.json` 不存在时用于创建管理员；之后以 Web 中修改后的密码为准。
+访问 `http://127.0.0.1:8080`，默认管理员账号和首次密码均为 `admin`。`TDL_ADMIN_INITIAL_PASSWORD` 仅在 `data/admin.json` 不存在时用于创建管理员；账户创建后，Web 中保存的密码始终优先于 `.env` 的该值。
+
+`permissions` 是一次性权限初始化服务：它只将 `data/` 与 `downloads/` 交给应用容器的非 root 用户。这样在 Linux、NAS 和 macOS 上都不会因为宿主机挂载权限导致首次启动失败；`.env` 不会被容器修改。
 
 NAS 若不支持相对挂载，直接把 `./data`、`./postgres`、`./downloads` 改为绝对路径，例如 `/volume1/docker/tdl/data:/data`、`/volume1/docker/tdl/postgres:/var/lib/postgresql/data`、`/volume1/downloads/telegram:/downloads`。容器内的 `/data`、`/downloads` 和 PostgreSQL 目标路径不要改。
 
@@ -186,7 +206,7 @@ TDL_TRUST_PROXY=true
 | 变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `TDL_ADMIN_USERNAME` | 是 | `admin` | 首次创建的管理员名称；之后改此值不会改已有账户 |
-| `TDL_ADMIN_INITIAL_PASSWORD` | 是 | 无 | 首次创建密码；每次启动仍需提供非空值 |
+| `TDL_ADMIN_INITIAL_PASSWORD` | 否 | `admin` | 仅在首次创建管理员时使用；创建后由 Web 已保存密码接管 |
 | `TDL_DATA_DIR` | 是 | `/data` | 会话、配置和管理员信息目录 |
 | `TDL_DOWNLOAD_DIR` | 是 | `/downloads` | 最终下载文件目录 |
 | `TDL_LISTEN_ADDR` | 否 | `:8080` | HTTP 监听地址 |

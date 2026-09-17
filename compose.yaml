@@ -1,4 +1,26 @@
 services:
+  permissions:
+    # The application image deliberately runs without root privileges. Prepare
+    # only its bind-mounted writable paths once, so the same Stack works on
+    # Docker Engine, NAS Compose panels and macOS desktop runtimes.
+    image: alpine:3.21
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /data /downloads
+        # data is small application state and may come from an older root-run
+        # image; downloaded files can be huge, so only its directory itself
+        # changes owner and every existing final file is left untouched.
+        chown -R 65532:65532 /data
+        chown 65532:65532 /downloads
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    networks: [internal]
+    restart: "no"
+
   postgres:
     image: postgres:17-alpine
     env_file: .env
@@ -31,6 +53,8 @@ services:
       - ./downloads:/downloads
     networks: [internal]
     depends_on:
+      permissions:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     restart: unless-stopped

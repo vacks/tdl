@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"time"
 
 	"github.com/vacks/tdl/internal/applog"
@@ -17,20 +18,33 @@ type CleanupResult struct {
 	Requests       int64 `json:"requests"`
 	Events         int64 `json:"events"`
 	ReactionEvents int64 `json:"reactionEvents"`
+	ChatMessages   int64 `json:"chatMessages"`
 	Resets         int64 `json:"resets"`
 	BotMessages    int64 `json:"botMessages"`
 }
 
-func (m *Manager) cleanupLoop() {
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-	for range ticker.C {
+func (m *Manager) cleanupLoop(ctx context.Context) {
+	run := func() {
+		// Auxiliary event/audit data is intentionally cleaned in the background.
+		// A first pass at startup makes the 30-day retention policy effective
+		// even for installations that restart more often than once per day.
 		result, err := m.cleanupPostgresHistory(auxiliaryHistoryRetentionDays)
 		if err != nil {
 			applog.Error("cleanup", "scheduled_cleanup_failed", "error", err.Error())
-			continue
+			return
 		}
-		applog.Info("cleanup", "scheduled_cleanup_completed", "retention_days", auxiliaryHistoryRetentionDays, "jobs", result.Jobs, "events", result.Events)
+		applog.Info("cleanup", "scheduled_cleanup_completed", "retention_days", auxiliaryHistoryRetentionDays, "events", result.Events, "chat_messages", result.ChatMessages)
+	}
+	run()
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
 	}
 }
 
@@ -68,6 +82,16 @@ func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, erro
 		}
 	}
 	for {
+		count, err := m.cleanupPostgresBatch(`DELETE FROM chat_message_inbox WHERE id IN (SELECT id FROM chat_message_inbox WHERE status IN ('done', 'failed') AND updated_at < ? ORDER BY id LIMIT ?)`, cutoff)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+		result.ChatMessages += count
+		if count == 0 {
+			break
+		}
+	}
+	for {
 		count, err := m.cleanupPostgresBatch(`DELETE FROM download_resets WHERE (account_id, source_url) IN (SELECT account_id, source_url FROM download_resets WHERE created_at < ? ORDER BY created_at LIMIT ?)`, cutoff)
 		if err != nil {
 			return CleanupResult{}, err
@@ -87,7 +111,7 @@ func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, erro
 			break
 		}
 	}
-	if result.Events > 0 || result.Requests > 0 || result.ReactionEvents > 0 || result.Resets > 0 || result.BotMessages > 0 {
+	if result.Events > 0 || result.Requests > 0 || result.ReactionEvents > 0 || result.ChatMessages > 0 || result.Resets > 0 || result.BotMessages > 0 {
 		m.touch()
 	}
 	return result, nil

@@ -28,26 +28,29 @@ type Store struct {
 	data account
 }
 
-func Open(dataDir, username, initialPassword string) (*Store, error) {
+func Open(dataDir, username, initialPassword string) (*Store, bool, error) {
 	s := &Store{path: filepath.Join(dataDir, accountFile)}
 	if data, err := os.ReadFile(s.path); err == nil {
 		if err := json.Unmarshal(data, &s.data); err != nil {
-			return nil, fmt.Errorf("read administrator account: %w", err)
+			return nil, false, fmt.Errorf("read administrator account: %w", err)
 		}
-		return s, nil
+		return s, false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, false, err
+	}
+	if strings.TrimSpace(initialPassword) == "" {
+		return nil, false, errors.New("TDL_ADMIN_INITIAL_PASSWORD is required before the administrator is initialized")
 	}
 
 	hash, err := hash(initialPassword)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	s.data = account{Username: username, PasswordHash: hash}
 	if err := s.save(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return s, nil
+	return s, true, nil
 }
 
 func (s *Store) Verify(username, password string) bool {

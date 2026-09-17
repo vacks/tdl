@@ -68,6 +68,7 @@ type ReactionEvent struct {
 // usernames or public links (both may be unavailable for private groups).
 type NewMessageEvent struct {
 	AccountID  string
+	DialogKey  string
 	DialogID   int64
 	DialogName string
 	MessageID  int
@@ -427,18 +428,27 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 		if !ok {
 			return
 		}
-		input, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
-		if err != nil {
-			applog.Info("chat_download", "new_message_peer_extract_failed", "account_id", accountID, "message_id", message.ID, "error", err.Error())
-			return
-		}
+		input, extractErr := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
 		name := "会话"
 		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
 		if peer, err := manager.ResolvePeer(updateCtx, message.PeerID); err == nil {
 			input, name = peer.InputPeer(), peer.VisibleName()
+		} else if extractErr != nil {
+			// Telegram occasionally omits an entity from an otherwise valid
+			// update. The persistent peer cache can still resolve it; only drop
+			// the event when both sources fail, rather than losing a watched
+			// message merely because this particular update was incomplete.
+			// Keep the raw stable identity. A watched private group/channel has
+			// its authoritative InputPeer saved with its chat task, so downstream
+			// code can restore that peer even when this update omitted entities.
+			kind, id := peerIdentity(message.PeerID)
+			key := kind + ":" + fmt.Sprint(id)
+			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID})
+			return
 		}
 		dialogID, _ := inputPeerInfo(input)
-		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input})
+		key := newMessageDialogKey(input, accountID)
+		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input})
 	}
 	dispatcher.OnNewMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 		dispatchMessage(updateCtx, entities, update.Message)
@@ -593,6 +603,21 @@ func inputPeerInfo(input tg.InputPeerClass) (int64, string) {
 		return peer.ChannelID, "频道"
 	default:
 		return 0, "会话"
+	}
+}
+
+func newMessageDialogKey(input tg.InputPeerClass, accountID string) string {
+	switch peer := input.(type) {
+	case *tg.InputPeerSelf:
+		return "self:" + accountID
+	case *tg.InputPeerUser:
+		return fmt.Sprintf("user:%d", peer.UserID)
+	case *tg.InputPeerChat:
+		return fmt.Sprintf("chat:%d", peer.ChatID)
+	case *tg.InputPeerChannel:
+		return fmt.Sprintf("channel:%d", peer.ChannelID)
+	default:
+		return ""
 	}
 }
 

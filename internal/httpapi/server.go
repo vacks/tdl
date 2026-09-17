@@ -56,9 +56,12 @@ type loginAttempt struct {
 }
 
 func New(cfg config.Config) (*Server, error) {
-	accounts, err := auth.Open(cfg.DataDir, cfg.AdminUsername, cfg.InitialPassword)
+	accounts, initialized, err := auth.Open(cfg.DataDir, cfg.AdminUsername, cfg.InitialPassword)
 	if err != nil {
 		return nil, err
+	}
+	if initialized {
+		applog.Info("auth", "administrator_initialized")
 	}
 	settingsStore, err := settings.Open(cfg.DataDir)
 	if err != nil {

@@ -56,14 +56,14 @@ func TestChatTaskPresentationMirrorsWebRangeRules(t *testing.T) {
 }
 
 func TestChatTaskKeyboardExposesPurgeForTerminalTask(t *testing.T) {
-	keys := chatTaskKeyboard(download.ChatJob{ID: "chat-1", Status: "completed"}, 2)
+	keys := chatTaskKeyboard(download.ChatJob{ID: "chat-1", Status: "completed"}, true)
 	joined := ""
 	for _, row := range keys {
 		for _, key := range row {
 			joined += key.CallbackData + " "
 		}
 	}
-	for _, want := range []string{"c:t:chat-1:delete:2", "c:t:chat-1:purge:2", "c:t:chat-1:listenon:2", "c:l:2"} {
+	for _, want := range []string{"c:t:chat-1:delete", "c:t:chat-1:purge", "c:t:chat-1:listenon", "c:l:back"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("chatTaskKeyboard() missing %q: %s", want, joined)
 		}
@@ -159,14 +159,14 @@ func TestTaskPresentationContainsEscapedProgressAndActions(t *testing.T) {
 			t.Errorf("taskText missing %q: %s", want, text)
 		}
 	}
-	keys := taskKeyboard(job, 2)
+	keys := taskKeyboard(job, true)
 	joined := ""
 	for _, row := range keys {
 		for _, button := range row {
 			joined += button.CallbackData + " "
 		}
 	}
-	for _, want := range []string{"t:job-1:pause:2", "t:job-1:cancel:2", "t:job-1:view:2", "l:2"} {
+	for _, want := range []string{"t:job-1:pause", "t:job-1:cancel", "t:job-1:view", "l:back"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("taskKeyboard missing %q: %s", want, joined)
 		}
@@ -182,9 +182,22 @@ func TestLifecycleAndDeletedMessagesKeepExpectedControls(t *testing.T) {
 	if !strings.Contains(deleted, "任务已删除") || !strings.Contains(deleted, "2/2 文件") {
 		t.Fatalf("deletedTaskText() = %q", deleted)
 	}
-	keyboard := deletedTaskKeyboard(3)
-	if len(keyboard) != 1 || keyboard[0][0].CallbackData != "l:3" {
+	keyboard := deletedTaskKeyboard(true)
+	if len(keyboard) != 1 || keyboard[0][0].CallbackData != "l:back" {
 		t.Fatalf("deletedTaskKeyboard() = %#v", keyboard)
+	}
+}
+
+func TestListPageStateMovesByCursorWithoutOffsets(t *testing.T) {
+	state := listPageState{kind: "task", page: 1, next: "cursor-2"}
+	next, ok := moveListPage(state, "next")
+	if !ok || next.page != 2 || next.cursor != "cursor-2" || len(next.previous) != 1 || next.previous[0] != "" {
+		t.Fatalf("next state = %#v", next)
+	}
+	next.next = "cursor-3"
+	previous, ok := moveListPage(next, "prev")
+	if !ok || previous.page != 1 || previous.cursor != "" || len(previous.previous) != 0 {
+		t.Fatalf("previous state = %#v", previous)
 	}
 }
 

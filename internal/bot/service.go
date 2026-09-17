@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,6 +54,7 @@ type Service struct {
 	known       map[string]string
 	tracked     map[string]trackedRef
 	chatTracked map[string]chatTrackedRef
+	listPages   map[string]listPageState
 	// lifecycle keeps the one notification card for a job in each authorized
 	// chat. The card is edited as the job advances instead of sending a new
 	// Bot message for every state transition.
@@ -94,8 +94,20 @@ type trackedRef struct {
 }
 type chatTrackedRef struct {
 	JobID string
-	Page  int
 	messageRef
+}
+
+// listPageState is deliberately kept server-side. Telegram callback data is
+// limited to 64 bytes, while a safe database cursor plus task ID and filters
+// does not fit. Keeping the small navigation stack per Bot message lets both
+// message and chat lists use keyset pagination without OFFSET scans.
+type listPageState struct {
+	kind     string
+	status   string
+	cursor   string
+	next     string
+	previous []string
+	page     int
 }
 type helpRetry struct {
 	next     time.Time
@@ -110,7 +122,7 @@ const (
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -169,6 +181,7 @@ func (s *Service) loop() {
 			}
 			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[int64]int{}, time.Time{}
 			s.chatTracked = map[string]chatTrackedRef{}
+			s.listPages = map[string]listPageState{}
 			commandsChanged = true
 		}
 		s.mu.Unlock()
@@ -415,16 +428,16 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 	case text == "/start" || text == "/help":
 		s.send(cfg.Token, msg.Chat.ID, helpText(), nil)
 	case text == "/tasks":
-		s.sendTaskList(cfg, msg.Chat.ID, 1, "")
+		s.sendTaskList(cfg, msg.Chat.ID, "")
 	case strings.HasPrefix(text, "/tasks "):
 		status, err := download.NormalizeTaskStatusFilter(strings.TrimSpace(strings.TrimPrefix(text, "/tasks ")))
 		if err != nil {
 			s.send(cfg.Token, msg.Chat.ID, err.Error()+"。可用状态：排队中、等待中、下载中、已暂停、已完成、部分完成、失败、已取消。", nil)
 			break
 		}
-		s.sendTaskList(cfg, msg.Chat.ID, 1, status)
+		s.sendTaskList(cfg, msg.Chat.ID, status)
 	case text == "/chats":
-		s.sendChatList(cfg, msg.Chat.ID, 1)
+		s.sendChatList(cfg, msg.Chat.ID)
 	case strings.HasPrefix(text, "/chats "):
 		s.createChatTask(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/chats ")))
 	case text == "/status":
@@ -511,64 +524,39 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 		return
 	}
 	if strings.HasPrefix(query.Data, "l:") {
-		parts := strings.Split(query.Data, ":")
-		if len(parts) < 2 || len(parts) > 3 {
+		direction := strings.TrimPrefix(query.Data, "l:")
+		if direction != "prev" && direction != "next" && direction != "refresh" && direction != "back" {
 			return
-		}
-		page, err := strconv.Atoi(parts[1])
-		if err != nil || page < 1 {
-			s.answer(cfg.Token, query.ID, "页码无效")
-			return
-		}
-		status := ""
-		if len(parts) == 3 {
-			status = parts[2]
 		}
 		s.untrackMessage(query.Message.Chat.ID, query.Message.MessageID)
-		s.editTaskList(cfg, query.Message.Chat.ID, query.Message.MessageID, page, status)
+		if direction == "back" {
+			direction = "refresh"
+		}
+		s.editTaskList(cfg, query.Message.Chat.ID, query.Message.MessageID, direction)
 		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	if strings.HasPrefix(query.Data, "v:") {
-		parts := strings.Split(query.Data, ":")
-		if len(parts) < 3 || len(parts) > 4 {
+		id := strings.TrimPrefix(query.Data, "v:")
+		if id == "" || strings.Contains(id, ":") {
 			return
 		}
-		var page int
-		if _, err := fmt.Sscanf(parts[2], "%d", &page); err != nil || page < 1 {
-			s.answer(cfg.Token, query.ID, "页码无效")
-			return
-		}
-		status := ""
-		if len(parts) == 4 {
-			status = parts[3]
-		}
-		s.editTask(cfg, query.Message.Chat.ID, query.Message.MessageID, parts[1], page, status)
+		s.editTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID))
 		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	parts := strings.Split(query.Data, ":")
-	if len(parts) < 3 || len(parts) > 5 || parts[0] != "t" {
+	if len(parts) != 3 || parts[0] != "t" {
 		return
 	}
 	id, action := parts[1], parts[2]
-	listPage := 0
-	if len(parts) >= 4 {
-		if _, err := fmt.Sscanf(parts[3], "%d", &listPage); err != nil || listPage < 1 {
-			return
-		}
-	}
-	listStatus := ""
-	if len(parts) == 5 {
-		listStatus = parts[4]
-	}
 	if id == "list" && action == "refresh" {
-		s.sendTaskList(cfg, query.Message.Chat.ID, 1, "")
+		s.sendTaskList(cfg, query.Message.Chat.ID, "")
 		s.answer(cfg.Token, query.ID, "已刷新")
 		return
 	}
 	if action == "view" {
-		s.editTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, listPage, listStatus)
+		s.editTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID))
 		s.answer(cfg.Token, query.ID, "")
 		return
 	}
@@ -591,7 +579,7 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 		s.forgetLifecycle(id)
 		s.lifecycleMu.Unlock()
 		s.answer(cfg.Token, query.ID, "操作成功")
-		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, deletedTaskText(query.Message.Text), deletedTaskKeyboard(listPage, listStatus))
+		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, deletedTaskText(query.Message.Text), deletedTaskKeyboard(s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID)))
 		return
 	}
 	var err error
@@ -612,13 +600,13 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 		return
 	}
 	s.answer(cfg.Token, query.ID, "操作成功")
-	s.renderActionResult(cfg, *query.Message, id, listPage, listStatus)
+	s.renderActionResult(cfg, *query.Message, id, s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID))
 }
 
 // renderActionResult is the sole post-action renderer. A callback already has
 // the final durable status, so consuming its matching domain event prevents a
 // second, visually confusing edit from the generic lifecycle refresh.
-func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID string, listPage int, listStatus string) {
+func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID string, fromList bool) {
 	job, err := s.downloads.Get(jobID)
 	if err != nil {
 		s.edit(cfg.Token, message.Chat.ID, message.MessageID, "任务不存在或已删除。", nil)
@@ -633,7 +621,7 @@ func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID st
 		s.updateLifecycle(cfg, job)
 		return
 	}
-	s.edit(cfg.Token, message.Chat.ID, message.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, listPage, listStatus))
+	s.edit(cfg.Token, message.Chat.ID, message.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, fromList))
 	if active(job.Status) {
 		s.track(job.ID, messageRef{ChatID: message.Chat.ID, MessageID: message.MessageID})
 	} else {
@@ -641,55 +629,70 @@ func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID st
 	}
 }
 
-func (s *Service) sendTaskList(cfg settings.Bot, chatID int64, page int, status string) {
-	text, buttons, err := s.taskList(page, status)
+func (s *Service) sendTaskList(cfg settings.Bot, chatID int64, status string) {
+	state := listPageState{kind: "task", status: status, page: 1}
+	text, buttons, err := s.taskList(&state)
 	if err != nil {
 		s.send(cfg.Token, chatID, "读取任务列表失败。", nil)
 		return
 	}
-	s.send(cfg.Token, chatID, text, buttons)
+	messageID, err := s.send(cfg.Token, chatID, text, buttons)
+	if err == nil {
+		s.putListPage("task", chatID, messageID, state)
+	}
 }
 
-func (s *Service) editTaskList(cfg settings.Bot, chatID, messageID int64, page int, status string) {
-	text, buttons, err := s.taskList(page, status)
+func (s *Service) editTaskList(cfg settings.Bot, chatID, messageID int64, direction string) {
+	state, ok := s.getListPage("task", chatID, messageID)
+	if !ok {
+		s.edit(cfg.Token, chatID, messageID, "任务列表已过期，请重新发送 /tasks。", nil)
+		return
+	}
+	if direction != "refresh" {
+		var moved bool
+		state, moved = moveListPage(state, direction)
+		if !moved {
+			return
+		}
+	}
+	text, buttons, err := s.taskList(&state)
 	if err != nil {
 		s.edit(cfg.Token, chatID, messageID, "读取任务列表失败。", nil)
 		return
 	}
+	s.putListPage("task", chatID, messageID, state)
 	s.edit(cfg.Token, chatID, messageID, text, buttons)
 }
 
-func (s *Service) taskList(page int, status string) (string, [][]button, error) {
-	jobs, total, err := s.downloads.ListPage(page, 10, status)
+func (s *Service) taskList(state *listPageState) (string, [][]button, error) {
+	jobs, total, next, err := s.downloads.ListCursor(state.cursor, 10, state.status)
 	if err != nil {
 		return "", nil, err
 	}
 	if len(jobs) == 0 {
 		return "暂无下载任务。", nil, nil
 	}
-	totalPages := (total + 9) / 10
-	if page > totalPages {
-		page = totalPages
-	}
+	totalPages := max(1, (total+9)/10)
+	state.next = next
 	buttons := make([][]button, 0, len(jobs)+1)
 	for _, job := range jobs {
 		label := fmt.Sprintf("%s %s %d/%d文件", statusIcon(job.Status), short(job.DialogName, 18), job.CompletedItems, job.TotalItems)
-		buttons = append(buttons, []button{{Text: label, CallbackData: taskViewCallback(job.ID, page, status)}})
+		buttons = append(buttons, []button{{Text: label, CallbackData: "v:" + job.ID}})
 	}
 	navigation := make([]button, 0, 3)
-	if page > 1 {
-		navigation = append(navigation, button{Text: "‹ 上一页", CallbackData: taskListCallback(page-1, status)})
+	if len(state.previous) > 0 {
+		navigation = append(navigation, button{Text: "‹ 上一页", CallbackData: "l:prev"})
 	}
-	navigation = append(navigation, button{Text: fmt.Sprintf("第 %d/%d 页", page, totalPages), CallbackData: taskListCallback(page, status)})
-	if page < totalPages {
-		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: taskListCallback(page+1, status)})
+	navigation = append(navigation, button{Text: fmt.Sprintf("第 %d/%d 页", state.page, totalPages), CallbackData: "l:refresh"})
+	if state.next != "" {
+		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: "l:next"})
 	}
 	buttons = append(buttons, navigation)
 	title := "下载任务"
-	if label := download.TaskStatusFilterLabel(status); label != "" {
+	if label := download.TaskStatusFilterLabel(state.status); label != "" {
 		title += " · " + label
 	}
-	return fmt.Sprintf("<b>%s</b> · 共 %d 个 · 第 %d/%d 页", title, total, page, totalPages), buttons, nil
+	return fmt.Sprintf("<b>%s</b> · 共 %d 个 · 第 %d/%d 页", title, total, state.page, totalPages), buttons, nil
 }
 
 func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
@@ -706,63 +709,72 @@ func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
 		return
 	}
 	applog.Info("bot", "chat_task_created", "user_id", msg.From.ID, "chat_job_id", job.ID)
-	messageID, err := s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, 1))
+	messageID, err := s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, false))
 	if err == nil && active(job.Status) {
-		s.trackChat(job.ID, 1, messageRef{ChatID: msg.Chat.ID, MessageID: messageID})
+		s.trackChat(job.ID, messageRef{ChatID: msg.Chat.ID, MessageID: messageID})
 	}
 }
 
-func (s *Service) sendChatList(cfg settings.Bot, chatID int64, page int) {
-	text, buttons, err := s.chatTaskList(page)
+func (s *Service) sendChatList(cfg settings.Bot, chatID int64) {
+	state := listPageState{kind: "chat", page: 1}
+	text, buttons, err := s.chatTaskList(&state)
 	if err != nil {
 		s.send(cfg.Token, chatID, "读取会话下载列表失败。", nil)
 		return
 	}
-	s.send(cfg.Token, chatID, text, buttons)
+	messageID, err := s.send(cfg.Token, chatID, text, buttons)
+	if err == nil {
+		s.putListPage("chat", chatID, messageID, state)
+	}
 }
 
-func (s *Service) editChatList(cfg settings.Bot, chatID, messageID int64, page int) {
-	text, buttons, err := s.chatTaskList(page)
+func (s *Service) editChatList(cfg settings.Bot, chatID, messageID int64, direction string) {
+	state, ok := s.getListPage("chat", chatID, messageID)
+	if !ok {
+		s.edit(cfg.Token, chatID, messageID, "会话下载列表已过期，请重新发送 /chats。", nil)
+		return
+	}
+	if direction != "refresh" {
+		var moved bool
+		state, moved = moveListPage(state, direction)
+		if !moved {
+			return
+		}
+	}
+	text, buttons, err := s.chatTaskList(&state)
 	if err != nil {
 		s.edit(cfg.Token, chatID, messageID, "读取会话下载列表失败。", nil)
 		return
 	}
+	s.putListPage("chat", chatID, messageID, state)
 	s.edit(cfg.Token, chatID, messageID, text, buttons)
 }
 
-// The Bot API callback payload is bounded, so the opaque database cursor used
-// by the Web is intentionally not exposed here. Bot lists have small pages;
-// page-number access is translated through the manager's presentation helper.
-func (s *Service) chatTaskList(page int) (string, [][]button, error) {
-	if page < 1 {
-		page = 1
-	}
-	jobs, total, err := s.downloads.ListChatsPage(page, 10)
+func (s *Service) chatTaskList(state *listPageState) (string, [][]button, error) {
+	jobs, total, next, err := s.downloads.ListChats(state.cursor, 10)
 	if err != nil {
 		return "", nil, err
 	}
 	if len(jobs) == 0 {
 		return "暂无会话下载任务。", nil, nil
 	}
-	totalPages := (total + 9) / 10
-	if page > totalPages {
-		page = totalPages
-	}
+	totalPages := max(1, (total+9)/10)
+	state.next = next
 	buttons := make([][]button, 0, len(jobs)+1)
 	for _, job := range jobs {
 		label := fmt.Sprintf("%s %s %d/%d下载", statusIcon(job.Status), short(job.DialogName, 18), job.Completed, job.Discovered)
-		buttons = append(buttons, []button{{Text: label, CallbackData: fmt.Sprintf("c:v:%s:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: label, CallbackData: "c:v:" + job.ID}})
 	}
 	navigation := make([]button, 0, 3)
-	if page > 1 {
-		navigation = append(navigation, button{Text: "‹ 上一页", CallbackData: fmt.Sprintf("c:l:%d", page-1)})
+	if len(state.previous) > 0 {
+		navigation = append(navigation, button{Text: "‹ 上一页", CallbackData: "c:l:prev"})
 	}
-	navigation = append(navigation, button{Text: fmt.Sprintf("第 %d/%d 页", page, totalPages), CallbackData: fmt.Sprintf("c:l:%d", page)})
-	if page < totalPages {
-		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: fmt.Sprintf("c:l:%d", page+1)})
+	navigation = append(navigation, button{Text: fmt.Sprintf("第 %d/%d 页", state.page, totalPages), CallbackData: "c:l:refresh"})
+	if state.next != "" {
+		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: "c:l:next"})
 	}
 	buttons = append(buttons, navigation)
-	return fmt.Sprintf("<b>会话下载</b> · 共 %d 个 · 第 %d/%d 页", total, page, totalPages), buttons, nil
+	return fmt.Sprintf("<b>会话下载</b> · 共 %d 个 · 第 %d/%d 页", total, state.page, totalPages), buttons, nil
 }
 
 func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
@@ -774,33 +786,27 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 		return
 	}
 	if parts[1] == "l" && len(parts) == 3 {
-		var page int
-		if _, err := fmt.Sscanf(parts[2], "%d", &page); err != nil || page < 1 {
-			s.answer(cfg.Token, query.ID, "页码无效")
+		direction := parts[2]
+		if direction != "prev" && direction != "next" && direction != "refresh" && direction != "back" {
 			return
 		}
 		s.untrackChatMessage(query.Message.Chat.ID, query.Message.MessageID)
-		s.editChatList(cfg, query.Message.Chat.ID, query.Message.MessageID, page)
-		s.answer(cfg.Token, query.ID, "")
-		return
-	}
-	if parts[1] == "v" && len(parts) == 4 {
-		var page int
-		if _, err := fmt.Sscanf(parts[3], "%d", &page); err != nil || page < 1 {
-			return
+		if direction == "back" {
+			direction = "refresh"
 		}
-		s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, parts[2], page)
+		s.editChatList(cfg, query.Message.Chat.ID, query.Message.MessageID, direction)
 		s.answer(cfg.Token, query.ID, "")
 		return
 	}
-	if parts[1] != "t" || len(parts) != 5 {
+	if parts[1] == "v" && len(parts) == 3 {
+		s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, parts[2], s.hasListPage("chat", query.Message.Chat.ID, query.Message.MessageID))
+		s.answer(cfg.Token, query.ID, "")
+		return
+	}
+	if parts[1] != "t" || len(parts) != 4 {
 		return
 	}
 	id, action := parts[2], parts[3]
-	var page int
-	if _, err := fmt.Sscanf(parts[4], "%d", &page); err != nil || page < 1 {
-		return
-	}
 	var err error
 	switch action {
 	case "pause":
@@ -833,21 +839,25 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 		if action == "purge" {
 			message = "会话任务已彻底删除；最终下载文件已保留。"
 		}
-		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, message, [][]button{{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}}})
+		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, message, [][]button{{{Text: "返回会话列表", CallbackData: "c:l:back"}}})
 		return
 	}
-	s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, page)
+	s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, s.hasListPage("chat", query.Message.Chat.ID, query.Message.MessageID))
 }
 
-func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id string, page int) {
+func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id string, fromList bool) {
 	job, err := s.downloads.GetChat(id)
 	if err != nil {
-		s.edit(cfg.Token, chatID, messageID, "会话任务不存在或已删除。", [][]button{{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}}})
+		buttons := [][]button(nil)
+		if fromList {
+			buttons = [][]button{{{Text: "返回会话列表", CallbackData: "c:l:back"}}}
+		}
+		s.edit(cfg.Token, chatID, messageID, "会话任务不存在或已删除。", buttons)
 		return
 	}
-	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, page))
+	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, fromList))
 	if active(job.Status) {
-		s.trackChat(job.ID, page, messageRef{ChatID: chatID, MessageID: messageID})
+		s.trackChat(job.ID, messageRef{ChatID: chatID, MessageID: messageID})
 	}
 }
 
@@ -883,31 +893,33 @@ func chatRangeLabel(job download.ChatJob) string {
 	return fmt.Sprintf("最早 — %d", job.UpperMessageID)
 }
 
-func chatTaskKeyboard(job download.ChatJob, page int) [][]button {
+func chatTaskKeyboard(job download.ChatJob, fromList bool) [][]button {
 	buttons := make([][]button, 0, 3)
 	if job.Status == "queued" || job.Status == "scanning" || job.Status == "downloading" || job.Status == "listening" {
-		buttons = append(buttons, []button{{Text: "暂停", CallbackData: fmt.Sprintf("c:t:%s:pause:%d", job.ID, page)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: "暂停", CallbackData: fmt.Sprintf("c:t:%s:pause", job.ID)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel", job.ID)}})
 	}
 	if job.Status == "paused" {
-		buttons = append(buttons, []button{{Text: "恢复", CallbackData: fmt.Sprintf("c:t:%s:resume:%d", job.ID, page)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: "恢复", CallbackData: fmt.Sprintf("c:t:%s:resume", job.ID)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel", job.ID)}})
 	}
 	if job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" || job.Failed > 0 {
 		label := "重新开始"
 		if job.Status == "listening" && job.Failed > 0 {
 			label = "重试失败项"
 		}
-		buttons = append(buttons, []button{{Text: label, CallbackData: fmt.Sprintf("c:t:%s:retry:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: label, CallbackData: fmt.Sprintf("c:t:%s:retry", job.ID)}})
 	}
 	if job.Status == "completed" || job.Status == "failed" || job.Status == "partial" || job.Status == "cancelled" {
-		buttons = append(buttons, []button{{Text: "删除", CallbackData: fmt.Sprintf("c:t:%s:delete:%d", job.ID, page)}})
-		buttons = append(buttons, []button{{Text: "彻底删除", CallbackData: fmt.Sprintf("c:t:%s:purge:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: "删除", CallbackData: fmt.Sprintf("c:t:%s:delete", job.ID)}})
+		buttons = append(buttons, []button{{Text: "彻底删除", CallbackData: fmt.Sprintf("c:t:%s:purge", job.ID)}})
 	}
 	if job.ListenNew && job.Status != "cancelled" && job.Status != "deleted" {
-		buttons = append(buttons, []button{{Text: "停止消息监听", CallbackData: fmt.Sprintf("c:t:%s:listenoff:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: "停止消息监听", CallbackData: fmt.Sprintf("c:t:%s:listenoff", job.ID)}})
 	} else if !job.ListenNew && (job.Status == "completed" || job.Status == "failed" || job.Status == "partial") {
-		buttons = append(buttons, []button{{Text: "开启消息监听", CallbackData: fmt.Sprintf("c:t:%s:listenon:%d", job.ID, page)}})
+		buttons = append(buttons, []button{{Text: "开启消息监听", CallbackData: fmt.Sprintf("c:t:%s:listenon", job.ID)}})
 	}
-	buttons = append(buttons, []button{{Text: "返回会话列表", CallbackData: fmt.Sprintf("c:l:%d", page)}})
+	if fromList {
+		buttons = append(buttons, []button{{Text: "返回会话列表", CallbackData: "c:l:back"}})
+	}
 	return buttons
 }
 
@@ -917,14 +929,14 @@ func (s *Service) sendTask(cfg settings.Bot, chatID int64, id string) {
 		s.send(cfg.Token, chatID, "未找到该任务。", nil)
 		return
 	}
-	messageID, err := s.send(cfg.Token, chatID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, 0))
+	messageID, err := s.send(cfg.Token, chatID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, false))
 	if err == nil && active(job.Status) {
 		s.track(job.ID, messageRef{ChatID: chatID, MessageID: messageID})
 	}
 }
-func (s *Service) editTask(cfg settings.Bot, chatID, messageID int64, id string, listPage int, filters ...string) {
+func (s *Service) editTask(cfg settings.Bot, chatID, messageID int64, id string, fromList bool) {
 	if id == "list" {
-		s.sendTaskList(cfg, chatID, 1, taskStatusFilter(filters))
+		s.sendTaskList(cfg, chatID, "")
 		return
 	}
 	job, err := s.downloads.Get(id)
@@ -932,7 +944,7 @@ func (s *Service) editTask(cfg settings.Bot, chatID, messageID int64, id string,
 		s.edit(cfg.Token, chatID, messageID, "任务不存在或已删除。", nil)
 		return
 	}
-	s.edit(cfg.Token, chatID, messageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, listPage, filters...))
+	s.edit(cfg.Token, chatID, messageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, fromList))
 	if active(job.Status) {
 		s.track(job.ID, messageRef{ChatID: chatID, MessageID: messageID})
 	}
@@ -984,7 +996,7 @@ func (s *Service) refresh(cfg settings.Bot) {
 			s.untrack(key)
 			continue
 		}
-		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, 0)) {
+		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, s.hasListPage("task", ref.ChatID, ref.MessageID))) {
 			s.untrack(key)
 		}
 		if !active(job.Status) {
@@ -1000,7 +1012,7 @@ func (s *Service) refresh(cfg settings.Bot) {
 			s.untrackChat(key)
 			continue
 		}
-		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, chatTaskText(job), chatTaskKeyboard(job, ref.Page)) {
+		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, chatTaskText(job), chatTaskKeyboard(job, s.hasListPage("chat", ref.ChatID, ref.MessageID))) {
 			s.untrackChat(key)
 			continue
 		}
@@ -1031,6 +1043,55 @@ func (s *Service) track(id string, ref messageRef) {
 	s.mu.Unlock()
 }
 func (s *Service) untrack(key string) { s.mu.Lock(); delete(s.tracked, key); s.mu.Unlock() }
+
+func listPageKey(kind string, chatID, messageID int64) string {
+	return kind + ":" + fmt.Sprint(chatID) + ":" + fmt.Sprint(messageID)
+}
+
+func (s *Service) getListPage(kind string, chatID, messageID int64) (listPageState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.listPages[listPageKey(kind, chatID, messageID)]
+	return state, ok
+}
+
+func (s *Service) hasListPage(kind string, chatID, messageID int64) bool {
+	_, ok := s.getListPage(kind, chatID, messageID)
+	return ok
+}
+
+func (s *Service) putListPage(kind string, chatID, messageID int64, state listPageState) {
+	s.mu.Lock()
+	s.listPages[listPageKey(kind, chatID, messageID)] = state
+	s.mu.Unlock()
+}
+
+func moveListPage(state listPageState, direction string) (listPageState, bool) {
+	switch direction {
+	case "next":
+		if state.next == "" {
+			return state, false
+		}
+		state.previous = append(state.previous, state.cursor)
+		state.cursor = state.next
+		state.next = ""
+		state.page++
+		return state, true
+	case "prev":
+		if len(state.previous) == 0 {
+			return state, false
+		}
+		state.cursor = state.previous[len(state.previous)-1]
+		state.previous = state.previous[:len(state.previous)-1]
+		state.next = ""
+		if state.page > 1 {
+			state.page--
+		}
+		return state, true
+	default:
+		return state, false
+	}
+}
 func (s *Service) untrackJob(jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1050,9 +1111,9 @@ func (s *Service) untrackMessage(chatID, messageID int64) {
 	}
 }
 
-func (s *Service) trackChat(id string, page int, ref messageRef) {
+func (s *Service) trackChat(id string, ref messageRef) {
 	s.mu.Lock()
-	s.chatTracked[id+":"+fmt.Sprint(ref.ChatID)] = chatTrackedRef{JobID: id, Page: page, messageRef: ref}
+	s.chatTracked[id+":"+fmt.Sprint(ref.ChatID)] = chatTrackedRef{JobID: id, messageRef: ref}
 	s.mu.Unlock()
 }
 func (s *Service) untrackChat(key string) { s.mu.Lock(); delete(s.chatTracked, key); s.mu.Unlock() }
@@ -1280,23 +1341,16 @@ func deletedTaskText(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-func deletedTaskKeyboard(listPage int, filters ...string) [][]button {
-	if listPage < 1 {
+func deletedTaskKeyboard(fromList bool) [][]button {
+	if !fromList {
 		return nil
 	}
-	return [][]button{{{Text: "‹ 返回任务列表", CallbackData: taskListCallback(listPage, taskStatusFilter(filters))}}}
+	return [][]button{{{Text: "‹ 返回任务列表", CallbackData: "l:back"}}}
 }
 
-func taskKeyboard(job download.Job, listPage int, filters ...string) [][]button {
+func taskKeyboard(job download.Job, fromList bool) [][]button {
 	id := job.ID
-	status := taskStatusFilter(filters)
 	callback := func(action string) string {
-		if listPage > 0 {
-			if status != "" {
-				return fmt.Sprintf("t:%s:%s:%d:%s", id, action, listPage, status)
-			}
-			return fmt.Sprintf("t:%s:%s:%d", id, action, listPage)
-		}
 		return "t:" + id + ":" + action
 	}
 	var rows [][]button
@@ -1313,8 +1367,8 @@ func taskKeyboard(job download.Job, listPage int, filters ...string) [][]button 
 		rows = append(rows, []button{{"删除", callback("delete")}})
 	}
 	rows = append(rows, []button{{"↻ 刷新", callback("view")}})
-	if listPage > 0 {
-		rows = append(rows, []button{{"‹ 返回任务列表", taskListCallback(listPage, status)}})
+	if fromList {
+		rows = append(rows, []button{{"‹ 返回任务列表", "l:back"}})
 	}
 	return rows
 }
@@ -1326,19 +1380,6 @@ func taskStatusFilter(filters []string) string {
 	return filters[0]
 }
 
-func taskListCallback(page int, status string) string {
-	if status == "" {
-		return fmt.Sprintf("l:%d", page)
-	}
-	return fmt.Sprintf("l:%d:%s", page, status)
-}
-
-func taskViewCallback(id string, page int, status string) string {
-	if status == "" {
-		return fmt.Sprintf("v:%s:%d", id, page)
-	}
-	return fmt.Sprintf("v:%s:%d:%s", id, page, status)
-}
 func taskText(job download.Job, progress []download.FileProgress) string {
 	byID := map[string]download.FileProgress{}
 	for _, p := range progress {

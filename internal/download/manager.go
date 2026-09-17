@@ -185,8 +185,9 @@ type Manager struct {
 	chatActive    map[string]struct{}
 	wake          chan struct{}
 	chatWake      chan struct{}
-	chatEvents    chan telegram.NewMessageEvent
+	chatEventWake chan struct{}
 	chatListeners map[string]*chatListener
+	chatWatched   map[string]map[string]struct{}
 	slotWake      chan struct{}
 	progress      *progressStore
 	events        *eventBus
@@ -198,6 +199,7 @@ type Manager struct {
 	dbHealthMu    sync.RWMutex
 	dbHealth      DatabaseHealth
 	dbMonitorStop context.CancelFunc
+	cleanupStop   context.CancelFunc
 	dbOutage      atomic.Bool
 	visibleJobs   atomic.Int64
 	visibleChats  atomic.Int64
@@ -217,7 +219,7 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEvents: make(chan telegram.NewMessageEvent, 512), chatListeners: make(map[string]*chatListener), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
 	if err := m.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -264,6 +266,10 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 		_ = db.Close()
 		return nil, fmt.Errorf("recover reaction inbox: %w", err)
 	}
+	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing'`, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover chat message inbox: %w", err)
+	}
 	for worker := 0; worker < workerCount; worker++ {
 		go m.worker()
 	}
@@ -271,8 +277,12 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	for worker := 0; worker < 3; worker++ {
 		go m.chatDownloadWorker()
 	}
-	go m.chatEventWorker()
-	go m.cleanupLoop()
+	for worker := 0; worker < 2; worker++ {
+		go m.chatEventWorker()
+	}
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	m.cleanupStop = cancelCleanup
+	go m.cleanupLoop(cleanupCtx)
 	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 	m.dbMonitorStop = cancelMonitor
 	m.updateDatabaseHealth()
@@ -540,48 +550,6 @@ func (m *Manager) Get(id string) (Job, error) {
 	return job, nil
 }
 
-// ListPage is retained for Bot page navigation. The Web UI uses ListCursor;
-// Bot callbacks carry only a human page number, so use one bounded SQL query
-// rather than replaying every earlier page for a deep page request.
-func (m *Manager) ListPage(page, pageSize int, filters ...string) ([]Job, int, error) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 10
-	}
-	if pageSize > 50 {
-		pageSize = 50
-	}
-	status, err := taskStatusFilter(filters)
-	if err != nil {
-		return nil, 0, err
-	}
-	total, err := m.visibleJobTotal(status)
-	if err != nil {
-		return nil, 0, err
-	}
-	if total == 0 {
-		return []Job{}, 0, nil
-	}
-	pages := (total + pageSize - 1) / pageSize
-	if page > pages {
-		page = pages
-	}
-	var cursor string
-	for current := 1; current <= page; current++ {
-		jobs, next, err := m.listCursor(cursor, pageSize, status)
-		if err != nil {
-			return nil, 0, err
-		}
-		if current == page || next == "" {
-			return jobs, total, nil
-		}
-		cursor = next
-	}
-	return []Job{}, total, nil
-}
-
 // ListCursor is stable when new tasks are inserted: it continues after the
 // last row seen rather than making deep pages increasingly expensive with
 // OFFSET. Its jobs intentionally omit Items; file details are fetched on row
@@ -608,9 +576,8 @@ func (m *Manager) ListCursor(cursor string, pageSize int, filters ...string) ([]
 	return jobs, total, next, nil
 }
 
-// listCursor performs just the indexed page query. Bot's numbered navigation
-// reuses it after calculating the total once, avoiding a COUNT for every
-// intermediate keyset page.
+// listCursor performs just the indexed page query; Web and Bot both retain
+// the opaque cursor for their next/previous navigation.
 func (m *Manager) listCursor(cursor string, pageSize int, status string) ([]Job, string, error) {
 	where := "WHERE j.parent_chat_id = '' AND j.status != 'deleted'"
 	whereArgs := make([]any, 0, 1)
@@ -662,10 +629,14 @@ func (m *Manager) visibleJobTotal(status string) (int, error) {
 }
 
 func (m *Manager) listSummaries(where, pagination string, args []any, total int) ([]Job, int, error) {
+	// Select one page of parent jobs before aggregating their files. Applying
+	// LIMIT after a joined GROUP BY can otherwise touch the entire permanent
+	// file history merely to render a small task page.
 	query := `SELECT j.id, j.source_url, j.dialog_type, j.dialog_key, j.dialog_name, j.account_id, j.attempts, j.status, j.error, j.created_at, j.updated_at,
- COUNT(i.id), COALESCE(SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(MAX(NULLIF(i.message_text, '')), '')
- FROM download_jobs j LEFT JOIN download_items i ON i.job_id = j.id ` + where + `
- GROUP BY j.id ` + pagination
+	 COALESCE(summary.total_items, 0), COALESCE(summary.completed_items, 0), COALESCE(summary.message_text, '')
+ FROM (SELECT * FROM download_jobs j ` + where + ` ` + pagination + `) j
+ LEFT JOIN LATERAL (SELECT COUNT(id) AS total_items, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_items, MAX(NULLIF(message_text, '')) AS message_text FROM download_items WHERE job_id = j.id) summary ON true
+ ORDER BY j.created_at DESC, j.id DESC`
 	rows, err := m.db.Query(query, args...)
 	if err != nil {
 		return nil, 0, err
@@ -710,18 +681,27 @@ func decodeJobCursor(cursor string) (string, string, error) {
 
 func (m *Manager) Summary() (active, failedItems int) {
 	// Dashboard refreshes frequently. Do not aggregate permanent completed
-	// history here: at multi-million scale that would force repeated scans.
-	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`).Scan(&active)
+	// history here: at multi-million scale that would force repeated scans. A
+	// chat task owns an indexed file queue rather than child jobs, so include
+	// both queue types or the dashboard would incorrectly show zero while a
+	// session download is active.
+	_ = m.db.QueryRow(`SELECT
+ (SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')) +
+ (SELECT COUNT(1) FROM chat_download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused'))`).Scan(&active)
 	sevenDaysAgo := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
-	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE status = 'failed' AND finished_at >= ?`, sevenDaysAgo).Scan(&failedItems)
+	_ = m.db.QueryRow(`SELECT
+ (SELECT COUNT(1) FROM download_items WHERE status = 'failed' AND finished_at >= ?) +
+ (SELECT COUNT(1) FROM chat_download_items WHERE status = 'failed' AND finished_at >= ?)`, sevenDaysAgo, sevenDaysAgo).Scan(&failedItems)
 	return
 }
 
-// ActiveAccountJobs reports work that would lose its bound Telegram session if
-// the account were removed. Terminal history does not block account removal.
+// ActiveAccountJobs reports every non-terminal message or chat task that would
+// lose its bound Telegram session if the account were removed.
 func (m *Manager) ActiveAccountJobs(accountID string) (int, error) {
 	var count int
-	err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE account_id = ? AND status IN ('queued', 'running', 'paused')`, accountID).Scan(&count)
+	err := m.db.QueryRow(`SELECT
+ (SELECT COUNT(1) FROM download_jobs WHERE account_id = ? AND status IN ('queued', 'running', 'paused')) +
+ (SELECT COUNT(1) FROM chat_download_jobs WHERE account_id = ? AND status IN ('queued', 'scanning', 'downloading', 'listening', 'paused'))`, accountID, accountID).Scan(&count)
 	return count, err
 }
 
@@ -735,6 +715,9 @@ func (m *Manager) LiveProgress() []FileProgress {
 func (m *Manager) Stop() {
 	if m.dbMonitorStop != nil {
 		m.dbMonitorStop()
+	}
+	if m.cleanupStop != nil {
+		m.cleanupStop()
 	}
 	m.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(m.cancels))

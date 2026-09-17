@@ -41,6 +41,11 @@ func (m *Manager) migratePostgres() error {
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_download_streams (
  chat_job_id TEXT NOT NULL, stream_kind TEXT NOT NULL, offset_message_id INTEGER NOT NULL DEFAULT 0, initialized SMALLINT NOT NULL DEFAULT 0, completed SMALLINT NOT NULL DEFAULT 0, PRIMARY KEY(chat_job_id, stream_kind), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+	)`,
+		`CREATE TABLE IF NOT EXISTS chat_message_inbox (
+ id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, message_id INTEGER NOT NULL,
+ peer_type TEXT NOT NULL, peer_id BIGINT NOT NULL DEFAULT 0, peer_hash BIGINT NOT NULL DEFAULT 0, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(account_id, dialog_key, message_id)
 )`,
 		`CREATE TABLE IF NOT EXISTS downloaded_media (
  dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, final_path TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, owner_kind TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(dialog_key, message_id)
@@ -69,6 +74,11 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_job_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_child_job ON chat_download_items(child_job_id)`,
+		`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
+		`CREATE INDEX IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
+		`CREATE INDEX IF NOT EXISTS chat_download_items_failed_finished_at ON chat_download_items(status, finished_at) WHERE status = 'failed'`,
+		`CREATE INDEX IF NOT EXISTS chat_download_items_active_status ON chat_download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
+		`CREATE INDEX IF NOT EXISTS chat_download_items_state_by_job ON chat_download_items(chat_job_id, status) WHERE status IN ('queued', 'running', 'downloaded', 'failed')`,
 		`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
 	}
 	for _, statement := range statements {
@@ -146,6 +156,33 @@ var postgresMigrations = []postgresMigration{
 		version: 6,
 		statements: []string{
 			`CREATE INDEX IF NOT EXISTS download_jobs_visible_status_created_id ON download_jobs(status, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+		},
+	},
+	{
+		version: 7,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS chat_message_inbox (id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, message_id INTEGER NOT NULL, peer_type TEXT NOT NULL, peer_id BIGINT NOT NULL DEFAULT 0, peer_hash BIGINT NOT NULL DEFAULT 0, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(account_id, dialog_key, message_id))`,
+			`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
+			`CREATE INDEX IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
+			`CREATE INDEX IF NOT EXISTS chat_download_items_waiting ON chat_download_items(status, chat_job_id, message_id) WHERE status = 'waiting'`,
+			`CREATE INDEX IF NOT EXISTS chat_download_items_downloaded ON chat_download_items(chat_job_id, message_id) WHERE status = 'downloaded'`,
+		},
+	},
+	{
+		// v8 keeps the dashboard's recent-failure figure an index range scan
+		// for session-download items as well as ordinary message items.
+		version: 8,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS chat_download_items_failed_finished_at ON chat_download_items(status, finished_at) WHERE status = 'failed'`,
+		},
+	},
+	{
+		// v9 avoids scanning permanent completed chat history for the
+		// dashboard's active count and the active-chat state reconciler.
+		version: 9,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS chat_download_items_active_status ON chat_download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
+			`CREATE INDEX IF NOT EXISTS chat_download_items_state_by_job ON chat_download_items(chat_job_id, status) WHERE status IN ('queued', 'running', 'downloaded', 'failed')`,
 		},
 	},
 }

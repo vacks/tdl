@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	gotd "github.com/gotd/td/telegram"
@@ -166,10 +167,14 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 		where += " AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))"
 		args = []any{ChatStatusDeleted, createdAt, createdAt, id, pageSize + 1}
 	}
+	// Page the parent jobs before touching their potentially very large media
+	// indexes. A grouped join followed by LIMIT can otherwise aggregate every
+	// historical row just to render ten task cards.
 	rows, err := m.db.Query(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
- COUNT(i.message_id), COALESCE(SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END), 0), COALESCE(MIN(i.message_id), 0)
- FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id `+where+`
- GROUP BY c.id ORDER BY c.created_at DESC, c.id DESC LIMIT ?`, args...)
+	COALESCE(summary.discovered, 0), COALESCE(summary.completed, 0), COALESCE(summary.failed, 0), COALESCE(summary.earliest, 0)
+FROM (SELECT * FROM chat_download_jobs c `+where+` ORDER BY created_at DESC, id DESC LIMIT ?) c
+	LEFT JOIN LATERAL (SELECT COUNT(message_id) AS discovered, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed, MIN(message_id) AS earliest FROM chat_download_items WHERE chat_job_id = c.id) summary ON true
+	ORDER BY c.created_at DESC, c.id DESC`, args...)
 	if err != nil {
 		return nil, 0, "", err
 	}
@@ -195,32 +200,6 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 		next = encodeChatCursor(last.CreatedAt, last.ID)
 	}
 	return jobs, total, next, nil
-}
-
-// ListChatsPage is a Bot presentation helper. The Web API deliberately uses
-// keyset cursors; Bot pages are capped to small human-scale lists and are
-// converted here without exposing opaque cursor state in callback payloads.
-func (m *Manager) ListChatsPage(page, pageSize int) ([]ChatJob, int, error) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 10
-	}
-	var cursor string
-	var total int
-	for current := 1; current <= page; current++ {
-		jobs, found, next, err := m.ListChats(cursor, pageSize)
-		if err != nil {
-			return nil, 0, err
-		}
-		total = found
-		if current == page || next == "" {
-			return jobs, total, nil
-		}
-		cursor = next
-	}
-	return nil, total, nil
 }
 
 func encodeChatCursor(createdAt, id string) string {
@@ -344,6 +323,7 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	inserted := int64(0)
 	tx, err := m.db.Begin()
 	if err != nil {
 		return err
@@ -398,8 +378,16 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		if existingStatus == "claimed" && (ownerKind != "chat" || ownerID != chatID) {
 			status = "waiting"
 		}
-		_, err = tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, grouped_id, message_text, original_name, size, final_path, status, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginalName, item.Size, finalPath, status, now)
+		result, err := tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, grouped_id, message_text, original_name, size, final_path, status, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginalName, item.Size, finalPath, status, now)
 		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed > 0 {
+			inserted += changed
+		}
+	}
+	if startTransfers && inserted > 0 {
+		if _, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = '', updated_at = ? WHERE id = ? AND status = ?`, ChatStatusDownloading, now, chatID, ChatStatusListening); err != nil {
 			return err
 		}
 	}
@@ -425,6 +413,13 @@ func (m *Manager) chatWorker() {
 		}
 		if err := m.scanOneChat(); err != nil {
 			applog.Error("chat_download", "media_index_failed", "error", err.Error())
+		}
+		// A process can be interrupted after a final move but before the final
+		// database state update. Reconcile on the regular worker cadence, not
+		// only during restart/database recovery, so such a row cannot leave its
+		// session task permanently in "下载中".
+		if err := m.reconcileChatPublishedItems(); err != nil {
+			applog.Error("chat_download", "published_file_reconcile_failed", "error", err.Error())
 		}
 		m.reconcileChatClaims()
 		m.refreshChatStates()
@@ -602,7 +597,18 @@ func (m *Manager) runOneChatBatch() error {
 			return err
 		}
 	}
+	// Register this transfer while holding the same lock as pause/cancel. This
+	// closes the small window where a control action could finish before this
+	// batch had published its cancel function, leaving a newly-started upstream
+	// transfer outside that action's reach.
+	lock := m.chatLock(id)
+	lock.Lock()
+	if !chatRunnable(m.chatStatus(id)) {
+		lock.Unlock()
+		return nil
+	}
 	ctx, release := m.beginChatExecution(id)
+	lock.Unlock()
 	defer func() { release(); m.progress.ClearJob(id) }()
 	transferCtx, stopTransfer := context.WithCancel(ctx)
 	defer stopTransfer()
@@ -636,6 +642,19 @@ func (m *Manager) runOneChatBatch() error {
 		applog.Info("chat_download", "batch_no_progress_timeout", "chat_job_id", id, "item_count", len(batch), "timeout", timeout.String())
 	})
 	defer watchdog.Close()
+	var publishWG sync.WaitGroup
+	var publishMu sync.Mutex
+	var publishErr error
+	recordPublishErr := func(err error) {
+		if err == nil {
+			return
+		}
+		publishMu.Lock()
+		if publishErr == nil {
+			publishErr = err
+		}
+		publishMu.Unlock()
+	}
 	err = m.accounts.Run(transferCtx, target.AccountID, func(runCtx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		opts := upstreamDL.Options{Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: target.inputPeer(), Messages: ids}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
 			item, ok := byMessage[update.MessageID]
@@ -653,11 +672,38 @@ func (m *Manager) runOneChatBatch() error {
 				return
 			}
 			watchdog.Touch()
-			defer m.progress.ClearItem(id, item.Item)
-			_ = m.publishChatItem(id, update.Path, item, config)
+			m.progress.ClearItem(id, item.Item)
+			// Upstream invokes completion callbacks from transfer workers. Keep
+			// final file moves out of those workers, but wait below before the
+			// batch decides its final state. publishChatItem itself records a
+			// per-file failure; a post-move database failure is recovered by the
+			// reconciliation immediately after the wait and on worker cadence.
+			publishWG.Add(1)
+			go func() {
+				defer publishWG.Done()
+				if publishErr := m.publishChatItem(id, update.Path, item, config); publishErr != nil {
+					recordPublishErr(publishErr)
+					applog.Error("chat_download", "file_publish_failed", "chat_job_id", id, "message_id", item.MessageID, "error", publishErr.Error())
+				}
+			}()
 		}}
 		return upstreamDL.Run(runCtx, client, kvd, opts)
 	})
+	publishWG.Wait()
+	if reconcileErr := m.reconcileChatPublishedItems(); reconcileErr != nil {
+		return fmt.Errorf("核对已移动文件: %w", reconcileErr)
+	}
+	publishMu.Lock()
+	persistErr := publishErr
+	publishMu.Unlock()
+	if persistErr != nil {
+		// A transient database write failure before the final move leaves the
+		// item running. Put only those still-running rows back on the durable
+		// queue; rows that were already reconciled to completed are untouched.
+		if recoverErr := m.requeueChatPublishFailures(id, batch); recoverErr != nil {
+			return fmt.Errorf("恢复文件发布状态: %w", recoverErr)
+		}
+	}
 	if watchdog.Stalled() && (m.chatStatus(id) == ChatStatusScanning || m.chatStatus(id) == ChatStatusDownloading || m.chatStatus(id) == ChatStatusListening) {
 		return m.requeueStalledChatBatch(id, batch)
 	}
@@ -672,6 +718,40 @@ func (m *Manager) runOneChatBatch() error {
 		return err
 	}
 	m.touch()
+	return nil
+}
+
+// requeueChatPublishFailures recovers only rows whose final-path state could
+// not be saved. It deliberately retains downloaded/completed rows: the former
+// are reconciled from their already-moved file and the latter are final.
+func (m *Manager) requeueChatPublishFailures(chatID string, batch []source) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	changed := false
+	for _, item := range batch {
+		result, err := tx.Exec(`UPDATE chat_download_items
+SET status = 'queued', error = '文件发布状态保存失败，已自动重试',
+    elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END,
+    started_at = '', finished_at = ''
+WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'running'`, now, chatID, item.DialogKey, item.MessageID)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count > 0 {
+			changed = true
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		m.touch()
+		m.signalChat()
+	}
 	return nil
 }
 
@@ -712,6 +792,10 @@ func (m *Manager) chatStatus(id string) string {
 	var status string
 	_ = m.db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = ?`, id).Scan(&status)
 	return status
+}
+
+func chatRunnable(status string) bool {
+	return status == ChatStatusScanning || status == ChatStatusDownloading || status == ChatStatusListening
 }
 
 func (m *Manager) chatItemStatus(chatID string, item source) string {
@@ -769,8 +853,15 @@ func (m *Manager) reconcileChatPublishedItems() error {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, item := range items {
+		// Publish, pause and cancel must share a single per-chat linearization
+		// point. Otherwise a completion callback which started just before a
+		// cancellation can recreate a completed row after CancelChat marked it
+		// cancelled and released its global claim.
+		lock := m.chatLock(item.chatID)
+		lock.Lock()
 		tx, err := m.db.Begin()
 		if err != nil {
+			lock.Unlock()
 			return err
 		}
 		_, err = tx.Exec(`UPDATE chat_download_items SET status = 'completed', error = '', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'downloaded'`, now, item.chatID, item.dialogKey, item.messageID)
@@ -779,16 +870,25 @@ func (m *Manager) reconcileChatPublishedItems() error {
 		}
 		if err != nil {
 			_ = tx.Rollback()
+			lock.Unlock()
 			return err
 		}
 		if err := tx.Commit(); err != nil {
+			lock.Unlock()
 			return err
 		}
+		lock.Unlock()
 	}
 	return nil
 }
 
 func (m *Manager) publishChatItem(chatID, path string, item source, config settings.Values) error {
+	// A control action waits for an in-flight final-file publish to reach one
+	// durable result. Later callbacks observe the paused/cancelled parent and
+	// return without moving files or changing item state.
+	lock := m.chatLock(chatID)
+	lock.Lock()
+	defer lock.Unlock()
 	if status := m.chatStatus(chatID); status != ChatStatusScanning && status != ChatStatusDownloading && status != ChatStatusListening {
 		return nil
 	}
@@ -809,20 +909,26 @@ func (m *Manager) publishChatItem(chatID, path string, item source, config setti
 }
 
 func (m *Manager) reconcileChatListeners() {
-	rows, err := m.db.Query(`SELECT DISTINCT account_id FROM chat_download_jobs WHERE listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	rows, err := m.db.Query(`SELECT account_id, dialog_key FROM chat_download_jobs WHERE listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	wanted := make(map[string]struct{})
+	watched := make(map[string]map[string]struct{})
 	for rows.Next() {
-		var accountID string
-		if rows.Scan(&accountID) == nil && accountID != "" {
+		var accountID, dialogKey string
+		if rows.Scan(&accountID, &dialogKey) == nil && accountID != "" && dialogKey != "" {
 			wanted[accountID] = struct{}{}
+			if watched[accountID] == nil {
+				watched[accountID] = make(map[string]struct{})
+			}
+			watched[accountID][dialogKey] = struct{}{}
 		}
 	}
 	proxyURL := m.settings.ProxyURL()
 	m.mu.Lock()
+	m.chatWatched = watched
 	for accountID := range wanted {
 		if current, exists := m.chatListeners[accountID]; exists && current.proxy == proxyURL {
 			continue
@@ -847,14 +953,7 @@ func (m *Manager) reconcileChatListeners() {
 
 func (m *Manager) runChatListener(ctx context.Context, accountID string, listener *chatListener) {
 	err := m.accounts.ListenNewMessages(ctx, accountID, func(_ context.Context, event telegram.NewMessageEvent) {
-		select {
-		case m.chatEvents <- event:
-		default:
-			// This should be exceptional (the consumer only resolves media in
-			// explicitly selected chats). It is visible in logs rather than
-			// blocking Telegram's update dispatcher indefinitely.
-			applog.Error("chat_download", "new_message_queue_full", "account_id", event.AccountID, "message_id", event.MessageID)
-		}
+		m.enqueueChatMessage(event)
 	}, nil)
 	if err != nil && ctx.Err() == nil {
 		applog.Error("chat_download", "new_message_listener_failed", "account_id", accountID, "error", err.Error())
@@ -867,19 +966,50 @@ func (m *Manager) runChatListener(ctx context.Context, accountID string, listene
 }
 
 func (m *Manager) chatEventWorker() {
-	for event := range m.chatEvents {
-		m.handleNewChatMessage(event)
+	for {
+		if !m.DatabaseAvailable() {
+			if !waitChatEvent(time.Second * 5) {
+				return
+			}
+			continue
+		}
+		events, err := m.claimChatMessageInbox(1)
+		if err != nil {
+			applog.Error("chat_download", "new_message_claim_failed", "error", err.Error())
+			if !waitChatEvent(2 * time.Second) {
+				return
+			}
+			continue
+		}
+		if len(events) == 0 {
+			select {
+			case <-m.chatEventWake:
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		for _, event := range events {
+			if err := m.handleNewChatMessage(event.event); err != nil {
+				if retryErr := m.retryChatMessageInbox(event.id, event.attempts, err); retryErr != nil {
+					applog.Error("chat_download", "new_message_retry_update_failed", "inbox_id", event.id, "error", retryErr.Error())
+				}
+				continue
+			}
+			if err := m.completeChatMessageInbox(event.id); err != nil {
+				applog.Error("chat_download", "new_message_complete_update_failed", "inbox_id", event.id, "error", err.Error())
+			}
+		}
 	}
 }
 
-func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) {
+func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 	if event.InputPeer == nil || event.MessageID <= 0 {
-		return
+		return nil
 	}
 	_, dialogKey, _ := dialogIdentity(event.InputPeer, event.AccountID)
 	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status = ?`, event.AccountID, dialogKey, chatScanCompleted, ChatStatusListening)
 	if err != nil {
-		return
+		return err
 	}
 	defer rows.Close()
 	ids := make([]string, 0)
@@ -890,20 +1020,21 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) {
 		}
 	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 	sources, err := m.resolvePeer(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, event.DialogName)
 	if err != nil {
 		applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", err.Error())
-		return
+		return nil
 	}
 	for _, id := range ids {
 		if err := m.registerChatMedia(id, sources, true); err != nil {
 			applog.Error("chat_download", "new_media_register_failed", "chat_job_id", id, "message_id", event.MessageID, "error", err.Error())
-			continue
+			return err
 		}
 		applog.Info("chat_download", "new_media_queued", "chat_job_id", id, "message_id", event.MessageID, "item_count", len(sources))
 	}
+	return nil
 }
 
 func (m *Manager) scanOneChat() error {
@@ -1054,22 +1185,29 @@ func searchMessages(result tg.MessagesMessagesClass) []tg.MessageClass {
 }
 
 func (m *Manager) refreshChatStates() {
-	rows, err := m.db.Query(`SELECT id, listen_new, status, scan_state FROM chat_download_jobs WHERE status NOT IN (?, ?, ?, ?)`, ChatStatusPaused, ChatStatusCancelled, ChatStatusFailed, ChatStatusDeleted)
+	// Only an actively draining history queue needs aggregation. Completed and
+	// listening-only tasks are stable; a newly persisted listener event switches
+	// its parent back to downloading in registerChatMedia.
+	// Query every active parent in one indexed aggregation. The old loop ran a
+	// separate full per-chat aggregate every worker cadence, which becomes
+	// needlessly expensive when several large histories drain concurrently.
+	rows, err := m.db.Query(`SELECT j.id, j.listen_new, j.status,
+	COALESCE(SUM(CASE WHEN i.status IN ('queued', 'running', 'downloaded') THEN 1 ELSE 0 END), 0),
+	COALESCE(SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END), 0),
+	COALESCE(SUM(CASE WHEN i.status = 'queued' THEN 1 ELSE 0 END), 0)
+FROM chat_download_jobs j
+LEFT JOIN chat_download_items i ON i.chat_job_id = j.id AND i.status IN ('queued', 'running', 'downloaded', 'failed')
+WHERE j.status = ? AND j.scan_state = ?
+GROUP BY j.id, j.listen_new, j.status`, ChatStatusDownloading, chatScanCompleted)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id, status, scan string
+		var id, status string
 		var listen int
-		if err := rows.Scan(&id, &listen, &status, &scan); err != nil {
-			continue
-		}
-		if scan != chatScanCompleted {
-			continue
-		}
 		var active, failed, pending int
-		if err := m.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'downloaded') THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) FROM chat_download_items WHERE chat_job_id = ?`, id).Scan(&active, &failed, &pending); err != nil {
+		if err := rows.Scan(&id, &listen, &status, &active, &failed, &pending); err != nil {
 			continue
 		}
 		next := ChatStatusCompleted

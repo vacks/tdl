@@ -375,3 +375,79 @@ func TestPostgresStalledChatBatchRequeuesOnlyUnfinishedMedia(t *testing.T) {
 		t.Fatalf("claims=%d err=%v, want 0", claims, err)
 	}
 }
+
+func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	path := t.TempDir() + "/published.bin"
+	if err := os.WriteFile(path, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('reconcile-chat','tg://chat','channel','channel:reconcile',1,'test','account','downloading','completed','{}',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, final_path, status, discovered_at) VALUES ('reconcile-chat','channel:reconcile',7,'published.bin',?,'downloaded',?)`, path, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reconcileChatPublishedItems(); err != nil {
+		t.Fatal(err)
+	}
+	var itemStatus, mediaStatus, finalPath string
+	if err := db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = 'reconcile-chat' AND message_id = 7`).Scan(&itemStatus); err != nil || itemStatus != "completed" {
+		t.Fatalf("chat item status=%q err=%v, want completed", itemStatus, err)
+	}
+	if err := db.QueryRow(`SELECT status, final_path FROM downloaded_media WHERE dialog_key = 'channel:reconcile' AND message_id = 7`).Scan(&mediaStatus, &finalPath); err != nil || mediaStatus != "completed" || finalPath != path {
+		t.Fatalf("global media=%q/%q err=%v, want completed/%q", mediaStatus, finalPath, err, path)
+	}
+}
+
+func TestPostgresSummaryIncludesChatDownloadItems(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES ('summary-message','tg://message','queued',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status, finished_at) VALUES ('summary-message','channel:summary',1,1,'message.bin','queued',''), ('summary-message','channel:summary',1,2,'failed.bin','failed',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('summary-chat','tg://chat','channel','channel:chat-summary',2,'test','account','downloading','completed','{}',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, status, finished_at, discovered_at) VALUES ('summary-chat','channel:chat-summary',1,'chat.bin','running','',?), ('summary-chat','channel:chat-summary',2,'chat-failed.bin','failed',?,?)`, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	active, failed := m.Summary()
+	if active != 2 || failed != 2 {
+		t.Fatalf("Summary()=%d active, %d failed; want 2, 2", active, failed)
+	}
+}

@@ -25,14 +25,11 @@ func Load() (Config, error) {
 		DataDir:         value("TDL_DATA_DIR", "./data"),
 		DownloadDir:     value("TDL_DOWNLOAD_DIR", "./downloads"),
 		AdminUsername:   value("TDL_ADMIN_USERNAME", "admin"),
-		InitialPassword: os.Getenv("TDL_ADMIN_INITIAL_PASSWORD"),
+		InitialPassword: value("TDL_ADMIN_INITIAL_PASSWORD", "admin"),
 		CookieSecure:    boolValue("TDL_COOKIE_SECURE", false),
 		TrustProxy:      boolValue("TDL_TRUST_PROXY", false),
 		TrustedOrigins:  splitValues(os.Getenv("TDL_TRUSTED_ORIGINS")),
 		DatabaseURL:     value("TDL_DATABASE_URL", "postgres://tdl:tdl@postgres:5432/tdl?sslmode=disable"),
-	}
-	if strings.TrimSpace(cfg.InitialPassword) == "" {
-		return Config{}, fmt.Errorf("TDL_ADMIN_INITIAL_PASSWORD is required for the first start")
 	}
 	if err := os.MkdirAll(filepath.Clean(cfg.DataDir), 0o700); err != nil {
 		return Config{}, fmt.Errorf("create data directory: %w", err)
