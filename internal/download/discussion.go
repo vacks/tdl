@@ -260,5 +260,8 @@ func isNoDiscussionError(err error) bool {
 }
 
 func logRelatedWarning(accountID string, messageID int, err error) {
-	applog.Info("discussion_download", "related_messages_unavailable", "account_id", accountID, "message_id", messageID, "error", err.Error())
+	// This is non-fatal for the original message, but it is operationally
+	// significant: silently treating an inaccessible comment area as empty
+	// would hide an incomplete download from the administrator.
+	applog.Error("discussion_download", "related_messages_unavailable", "account_id", accountID, "message_id", messageID, "error", err.Error())
 }

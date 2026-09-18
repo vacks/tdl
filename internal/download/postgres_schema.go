@@ -54,7 +54,7 @@ func (m *Manager) migratePostgres() error {
  UNIQUE(account_id, dialog_key, message_id)
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_reply_roots (
- chat_job_id TEXT NOT NULL, account_id TEXT NOT NULL, discussion_dialog_key TEXT NOT NULL, root_message_id INTEGER NOT NULL, origin_message_id INTEGER NOT NULL, PRIMARY KEY(chat_job_id, discussion_dialog_key, root_message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+ chat_job_id TEXT NOT NULL, account_id TEXT NOT NULL, discussion_dialog_key TEXT NOT NULL, root_message_id INTEGER NOT NULL, origin_message_id INTEGER NOT NULL, discussion_peer_type TEXT NOT NULL DEFAULT '', discussion_peer_id BIGINT NOT NULL DEFAULT 0, discussion_peer_hash BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(chat_job_id, discussion_dialog_key, root_message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 )`,
 		`CREATE TABLE IF NOT EXISTS downloaded_media (
  dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, final_path TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, owner_kind TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(dialog_key, message_id)
@@ -290,6 +290,14 @@ END $$`,
 			`UPDATE chat_download_items i SET origin_dialog_name = j.dialog_name, origin_message_id = i.message_id FROM chat_download_jobs j WHERE j.id = i.chat_job_id AND i.origin_dialog_name = ''`,
 			`CREATE TABLE IF NOT EXISTS chat_reply_roots (chat_job_id TEXT NOT NULL, account_id TEXT NOT NULL, discussion_dialog_key TEXT NOT NULL, root_message_id INTEGER NOT NULL, origin_message_id INTEGER NOT NULL, PRIMARY KEY(chat_job_id, discussion_dialog_key, root_message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE)`,
 			`CREATE INDEX IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
+		},
+	},
+	{
+		version: 12,
+		statements: []string{
+			`ALTER TABLE chat_reply_roots ADD COLUMN IF NOT EXISTS discussion_peer_type TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_reply_roots ADD COLUMN IF NOT EXISTS discussion_peer_id BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_reply_roots ADD COLUMN IF NOT EXISTS discussion_peer_hash BIGINT NOT NULL DEFAULT 0`,
 		},
 	},
 }

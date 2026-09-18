@@ -1010,6 +1010,22 @@ SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_d
 	m.mu.Unlock()
 }
 
+// addChatWatched closes the interval between persisting a discussion mapping
+// and the next periodic listener reconciliation. The account listener is
+// already running for the parent channel, so only its in-memory filter needs
+// updating.
+func (m *Manager) addChatWatched(accountID, dialogKey string) {
+	if accountID == "" || dialogKey == "" {
+		return
+	}
+	m.mu.Lock()
+	if m.chatWatched[accountID] == nil {
+		m.chatWatched[accountID] = make(map[string]struct{})
+	}
+	m.chatWatched[accountID][dialogKey] = struct{}{}
+	m.mu.Unlock()
+}
+
 func (m *Manager) runChatListener(ctx context.Context, accountID string, listener *chatListener) {
 	err := m.accounts.ListenNewMessages(ctx, accountID, func(_ context.Context, event telegram.NewMessageEvent) {
 		m.enqueueChatMessage(event)
@@ -1119,21 +1135,26 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			if originKey == "" || originID <= 0 || resolvedRootID <= 0 {
 				return nil
 			}
-			originRows, originErr := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, event.AccountID, originKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+			originRows, originErr := m.db.Query(`SELECT id, config_json FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, event.AccountID, originKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 			if originErr != nil {
 				return originErr
 			}
 			for originRows.Next() {
-				var id string
-				if originRows.Scan(&id) != nil {
+				var id, configJSON string
+				if originRows.Scan(&id, &configJSON) != nil {
+					continue
+				}
+				if !targetIncludesReplies(storedChatTarget{configJSON: configJSON}) {
 					continue
 				}
 				ids = append(ids, id)
 				originByJob[id] = originID
-				if _, persistErr := m.db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO NOTHING`, id, event.AccountID, dialogKey, resolvedRootID, originID); persistErr != nil {
+				direct := makeDirectPeer(event.InputPeer)
+				if _, persistErr := m.db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id, discussion_peer_type, discussion_peer_id, discussion_peer_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO UPDATE SET discussion_peer_type = EXCLUDED.discussion_peer_type, discussion_peer_id = EXCLUDED.discussion_peer_id, discussion_peer_hash = EXCLUDED.discussion_peer_hash`, id, event.AccountID, dialogKey, resolvedRootID, originID, direct.kind, direct.id, direct.hash); persistErr != nil {
 					_ = originRows.Close()
 					return persistErr
 				}
+				m.addChatWatched(event.AccountID, dialogKey)
 			}
 			if originErr := originRows.Err(); originErr != nil {
 				_ = originRows.Close()
@@ -1159,6 +1180,11 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 		// replies beneath that reply would both waste API calls and violate the
 		// stored task's origin mapping.
 		if originByJob[id] > 0 {
+			if !includeReplies {
+				// Candidate admission is account-wide so an unmapped first comment
+				// can be discovered. Per-task snapshots remain authoritative.
+				continue
+			}
 			includeReplies = false
 		}
 		if _, done := resolved[includeReplies]; !done && resolvedErr[includeReplies] == nil {
@@ -1478,7 +1504,11 @@ func (m *Manager) rememberChatDiscussionRoot(ctx context.Context, api *tg.Client
 	if key == "" {
 		return nil
 	}
-	_, err = m.db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO NOTHING`, target.ID, target.AccountID, key, rootID, originMessageID)
+	direct := makeDirectPeer(peer)
+	_, err = m.db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id, discussion_peer_type, discussion_peer_id, discussion_peer_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO UPDATE SET discussion_peer_type = EXCLUDED.discussion_peer_type, discussion_peer_id = EXCLUDED.discussion_peer_id, discussion_peer_hash = EXCLUDED.discussion_peer_hash`, target.ID, target.AccountID, key, rootID, originMessageID, direct.kind, direct.id, direct.hash)
+	if err == nil {
+		m.addChatWatched(target.AccountID, key)
+	}
 	return err
 }
 
