@@ -16,7 +16,7 @@ func (m *Manager) migratePostgres() error {
 )`,
 		`CREATE TABLE IF NOT EXISTS download_items (
  id BIGSERIAL PRIMARY KEY, job_id TEXT NOT NULL, dialog_type TEXT NOT NULL DEFAULT 'legacy', dialog_key TEXT NOT NULL, dialog_id BIGINT NOT NULL, message_id INTEGER NOT NULL, grouped_id BIGINT NOT NULL DEFAULT 0,
- message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL, size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+ message_text TEXT NOT NULL DEFAULT '', origin_dialog_name TEXT NOT NULL DEFAULT '', origin_message_id INTEGER NOT NULL DEFAULT 0, is_comment SMALLINT NOT NULL DEFAULT 0, source_peer_type TEXT NOT NULL DEFAULT '', source_peer_id BIGINT NOT NULL DEFAULT 0, source_peer_hash BIGINT NOT NULL DEFAULT 0, original_name TEXT NOT NULL, size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
  UNIQUE(dialog_key, message_id), FOREIGN KEY(job_id) REFERENCES download_jobs(id)
 )`,
 		`CREATE TABLE IF NOT EXISTS bot_lifecycle_messages (
@@ -37,7 +37,7 @@ func (m *Manager) migratePostgres() error {
  id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_id BIGINT NOT NULL, dialog_name TEXT NOT NULL, account_id TEXT NOT NULL, direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id BIGINT NOT NULL DEFAULT 0, direct_peer_hash BIGINT NOT NULL DEFAULT 0, start_message_id INTEGER NOT NULL DEFAULT 0, upper_message_id INTEGER NOT NULL DEFAULT 0, listen_new SMALLINT NOT NULL DEFAULT 0, status TEXT NOT NULL, scan_state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_download_items (
- chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '', dialog_type TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, grouped_id BIGINT NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL DEFAULT '', size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'queued', error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
+ chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '', dialog_type TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, grouped_id BIGINT NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', origin_dialog_name TEXT NOT NULL DEFAULT '', origin_message_id INTEGER NOT NULL DEFAULT 0, is_comment SMALLINT NOT NULL DEFAULT 0, source_peer_type TEXT NOT NULL DEFAULT '', source_peer_id BIGINT NOT NULL DEFAULT 0, source_peer_hash BIGINT NOT NULL DEFAULT 0, original_name TEXT NOT NULL DEFAULT '', size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'queued', error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 )`,
 		// chat_download_stats is a derived, rebuildable cache for presentation and
 		// parent-state decisions. chat_download_items remains the only source of
@@ -49,9 +49,12 @@ func (m *Manager) migratePostgres() error {
  chat_job_id TEXT NOT NULL, stream_kind TEXT NOT NULL, offset_message_id INTEGER NOT NULL DEFAULT 0, initialized SMALLINT NOT NULL DEFAULT 0, completed SMALLINT NOT NULL DEFAULT 0, PRIMARY KEY(chat_job_id, stream_kind), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 	)`,
 		`CREATE TABLE IF NOT EXISTS chat_message_inbox (
- id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, message_id INTEGER NOT NULL,
+ id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, message_id INTEGER NOT NULL, reply_to_message_id INTEGER NOT NULL DEFAULT 0, reply_to_top_id INTEGER NOT NULL DEFAULT 0,
  peer_type TEXT NOT NULL, peer_id BIGINT NOT NULL DEFAULT 0, peer_hash BIGINT NOT NULL DEFAULT 0, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  UNIQUE(account_id, dialog_key, message_id)
+)`,
+		`CREATE TABLE IF NOT EXISTS chat_reply_roots (
+ chat_job_id TEXT NOT NULL, account_id TEXT NOT NULL, discussion_dialog_key TEXT NOT NULL, root_message_id INTEGER NOT NULL, origin_message_id INTEGER NOT NULL, PRIMARY KEY(chat_job_id, discussion_dialog_key, root_message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
 )`,
 		`CREATE TABLE IF NOT EXISTS downloaded_media (
  dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, final_path TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, owner_kind TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(dialog_key, message_id)
@@ -82,6 +85,7 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS chat_download_items_child_job ON chat_download_items(child_job_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
 		`CREATE INDEX IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
+		`CREATE INDEX IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_failed_finished_at ON chat_download_items(status, finished_at) WHERE status = 'failed'`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_active_status ON chat_download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_state_by_job ON chat_download_items(chat_job_id, status) WHERE status IN ('queued', 'running', 'downloaded', 'failed')`,
@@ -262,6 +266,30 @@ END $$`,
  SELECT c.id, COUNT(i.message_id), COUNT(*) FILTER (WHERE i.status = 'queued'), COUNT(*) FILTER (WHERE i.status = 'waiting'), COUNT(*) FILTER (WHERE i.status = 'running'), COUNT(*) FILTER (WHERE i.status = 'downloaded'), COUNT(*) FILTER (WHERE i.status = 'completed'), COUNT(*) FILTER (WHERE i.status = 'failed'), COUNT(*) FILTER (WHERE i.status = 'paused'), COUNT(*) FILTER (WHERE i.status = 'cancelled'), COALESCE(MIN(i.message_id), 0), NOW()::text
  FROM chat_download_jobs c LEFT JOIN chat_download_items i ON i.chat_job_id = c.id GROUP BY c.id
  ON CONFLICT (chat_job_id) DO UPDATE SET discovered = EXCLUDED.discovered, queued = EXCLUDED.queued, waiting = EXCLUDED.waiting, running = EXCLUDED.running, downloaded = EXCLUDED.downloaded, completed = EXCLUDED.completed, failed = EXCLUDED.failed, paused = EXCLUDED.paused, cancelled = EXCLUDED.cancelled, earliest_message_id = EXCLUDED.earliest_message_id, updated_at = EXCLUDED.updated_at`,
+		},
+	},
+	{
+		version: 11,
+		statements: []string{
+			`ALTER TABLE download_items ADD COLUMN IF NOT EXISTS origin_dialog_name TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE download_items ADD COLUMN IF NOT EXISTS origin_message_id INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE download_items ADD COLUMN IF NOT EXISTS is_comment SMALLINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE download_items ADD COLUMN IF NOT EXISTS source_peer_type TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE download_items ADD COLUMN IF NOT EXISTS source_peer_id BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE download_items ADD COLUMN IF NOT EXISTS source_peer_hash BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS origin_dialog_name TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS origin_message_id INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS is_comment SMALLINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS source_peer_type TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS source_peer_id BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_items ADD COLUMN IF NOT EXISTS source_peer_hash BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_message_inbox ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_message_inbox ADD COLUMN IF NOT EXISTS reply_to_top_id INTEGER NOT NULL DEFAULT 0`,
+			`CREATE INDEX IF NOT EXISTS chat_download_items_origin ON chat_download_items(chat_job_id, origin_message_id) WHERE is_comment = 1`,
+			`UPDATE download_items i SET origin_dialog_name = j.dialog_name, origin_message_id = i.message_id FROM download_jobs j WHERE j.id = i.job_id AND i.origin_dialog_name = ''`,
+			`UPDATE chat_download_items i SET origin_dialog_name = j.dialog_name, origin_message_id = i.message_id FROM chat_download_jobs j WHERE j.id = i.chat_job_id AND i.origin_dialog_name = ''`,
+			`CREATE TABLE IF NOT EXISTS chat_reply_roots (chat_job_id TEXT NOT NULL, account_id TEXT NOT NULL, discussion_dialog_key TEXT NOT NULL, root_message_id INTEGER NOT NULL, origin_message_id INTEGER NOT NULL, PRIMARY KEY(chat_job_id, discussion_dialog_key, root_message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE)`,
+			`CREATE INDEX IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
 		},
 	},
 }

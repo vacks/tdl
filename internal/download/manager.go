@@ -52,22 +52,33 @@ const (
 )
 
 type Item struct {
-	ID           int64  `json:"id"`
-	DialogType   string `json:"dialogType"`
-	DialogKey    string `json:"dialogKey"`
-	DialogID     int64  `json:"dialogId"`
-	MessageID    int    `json:"messageId"`
-	GroupedID    int64  `json:"groupedId,omitempty"`
-	MessageText  string `json:"messageText,omitempty"`
-	OriginalName string `json:"originalName"`
-	Size         int64  `json:"size"`
-	FinalPath    string `json:"finalPath,omitempty"`
-	StartedAt    string `json:"startedAt,omitempty"`
-	FinishedAt   string `json:"finishedAt,omitempty"`
-	ElapsedMS    int64  `json:"elapsedMs"`
-	Attempts     int    `json:"attempts"`
-	Status       string `json:"status"`
-	Error        string `json:"error,omitempty"`
+	ID         int64  `json:"id"`
+	DialogType string `json:"dialogType"`
+	DialogKey  string `json:"dialogKey"`
+	DialogID   int64  `json:"dialogId"`
+	MessageID  int    `json:"messageId"`
+	GroupedID  int64  `json:"groupedId,omitempty"`
+	// Origin* is the stable presentation context. It deliberately differs from
+	// the actual source dialog for a channel discussion reply: downloads and
+	// deduplication always use DialogKey/MessageID, while final naming can keep
+	// a post and its replies together in the originating channel directory.
+	OriginDialogName string `json:"originDialogName,omitempty"`
+	OriginMessageID  int    `json:"originMessageId,omitempty"`
+	IsComment        bool   `json:"isComment,omitempty"`
+	SourcePeerType   string `json:"-"`
+	SourcePeerID     int64  `json:"-"`
+	SourcePeerHash   int64  `json:"-"`
+	ReplyRootID      int    `json:"-"`
+	MessageText      string `json:"messageText,omitempty"`
+	OriginalName     string `json:"originalName"`
+	Size             int64  `json:"size"`
+	FinalPath        string `json:"finalPath,omitempty"`
+	StartedAt        string `json:"startedAt,omitempty"`
+	FinishedAt       string `json:"finishedAt,omitempty"`
+	ElapsedMS        int64  `json:"elapsedMs"`
+	Attempts         int    `json:"attempts"`
+	Status           string `json:"status"`
+	Error            string `json:"error,omitempty"`
 }
 
 type Job struct {
@@ -107,10 +118,37 @@ type source struct {
 	Item
 	DialogName string
 	MediaType  string
+	Direct     directPeer
 }
 type directPeer struct {
 	kind     string
 	id, hash int64
+}
+
+func (p directPeer) inputPeer() tg.InputPeerClass {
+	switch p.kind {
+	case "self":
+		return &tg.InputPeerSelf{}
+	case "user":
+		return &tg.InputPeerUser{UserID: p.id, AccessHash: p.hash}
+	case "chat":
+		return &tg.InputPeerChat{ChatID: p.id}
+	case "channel":
+		return &tg.InputPeerChannel{ChannelID: p.id, AccessHash: p.hash}
+	default:
+		return nil
+	}
+}
+
+func setSourcePeer(items []source, input tg.InputPeerClass) []source {
+	direct := makeDirectPeer(input)
+	for i := range items {
+		items[i].Direct = direct
+		items[i].SourcePeerType = direct.kind
+		items[i].SourcePeerID = direct.id
+		items[i].SourcePeerHash = direct.hash
+	}
+	return items
 }
 
 const bytesPerMiB int64 = 1024 * 1024
@@ -922,7 +960,7 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 		return Submission{}, false, err
 	}
 	for _, item := range sources {
-		result, insertErr := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT(dialog_key, message_id) DO NOTHING`, id, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginalName, item.Size)
+		result, insertErr := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT(dialog_key, message_id) DO NOTHING`, id, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size)
 		if insertErr != nil {
 			return Submission{}, false, insertErr
 		}
@@ -1100,14 +1138,6 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 		config.Download = snapshot
 	}
-	// One upstream invocation resolves exactly one dialog, so MessageID is
-	// sufficient for callback correlation here. Do not use its numeric dialog
-	// ID: Telegram represents some dialogs (notably "Saved Messages") with a
-	// different peer form in download callbacks than in the update stream.
-	pendingByMessage := make(map[int]source, len(pending))
-	for _, item := range pending {
-		pendingByMessage[item.MessageID] = item
-	}
 	watchdog := startTransferWatchdog(transferCtx, upstreamWatchPeriod, upstreamInitialTimeout, upstreamIdleTimeout, stopTransfer, func() bool {
 		if m.stopForInactiveParent(job.ID) {
 			return false
@@ -1134,52 +1164,37 @@ func (m *Manager) run(job Job, sources []source) {
 	// marker so recreating it starts with a new temporary directory.
 	restart := m.consumeRestart(job.AccountID, job.SourceURL)
 	err = m.accounts.Run(transferCtx, job.AccountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		opts := upstreamDL.Options{URLs: []string{job.SourceURL}, Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Restart: restart, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
-			if m.status(job.ID) != "running" {
-				return
+		// Upstream callbacks identify only a message ID. Execute one real
+		// Telegram dialog at a time so a discussion-group comment cannot collide
+		// with a channel post that happens to have the same numeric message ID.
+		groups := make([][]source, 0, 2)
+		groupIndex := make(map[string]int)
+		for _, item := range pending {
+			direct := item.Direct
+			if direct.kind == "" {
+				direct = directPeer{kind: job.DirectPeerType, id: job.DirectPeerID, hash: job.DirectPeerHash}
 			}
-			watchdog.Touch()
-			item, ok := pendingByMessage[update.MessageID]
-			if !ok {
-				return
+			key := fmt.Sprintf("%s:%d:%d", direct.kind, direct.id, direct.hash)
+			index, exists := groupIndex[key]
+			if !exists {
+				index = len(groups)
+				groupIndex[key] = index
+				groups = append(groups, nil)
 			}
-			started, _ := m.progress.Update(job.ID, item.Item, update)
-			if started {
-				recordStateErr(m.markItemStarted(item))
+			item.Direct = direct
+			groups[index] = append(groups[index], item)
+		}
+		for groupNumber, batch := range groups {
+			peer := batch[0].Direct.inputPeer()
+			if peer == nil {
+				return errors.New("下载文件缺少 Telegram 会话引用")
 			}
-		}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
-			if m.status(job.ID) != "running" {
-				return
-			}
-			watchdog.Touch()
-			item, ok := pendingByMessage[update.MessageID]
-			if !ok {
-				return
-			}
-			recordStateErr(m.markItemFinished(item))
-			// This file has left the network transfer phase. Remove its live
-			// sample now so its last callback cannot linger in a task rate while
-			// the final-path move runs asynchronously.
-			m.progress.ClearItem(job.ID, item.Item)
-			publishWG.Add(1)
-			go func() {
-				defer publishWG.Done()
-				recordStateErr(m.publishItem(job.ID, update.Path, item, config))
-			}()
-		}}
-		if peer := job.directInputPeer(); peer != nil {
-			opts.URLs = nil
-			// A chat child job may contain many media messages. Albums are passed
-			// once by their earliest member because upstream expands Group=true to
-			// all of their siblings; sending every member would download an album
-			// repeatedly.
-			messageIDs := make([]int, 0, len(sources))
-			seenMessages := make(map[int]struct{}, len(sources))
+			byMessage := make(map[int]source, len(batch))
+			messageIDs := make([]int, 0, len(batch))
+			seenMessages := make(map[int]struct{}, len(batch))
 			seenGroups := make(map[int64]struct{})
-			// Only submit the unfinished media. Replaying every original member on
-			// a resumed batch can make an album callback wait on files already
-			// published, while wasting bandwidth on completed files.
-			for _, item := range pending {
+			for _, item := range batch {
+				byMessage[item.MessageID] = item
 				if item.GroupedID != 0 {
 					if _, exists := seenGroups[item.GroupedID]; exists {
 						continue
@@ -1192,9 +1207,40 @@ func (m *Manager) run(job Job, sources []source) {
 				seenMessages[item.MessageID] = struct{}{}
 				messageIDs = append(messageIDs, item.MessageID)
 			}
-			opts.DirectDialogs = [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}
+			opts := upstreamDL.Options{Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Restart: restart && groupNumber == 0, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
+				if m.status(job.ID) != "running" {
+					return
+				}
+				watchdog.Touch()
+				item, ok := byMessage[update.MessageID]
+				if !ok {
+					return
+				}
+				if started, _ := m.progress.Update(job.ID, item.Item, update); started {
+					recordStateErr(m.markItemStarted(item))
+				}
+			}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
+				if m.status(job.ID) != "running" {
+					return
+				}
+				watchdog.Touch()
+				item, ok := byMessage[update.MessageID]
+				if !ok {
+					return
+				}
+				recordStateErr(m.markItemFinished(item))
+				m.progress.ClearItem(job.ID, item.Item)
+				publishWG.Add(1)
+				go func(item source, path string) {
+					defer publishWG.Done()
+					recordStateErr(m.publishItem(job.ID, path, item, config))
+				}(item, update.Path)
+			}}
+			if err := upstreamDL.Run(ctx, client, kvd, opts); err != nil {
+				return err
+			}
 		}
-		return upstreamDL.Run(ctx, client, kvd, opts)
+		return nil
 	})
 	// File completion callbacks run in the upstream download workers. Their
 	// publishing work is deliberately asynchronous, but the job state must not
@@ -1477,23 +1523,26 @@ func (m *Manager) setMessageItemWaiting(jobID string, item source) error {
 // lightweight and bounded, so a large historical chat index cannot create a
 // polling storm.
 func (m *Manager) reconcileMessageClaims() {
-	rows, err := m.db.Query(`SELECT i.job_id, i.dialog_type, i.dialog_key, i.dialog_id, i.message_id, i.grouped_id, i.message_text, i.original_name, i.size, j.dialog_name, j.status FROM download_items i JOIN download_jobs j ON j.id = i.job_id WHERE i.status = 'waiting' AND j.status IN ('queued', 'partial', 'failed') ORDER BY j.updated_at LIMIT 256`)
+	rows, err := m.db.Query(`SELECT i.job_id, i.dialog_type, i.dialog_key, i.dialog_id, i.message_id, i.grouped_id, i.message_text, i.origin_dialog_name, i.origin_message_id, i.is_comment, i.source_peer_type, i.source_peer_id, i.source_peer_hash, i.original_name, i.size, j.dialog_name, j.status FROM download_items i JOIN download_jobs j ON j.id = i.job_id WHERE i.status = 'waiting' AND j.status IN ('queued', 'partial', 'failed') ORDER BY j.updated_at LIMIT 256`)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var jobID, dialogName, jobStatus string
+		var isComment int
 		var item Item
-		if err := rows.Scan(&jobID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginalName, &item.Size, &dialogName, &jobStatus); err != nil {
+		if err := rows.Scan(&jobID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginDialogName, &item.OriginMessageID, &isComment, &item.SourcePeerType, &item.SourcePeerID, &item.SourcePeerHash, &item.OriginalName, &item.Size, &dialogName, &jobStatus); err != nil {
 			continue
 		}
-		claim, path, err := m.claimMessageMedia(jobID, source{Item: item, DialogName: dialogName})
+		item.IsComment = isComment != 0
+		candidate := source{Item: item, DialogName: dialogName, Direct: directPeer{kind: item.SourcePeerType, id: item.SourcePeerID, hash: item.SourcePeerHash}}
+		claim, path, err := m.claimMessageMedia(jobID, candidate)
 		if err != nil || claim == "waiting" {
 			continue
 		}
 		if claim == "completed" {
-			if m.adoptCompletedMessageItem(jobID, source{Item: item}, path) == nil && m.allItemsCompleted(jobID) {
+			if m.adoptCompletedMessageItem(jobID, candidate, path) == nil && m.allItemsCompleted(jobID) {
 				_ = m.setJob(jobID, "completed", "")
 			}
 			continue
@@ -1626,6 +1675,17 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			}
 			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: peer.VisibleName(), MediaType: messageMediaType(msg)})
 		}
+		originID := firstMessageID(messages, message.ID)
+		result = setOrigin(result, peer.VisibleName(), originID, false)
+		result = setSourcePeer(result, peer.InputPeer())
+		if m.settings.Get().Download.IncludeReplies {
+			related, relatedErr := relatedSources(ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID)
+			if relatedErr != nil {
+				logRelatedWarning(accountID, message.ID, relatedErr)
+			} else {
+				result = append(result, related...)
+			}
+		}
 		return nil
 	})
 	return result, err
@@ -1665,6 +1725,17 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 			}
 			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: dialogName, MediaType: messageMediaType(msg)})
 		}
+		originID := firstMessageID(messages, message.ID)
+		result = setOrigin(result, dialogName, originID, false)
+		result = setSourcePeer(result, inputPeer)
+		if m.settings.Get().Download.IncludeReplies {
+			related, relatedErr := relatedSources(ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID)
+			if relatedErr != nil {
+				logRelatedWarning(accountID, message.ID, relatedErr)
+			} else {
+				result = append(result, related...)
+			}
+		}
 		return nil
 	})
 	return result, err
@@ -1686,7 +1757,7 @@ func groupDisplayText(messages []*tg.Message) string {
 }
 
 func (m *Manager) items(jobID string) ([]Item, error) {
-	rows, err := m.db.Query(`SELECT id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items WHERE job_id = ? ORDER BY id`, jobID)
+	rows, err := m.db.Query(`SELECT id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -1694,9 +1765,11 @@ func (m *Manager) items(jobID string) ([]Item, error) {
 	items := make([]Item, 0)
 	for rows.Next() {
 		var item Item
-		if err := rows.Scan(&item.ID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginalName, &item.Size, &item.FinalPath, &item.StartedAt, &item.FinishedAt, &item.ElapsedMS, &item.Attempts, &item.Status, &item.Error); err != nil {
+		var isComment int
+		if err := rows.Scan(&item.ID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginDialogName, &item.OriginMessageID, &isComment, &item.SourcePeerType, &item.SourcePeerID, &item.SourcePeerHash, &item.OriginalName, &item.Size, &item.FinalPath, &item.StartedAt, &item.FinishedAt, &item.ElapsedMS, &item.Attempts, &item.Status, &item.Error); err != nil {
 			return nil, err
 		}
+		item.IsComment = isComment != 0
 		// Older records predate the size column. When their final file still
 		// exists, expose its actual size without requiring a database reset.
 		if item.Size == 0 && item.FinalPath != "" {
@@ -1719,7 +1792,7 @@ func (m *Manager) sources(jobID string) ([]source, error) {
 	}
 	result := make([]source, 0, len(items))
 	for _, item := range items {
-		result = append(result, source{Item: item, DialogName: dialogName})
+		result = append(result, source{Item: item, DialogName: dialogName, Direct: directPeer{kind: item.SourcePeerType, id: item.SourcePeerID, hash: item.SourcePeerHash}})
 	}
 	return result, nil
 }
@@ -2027,12 +2100,13 @@ func (m *Manager) fail(id string, sources []source, err error) {
 
 func renderName(pattern string, item source) (string, error) {
 	data := struct {
-		DialogID, GroupedID     int64
-		MessageID               int
-		DialogName, MessageText string
-		FileName, FileExt       string
-		DownloadDate            int64
-	}{item.DialogID, item.GroupedID, item.MessageID, sanitizeComponent(item.DialogName), sanitizeComponent(item.MessageText), sanitizeComponent(item.OriginalName), sanitizeComponent(filepath.Ext(item.OriginalName)), time.Now().Unix()}
+		DialogID, GroupedID                       int64
+		MessageID, OriginMessageID                int
+		DialogName, OriginDialogName, MessageText string
+		IsComment                                 bool
+		FileName, FileExt                         string
+		DownloadDate                              int64
+	}{item.DialogID, item.GroupedID, item.MessageID, item.OriginMessageID, sanitizeComponent(item.DialogName), sanitizeComponent(item.OriginDialogName), sanitizeComponent(item.MessageText), item.IsComment, sanitizeComponent(item.OriginalName), sanitizeComponent(filepath.Ext(item.OriginalName)), time.Now().Unix()}
 	tpl, err := template.New("filename").Funcs(template.FuncMap{
 		"formatDate": func(timestamp int64, layout string) string {
 			return time.Unix(timestamp, 0).Format(layout)

@@ -56,6 +56,12 @@ func TestValidateDownloadFilters(t *testing.T) {
 	}
 }
 
+func TestDiscussionRepliesDefaultEnabled(t *testing.T) {
+	if !Defaults().Download.IncludeReplies {
+		t.Fatal("discussion/reply downloads must default to enabled")
+	}
+}
+
 func TestUpdateNormalizesAndPersistsConfiguration(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)

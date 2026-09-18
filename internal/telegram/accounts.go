@@ -67,12 +67,14 @@ type ReactionEvent struct {
 // It intentionally carries an InputPeer, so consumers do not depend on
 // usernames or public links (both may be unavailable for private groups).
 type NewMessageEvent struct {
-	AccountID  string
-	DialogKey  string
-	DialogID   int64
-	DialogName string
-	MessageID  int
-	InputPeer  tg.InputPeerClass
+	AccountID        string
+	DialogKey        string
+	DialogID         int64
+	DialogName       string
+	MessageID        int
+	InputPeer        tg.InputPeerClass
+	ReplyToMessageID int
+	ReplyToTopID     int
 }
 
 type persisted struct {
@@ -443,12 +445,12 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			// code can restore that peer even when this update omitted entities.
 			kind, id := peerIdentity(message.PeerID)
 			key := kind + ":" + fmt.Sprint(id)
-			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID})
+			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 			return
 		}
 		dialogID, _ := inputPeerInfo(input)
 		key := newMessageDialogKey(input, accountID)
-		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input})
+		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 	}
 	dispatcher.OnNewMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 		dispatchMessage(updateCtx, entities, update.Message)
@@ -519,6 +521,26 @@ func (m *Manager) dispatchMessage(accountID string, event NewMessageEvent) {
 	for _, callback := range callbacks {
 		callback(context.Background(), event)
 	}
+}
+
+func replyMessageID(message *tg.Message) int {
+	if reply, ok := message.GetReplyTo(); ok {
+		if header, ok := reply.(*tg.MessageReplyHeader); ok {
+			value, _ := header.GetReplyToMsgID()
+			return value
+		}
+	}
+	return 0
+}
+
+func replyTopID(message *tg.Message) int {
+	if reply, ok := message.GetReplyTo(); ok {
+		if header, ok := reply.(*tg.MessageReplyHeader); ok {
+			value, _ := header.GetReplyToTopID()
+			return value
+		}
+	}
+	return 0
 }
 
 func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateType string, entities tg.Entities, raw tg.MessageClass, client *gotd.Client, onEvent func(context.Context, ReactionEvent)) {

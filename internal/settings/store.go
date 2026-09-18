@@ -31,6 +31,9 @@ type Download struct {
 	MinFileSizeMB int64    `json:"minFileSizeMB"`
 	MaxFileSizeMB int64    `json:"maxFileSizeMB"`
 	FileTypes     []string `json:"fileTypes"`
+	// IncludeReplies controls channel discussion comments and group message
+	// replies. A task snapshots this value at creation time.
+	IncludeReplies bool `json:"includeReplies"`
 }
 
 type BotNotifications struct {
@@ -71,7 +74,8 @@ func Defaults() Values {
 		TempFilenameTemplate: "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}",
 		// This is evaluated by the web application after download and therefore
 		// can include our MessageText mapping.
-		FinalFilenameTemplate: "{{ .DialogName }}/{{ .GroupedID }}_{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}",
+		FinalFilenameTemplate: "{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}",
+		IncludeReplies:        true,
 	}, Bot: Bot{Notifications: BotNotifications{TaskCreated: true, TaskCompleted: true, TaskPartial: true, TaskFailed: true}}, Reaction: Reaction{Emojis: []string{"👍"}}}
 }
 
@@ -99,6 +103,16 @@ func Open(dataDir string) (*Store, error) {
 	}
 	if err := json.Unmarshal(data, &s.values); err != nil {
 		return nil, fmt.Errorf("parse settings: %w", err)
+	}
+	// Existing settings files predate includeReplies. Missing means the new
+	// default (enabled); an explicit false remains a deliberate choice.
+	var raw struct {
+		Download map[string]json.RawMessage `json:"download"`
+	}
+	if json.Unmarshal(data, &raw) == nil {
+		if _, present := raw.Download["includeReplies"]; !present {
+			s.values.Download.IncludeReplies = true
+		}
 	}
 	normalizeDownload(&s.values.Download)
 	normalizeBot(&s.values.Bot)
@@ -238,7 +252,7 @@ func validateFinalTemplate(pattern string) error {
 		return fmt.Errorf("最终文件命名模板无效: %w", err)
 	}
 	var rendered bytes.Buffer
-	data := map[string]any{"DialogID": int64(1), "DialogName": "dialog", "MessageID": 1, "GroupedID": int64(0), "MessageText": "message", "FileName": "file.txt", "FileExt": ".txt", "DownloadDate": time.Now().Unix()}
+	data := map[string]any{"DialogID": int64(1), "DialogName": "dialog", "OriginDialogName": "dialog", "MessageID": 1, "OriginMessageID": 1, "GroupedID": int64(0), "IsComment": false, "MessageText": "message", "FileName": "file.txt", "FileExt": ".txt", "DownloadDate": time.Now().Unix()}
 	if err := tpl.Execute(&rendered, data); err != nil {
 		return fmt.Errorf("最终文件命名模板无效: %w", err)
 	}

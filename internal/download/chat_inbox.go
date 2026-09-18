@@ -59,8 +59,8 @@ func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := m.db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, dialog_name, dialog_id, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account_id, dialog_key, message_id) DO NOTHING`, event.AccountID, key, event.DialogName, event.DialogID, event.MessageID, direct.kind, direct.id, direct.hash, now, now, now)
+	result, err := m.db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, dialog_name, dialog_id, message_id, reply_to_message_id, reply_to_top_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account_id, dialog_key, message_id) DO NOTHING`, event.AccountID, key, event.DialogName, event.DialogID, event.MessageID, event.ReplyToMessageID, event.ReplyToTopID, direct.kind, direct.id, direct.hash, now, now, now)
 	if err != nil {
 		// A transient persistence error is retried only when Telegram redelivers
 		// this update. Once admitted, later processing is fully durable.
@@ -84,7 +84,7 @@ func (m *Manager) claimChatMessageInbox(limit int) ([]chatMessageInboxEvent, err
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	rows, err := tx.Query(`SELECT id, account_id, dialog_name, dialog_id, message_id, peer_type, peer_id, peer_hash, attempts
+	rows, err := tx.Query(`SELECT id, account_id, dialog_name, dialog_id, message_id, reply_to_message_id, reply_to_top_id, peer_type, peer_id, peer_hash, attempts
 FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?`, now, limit)
 	if err != nil {
 		return nil, err
@@ -93,15 +93,15 @@ FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER 
 	for rows.Next() {
 		var item chatMessageInboxEvent
 		var accountID, name, peerType string
-		var dialogID, messageID, peerID, peerHash int64
-		if err := rows.Scan(&item.id, &accountID, &name, &dialogID, &messageID, &peerType, &peerID, &peerHash, &item.attempts); err != nil {
+		var dialogID, messageID, replyToMessageID, replyToTopID, peerID, peerHash int64
+		if err := rows.Scan(&item.id, &accountID, &name, &dialogID, &messageID, &replyToMessageID, &replyToTopID, &peerType, &peerID, &peerHash, &item.attempts); err != nil {
 			return nil, err
 		}
 		peer := chatInboxPeer(peerType, peerID, peerHash)
 		if peer == nil {
 			return nil, fmt.Errorf("会话消息事件 %d 的会话引用无效", item.id)
 		}
-		item.event = telegram.NewMessageEvent{AccountID: accountID, DialogID: dialogID, DialogName: name, MessageID: int(messageID), InputPeer: peer}
+		item.event = telegram.NewMessageEvent{AccountID: accountID, DialogID: dialogID, DialogName: name, MessageID: int(messageID), ReplyToMessageID: int(replyToMessageID), ReplyToTopID: int(replyToTopID), InputPeer: peer}
 		result = append(result, item)
 	}
 	if err := rows.Err(); err != nil {
