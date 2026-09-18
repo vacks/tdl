@@ -1066,7 +1066,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 		return nil
 	}
 	_, dialogKey, _ := dialogIdentity(event.InputPeer, event.AccountID)
-	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status = ?`, event.AccountID, dialogKey, chatScanCompleted, ChatStatusListening)
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, event.AccountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 	if err != nil {
 		return err
 	}
@@ -1093,7 +1093,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 		if rootID <= 0 {
 			return nil
 		}
-		replyRows, queryErr := m.db.Query(`SELECT r.chat_job_id, r.origin_message_id FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE r.account_id = ? AND r.discussion_dialog_key = ? AND r.root_message_id = ? AND j.listen_new = 1 AND j.scan_state = ? AND j.status = ?`, event.AccountID, dialogKey, rootID, chatScanCompleted, ChatStatusListening)
+		replyRows, queryErr := m.db.Query(`SELECT r.chat_job_id, r.origin_message_id FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE r.account_id = ? AND r.discussion_dialog_key = ? AND r.root_message_id = ? AND j.listen_new = 1 AND j.scan_state = ? AND j.status IN (?, ?)`, event.AccountID, dialogKey, rootID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 		if queryErr != nil {
 			return queryErr
 		}
@@ -1119,7 +1119,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			if originKey == "" || originID <= 0 || resolvedRootID <= 0 {
 				return nil
 			}
-			originRows, originErr := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status = ?`, event.AccountID, originKey, chatScanCompleted, ChatStatusListening)
+			originRows, originErr := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, event.AccountID, originKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 			if originErr != nil {
 				return originErr
 			}
@@ -1147,29 +1147,62 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			}
 		}
 	}
-	sources, err := m.resolvePeer(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, event.DialogName)
-	if err != nil {
-		applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", err.Error())
-		return nil
-	}
+	resolved := make(map[bool][]source, 2)
+	resolvedErr := make(map[bool]error, 2)
 	for _, id := range ids {
-		items := sources
+		target, targetErr := m.chatTarget(id)
+		if targetErr != nil {
+			return targetErr
+		}
+		includeReplies := targetIncludesReplies(target)
+		// A comment event has already been associated with its parent; expanding
+		// replies beneath that reply would both waste API calls and violate the
+		// stored task's origin mapping.
+		if originByJob[id] > 0 {
+			includeReplies = false
+		}
+		if _, done := resolved[includeReplies]; !done && resolvedErr[includeReplies] == nil {
+			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, event.DialogName, includeReplies)
+		}
+		if resolveErr := resolvedErr[includeReplies]; resolveErr != nil {
+			applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", resolveErr.Error())
+			continue
+		}
+		items := resolved[includeReplies]
 		if originID := originByJob[id]; originID > 0 {
-			job, jobErr := m.GetChat(id)
-			if jobErr != nil {
-				return jobErr
-			}
-			items = make([]source, len(sources))
-			copy(items, sources)
-			items = setOrigin(items, job.DialogName, originID, true)
+			items = make([]source, len(resolved[false]))
+			copy(items, resolved[false])
+			items = setOrigin(items, target.DialogName, originID, true)
 		}
 		if err := m.registerChatMedia(id, items, true); err != nil {
 			applog.Error("chat_download", "new_media_register_failed", "chat_job_id", id, "message_id", event.MessageID, "error", err.Error())
 			return err
 		}
+		if originByJob[id] == 0 && includeReplies {
+			if err := m.rememberNewChatDiscussion(event, target); err != nil {
+				logRelatedWarning(event.AccountID, event.MessageID, err)
+			}
+		}
 		applog.Info("chat_download", "new_media_queued", "chat_job_id", id, "message_id", event.MessageID, "item_count", len(items))
 	}
 	return nil
+}
+
+func targetIncludesReplies(target storedChatTarget) bool {
+	config := settings.Defaults().Download
+	if target.configJSON != "" && json.Unmarshal([]byte(target.configJSON), &config) != nil {
+		return false
+	}
+	return config.IncludeReplies
+}
+
+func (m *Manager) rememberNewChatDiscussion(event telegram.NewMessageEvent, target storedChatTarget) error {
+	if target.DialogType != "channel" || event.InputPeer == nil || event.MessageID <= 0 {
+		return nil
+	}
+	return m.accounts.Run(context.Background(), event.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+		return m.rememberChatDiscussionRoot(ctx, client.API(), target, event.MessageID, event.MessageID)
+	})
 }
 
 func (m *Manager) discoverDiscussionOrigin(event telegram.NewMessageEvent, rootID int) (string, int, int, error) {

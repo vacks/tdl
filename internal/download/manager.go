@@ -1692,6 +1692,13 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 }
 
 func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string) ([]source, error) {
+	return m.resolvePeerWithReplies(ctx, accountID, inputPeer, dialogID, messageID, dialogName, m.settings.Get().Download.IncludeReplies)
+}
+
+// resolvePeerWithReplies is the shared listener/reaction resolver. Chat
+// download tasks pass their persisted configuration snapshot so later global
+// setting changes cannot alter an already-created task.
+func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies bool) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		message, err := tutil.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
@@ -1728,7 +1735,7 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 		originID := firstMessageID(messages, message.ID)
 		result = setOrigin(result, dialogName, originID, false)
 		result = setSourcePeer(result, inputPeer)
-		if m.settings.Get().Download.IncludeReplies {
+		if includeReplies {
 			related, relatedErr := relatedSources(ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID)
 			if relatedErr != nil {
 				logRelatedWarning(accountID, message.ID, relatedErr)
