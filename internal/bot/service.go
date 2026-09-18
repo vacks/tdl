@@ -1447,7 +1447,11 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 				speed = " · " + bytesLabel(int64(p.SpeedBPS)) + "/s"
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%s %s  %s%s", statusIcon(item.Status), html.EscapeString(short(item.OriginalName, 26)), percent, speed))
+		origin := ""
+		if item.IsComment {
+			origin = " · 评论/回复"
+		}
+		lines = append(lines, fmt.Sprintf("%s %s  %s%s%s", statusIcon(item.Status), html.EscapeString(short(item.OriginalName, 26)), percent, speed, origin))
 	}
 	lines = append(lines,
 		"<b>对话：</b>"+html.EscapeString(short(job.DialogName, 36)),

@@ -59,56 +59,93 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 		threadPeer, threadMessageID, isDiscussion = resolvedPeer, resolvedRoot, true
 	}
 
-	result, err := api.MessagesGetReplies(ctx, &tg.MessagesGetRepliesRequest{Peer: threadPeer, MsgID: threadMessageID, Limit: 100})
-	if err != nil {
-		if isNoDiscussionError(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("获取关联回复: %w", err)
-	}
-	entities := entitiesFromMessages(result)
 	dialogType, dialogKey, dialogID := dialogIdentity(threadPeer, accountID)
 	if isDiscussion {
 		// Linked discussions are Telegram supergroups, represented as an
 		// InputPeerChannel on the wire.
 		dialogType = "chat"
 	}
-	dialogName := visiblePeerName(entities, threadPeer, originName)
 	seen := make(map[int]struct{})
 	items := make([]source, 0)
-	for _, raw := range searchMessages(result) {
-		message, ok := raw.(*tg.Message)
-		if !ok || message.ID == threadMessageID {
-			continue
+	// Telegram caps a single reply page. OffsetID is the lowest ID from the
+	// previous page, so this always walks newest to oldest until the server
+	// confirms there are no more replies. Never use a page length as proof that
+	// a thread ended: sparse/deleted messages may yield short intermediate pages.
+	offset := 0
+	for {
+		result, err := api.MessagesGetReplies(ctx, &tg.MessagesGetRepliesRequest{Peer: threadPeer, MsgID: threadMessageID, OffsetID: offset, Limit: 100})
+		if err != nil {
+			if isNoDiscussionError(err) {
+				return items, nil
+			}
+			return nil, fmt.Errorf("获取关联回复: %w", err)
 		}
-		// GetReplies normally returns every member of an album. Ask upstream for
-		// its complete group only once as a safety net for a page boundary.
-		messages := []*tg.Message{message}
-		if _, grouped := message.GetGroupedID(); grouped {
-			group, groupErr := tutil.GetGroupedMessages(ctx, api, threadPeer, message)
-			if groupErr == nil && len(group) > 0 {
-				messages = group
-			}
+		page := searchMessages(result)
+		if len(page) == 0 {
+			break
 		}
-		caption := groupDisplayText(messages)
-		for _, member := range messages {
-			if member == nil {
-				continue
-			}
-			if _, exists := seen[member.ID]; exists {
-				continue
-			}
-			media, ok := tmedia.GetMedia(member)
+		entities := entitiesFromMessages(result)
+		dialogName := visiblePeerName(entities, threadPeer, originName)
+		nextOffset := replyPageNextOffset(page, offset)
+		for _, raw := range page {
+			message, ok := raw.(*tg.Message)
 			if !ok {
 				continue
 			}
-			seen[member.ID] = struct{}{}
-			groupedID, _ := member.GetGroupedID()
-			direct := makeDirectPeer(threadPeer)
-			items = append(items, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: member.ID, GroupedID: groupedID, MessageText: caption, OriginalName: media.Name, Size: media.Size, OriginDialogName: originName, OriginMessageID: originMessageID, IsComment: true, SourcePeerType: direct.kind, SourcePeerID: direct.id, SourcePeerHash: direct.hash, ReplyRootID: threadMessageID}, DialogName: dialogName, MediaType: messageMediaType(member), Direct: direct})
+			if message.ID == threadMessageID {
+				continue
+			}
+			// GetReplies normally returns every member of an album. Ask upstream for
+			// its complete group only once as a safety net for a page boundary.
+			messages := []*tg.Message{message}
+			if _, grouped := message.GetGroupedID(); grouped {
+				group, groupErr := tutil.GetGroupedMessages(ctx, api, threadPeer, message)
+				if groupErr == nil && len(group) > 0 {
+					messages = group
+				}
+			}
+			caption := groupDisplayText(messages)
+			for _, member := range messages {
+				if member == nil {
+					continue
+				}
+				if _, exists := seen[member.ID]; exists {
+					continue
+				}
+				media, ok := tmedia.GetMedia(member)
+				if !ok {
+					continue
+				}
+				seen[member.ID] = struct{}{}
+				groupedID, _ := member.GetGroupedID()
+				direct := makeDirectPeer(threadPeer)
+				items = append(items, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: member.ID, GroupedID: groupedID, MessageText: caption, OriginalName: media.Name, Size: media.Size, OriginDialogName: originName, OriginMessageID: originMessageID, IsComment: true, SourcePeerType: direct.kind, SourcePeerID: direct.id, SourcePeerHash: direct.hash, ReplyRootID: threadMessageID}, DialogName: dialogName, MediaType: messageMediaType(member), Direct: direct})
+			}
 		}
+		if nextOffset == 0 || nextOffset == offset {
+			return nil, fmt.Errorf("关联回复分页游标未推进")
+		}
+		offset = nextOffset
 	}
 	return items, nil
+}
+
+func replyPageNextOffset(page []tg.MessageClass, previous int) int {
+	next := previous
+	for _, raw := range page {
+		var id int
+		switch message := raw.(type) {
+		case *tg.Message:
+			id = message.ID
+		case *tg.MessageEmpty:
+			// Deleted replies retain an ID and must still advance pagination.
+			id = message.ID
+		}
+		if id > 0 && (next == 0 || id < next) {
+			next = id
+		}
+	}
+	return next
 }
 
 // discussionThread resolves a channel post to the actual linked discussion
@@ -136,6 +173,50 @@ func discussionThread(ctx context.Context, api *tg.Client, accountID string, ori
 		return candidate, message.ID, true, nil
 	}
 	return nil, 0, false, nil
+}
+
+// discussionOriginFromRoot recovers the original channel post from a newly
+// received discussion reply when a historical task has not yet seen any reply
+// for that post. Telegram stores the source channel/post in the forwarded
+// discussion-root header, so this costs one request only for the first unknown
+// thread instead of an API call for every historical channel message.
+func discussionOriginFromRoot(ctx context.Context, api *tg.Client, discussionPeer tg.InputPeerClass, rootMessageID int) (originKey string, originMessageID int, resolvedRootMessageID int, err error) {
+	channel, ok := discussionPeer.(*tg.InputPeerChannel)
+	if !ok {
+		return "", 0, rootMessageID, nil
+	}
+	result, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+		Channel: &tg.InputChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
+		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: rootMessageID}},
+	})
+	if err != nil {
+		return "", 0, rootMessageID, fmt.Errorf("读取讨论根消息: %w", err)
+	}
+	for _, raw := range searchMessages(result) {
+		message, ok := raw.(*tg.Message)
+		if !ok {
+			continue
+		}
+		resolvedRootMessageID = message.ID
+		fwd, ok := message.GetFwdFrom()
+		if !ok {
+			return "", 0, resolvedRootMessageID, nil
+		}
+		from, ok := fwd.GetFromID()
+		if !ok {
+			return "", 0, resolvedRootMessageID, nil
+		}
+		channelFrom, ok := from.(*tg.PeerChannel)
+		if !ok {
+			return "", 0, resolvedRootMessageID, nil
+		}
+		postID, ok := fwd.GetChannelPost()
+		if !ok || postID <= 0 {
+			return "", 0, resolvedRootMessageID, nil
+		}
+		return fmt.Sprintf("channel:%d", channelFrom.ChannelID), postID, resolvedRootMessageID, nil
+	}
+	return "", 0, rootMessageID, nil
 }
 
 func entitiesFromMessages(result tg.MessagesMessagesClass) peer.Entities {
@@ -172,7 +253,10 @@ func visiblePeerName(entities peer.Entities, input tg.InputPeerClass, fallback s
 
 func isNoDiscussionError(err error) bool {
 	text := strings.ToUpper(err.Error())
-	return strings.Contains(text, "MSG_ID_INVALID") || strings.Contains(text, "MESSAGE_ID_INVALID") || strings.Contains(text, "CHANNEL_PRIVATE") || strings.Contains(text, "CHAT_ADMIN_REQUIRED")
+	// Only a genuinely missing thread is non-fatal. Permission errors must be
+	// surfaced to the task/log instead of being mistaken for an empty comment
+	// section.
+	return strings.Contains(text, "MSG_ID_INVALID") || strings.Contains(text, "MESSAGE_ID_INVALID")
 }
 
 func logRelatedWarning(accountID string, messageID int, err error) {

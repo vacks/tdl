@@ -75,7 +75,10 @@ const (
 // four streams cover ordinary photos/videos, files, music, and the special
 // voice/round-video class. Every result still enters the same message-ID
 // index, so a server-side filter overlap can never create a duplicate file.
-var chatStreamKinds = []string{"reply_candidates", "photo_video", "document", "music", "round_voice"}
+// Keep ordinary media streams first: each stream registers files page by page
+// and the downloader can begin immediately. Reply metadata is intentionally
+// last so a very large text history never blocks the first media downloads.
+var chatStreamKinds = []string{"photo_video", "document", "music", "round_voice", "reply_candidates"}
 
 // createChatJob persists only a resolved and bounded chat target. Discovery
 // workers are attached in a later layer; keeping creation transactional lets
@@ -1106,7 +1109,42 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			return err
 		}
 		if len(ids) == 0 {
-			return nil
+			// The original post may have had zero replies while history was
+			// indexed, therefore no persistent root mapping existed yet. Recover
+			// its channel/post from the discussion-root forward header on demand.
+			originKey, originID, resolvedRootID, discoverErr := m.discoverDiscussionOrigin(event, rootID)
+			if discoverErr != nil {
+				return discoverErr
+			}
+			if originKey == "" || originID <= 0 || resolvedRootID <= 0 {
+				return nil
+			}
+			originRows, originErr := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status = ?`, event.AccountID, originKey, chatScanCompleted, ChatStatusListening)
+			if originErr != nil {
+				return originErr
+			}
+			for originRows.Next() {
+				var id string
+				if originRows.Scan(&id) != nil {
+					continue
+				}
+				ids = append(ids, id)
+				originByJob[id] = originID
+				if _, persistErr := m.db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO NOTHING`, id, event.AccountID, dialogKey, resolvedRootID, originID); persistErr != nil {
+					_ = originRows.Close()
+					return persistErr
+				}
+			}
+			if originErr := originRows.Err(); originErr != nil {
+				_ = originRows.Close()
+				return originErr
+			}
+			if err := originRows.Close(); err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
 		}
 	}
 	sources, err := m.resolvePeer(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, event.DialogName)
@@ -1132,6 +1170,17 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 		applog.Info("chat_download", "new_media_queued", "chat_job_id", id, "message_id", event.MessageID, "item_count", len(items))
 	}
 	return nil
+}
+
+func (m *Manager) discoverDiscussionOrigin(event telegram.NewMessageEvent, rootID int) (string, int, int, error) {
+	var originKey string
+	var originID, resolvedRootID int
+	err := m.accounts.Run(context.Background(), event.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+		var err error
+		originKey, originID, resolvedRootID, err = discussionOriginFromRoot(ctx, client.API(), event.InputPeer, rootID)
+		return err
+	})
+	return originKey, originID, resolvedRootID, err
 }
 
 func (m *Manager) scanOneChat() error {

@@ -45,6 +45,25 @@ func TestNoDiscussionErrorsAreNonFatal(t *testing.T) {
 	}
 }
 
+func TestReplyPageNextOffsetAlwaysMovesTowardOlderReplies(t *testing.T) {
+	page := []tg.MessageClass{&tg.Message{ID: 300}, &tg.Message{ID: 250}, &tg.Message{ID: 275}}
+	if got := replyPageNextOffset(page, 0); got != 250 {
+		t.Fatalf("got %d, want oldest page ID 250", got)
+	}
+	if got := replyPageNextOffset(page, 250); got != 250 {
+		t.Fatalf("got %d, want unchanged offset for a repeated page", got)
+	}
+	if got := replyPageNextOffset([]tg.MessageClass{&tg.MessageEmpty{ID: 200}}, 250); got != 200 {
+		t.Fatalf("deleted replies must advance offset: %d", got)
+	}
+}
+
+func TestDiscussionAccessErrorsRemainVisible(t *testing.T) {
+	if isNoDiscussionError(assertError("rpc error: CHANNEL_PRIVATE")) {
+		t.Fatal("access failures must not be treated as an empty discussion")
+	}
+}
+
 type assertError string
 
 func (e assertError) Error() string { return string(e) }
