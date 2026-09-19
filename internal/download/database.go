@@ -62,11 +62,11 @@ func openPostgresDatabase(ctx context.Context, url string) (*database, error) {
 
 // openDatabase accepts PostgreSQL only. Keeping one SQL dialect eliminates
 // divergent production behaviour and makes all schema guarantees testable.
-func openDatabase(ctx context.Context, url string) (*database, error) {
-	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
-		return nil, fmt.Errorf("TDL_DATABASE_URL 必须是 PostgreSQL 连接串")
+func openDatabase(ctx context.Context, dsn string) (*database, error) {
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		return nil, fmt.Errorf("PostgreSQL 连接配置无效")
 	}
-	return openPostgresDatabase(ctx, url)
+	return openPostgresDatabase(ctx, dsn)
 }
 
 func (d *database) Close() error { return d.db.Close() }

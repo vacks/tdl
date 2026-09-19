@@ -154,12 +154,15 @@ func setSourcePeer(items []source, input tg.InputPeerClass) []source {
 const bytesPerMiB int64 = 1024 * 1024
 
 // filterSources applies the global download policy before any task or chat
-// index row is created. An empty allowed-type list and zero size limits mean
-// unrestricted, preserving the default behavior.
+// index row is created. FileTypes is an explicit allow-list: an empty list
+// intentionally means no file type is eligible for download.
 func filterSources(sources []source, config settings.Download) []source {
 	allowed := make(map[string]struct{}, len(config.FileTypes))
 	for _, kind := range config.FileTypes {
 		allowed[kind] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return nil
 	}
 	minBytes := config.MinFileSizeMB * bytesPerMiB
 	maxBytes := config.MaxFileSizeMB * bytesPerMiB
@@ -194,17 +197,37 @@ func messageMediaType(message *tg.Message) string {
 		if !ok {
 			return "document"
 		}
-		mime := strings.ToLower(document.MimeType)
-		switch {
-		case strings.HasPrefix(mime, "image/"):
-			return "image"
-		case strings.HasPrefix(mime, "video/"):
-			return "video"
-		case strings.HasPrefix(mime, "audio/"):
-			return "audio"
-		default:
-			return "document"
+		// Telegram does not use the filename extension to classify shared
+		// content. A document carries semantic attributes supplied by the
+		// sender/server (sticker, animated GIF, audio/voice, video, ...).
+		// Keep this ordering deliberate: a sticker remains a sticker even
+		// when its container is WebP, TGS, or a video format.
+		for _, attribute := range document.Attributes {
+			if _, ok := attribute.(*tg.DocumentAttributeSticker); ok {
+				return "sticker"
+			}
 		}
+		for _, attribute := range document.Attributes {
+			if _, ok := attribute.(*tg.DocumentAttributeAnimated); ok {
+				return "gif"
+			}
+		}
+		for _, attribute := range document.Attributes {
+			audio, ok := attribute.(*tg.DocumentAttributeAudio)
+			if !ok {
+				continue
+			}
+			if audio.Voice {
+				return "voice"
+			}
+			return "music"
+		}
+		for _, attribute := range document.Attributes {
+			if _, ok := attribute.(*tg.DocumentAttributeVideo); ok {
+				return "video"
+			}
+		}
+		return "document"
 	default:
 		return "document"
 	}

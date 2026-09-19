@@ -27,7 +27,7 @@ func TestPostgresHTTPAuthenticationAndTaskList(t *testing.T) {
 		DownloadDir:     filepath.Join(root, "downloads"),
 		AdminUsername:   "admin",
 		InitialPassword: "test-password",
-		DatabaseURL:     databaseURL,
+		DatabaseDSN:     databaseURL,
 	})
 	if err != nil {
 		t.Fatal(err)

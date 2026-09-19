@@ -1,33 +1,10 @@
 services:
-  permissions:
-    # The application image deliberately runs without root privileges. Prepare
-    # only its bind-mounted writable paths once, so the same Stack works on
-    # Docker Engine, NAS Compose panels and macOS desktop runtimes.
-    image: alpine:3.21
-    user: "0:0"
-    command:
-      - /bin/sh
-      - -ec
-      - |
-        mkdir -p /data /downloads
-        # data is small application state and may come from an older root-run
-        # image; downloaded files can be huge, so only its directory itself
-        # changes owner and every existing final file is left untouched.
-        chown -R 65532:65532 /data
-        chown 65532:65532 /downloads
-    volumes:
-      - ./data:/data
-      - ./downloads:/downloads
-    networks: [internal]
-    restart: "no"
-
   postgres:
     image: postgres:17-alpine
-    env_file: .env
     environment:
-      POSTGRES_DB: ${TDL_POSTGRES_DB:?set TDL_POSTGRES_DB in .env}
-      POSTGRES_USER: ${TDL_POSTGRES_USER:?set TDL_POSTGRES_USER in .env}
-      POSTGRES_PASSWORD: ${TDL_POSTGRES_PASSWORD:?set TDL_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: tdl
+      POSTGRES_USER: tdl
+      POSTGRES_PASSWORD: tdl-postgres-7rQ4mX9pL2vN8kD6
     volumes:
       - ./postgres:/var/lib/postgresql/data
     networks: [internal]
@@ -39,22 +16,21 @@ services:
     restart: unless-stopped
 
   app:
-    build: .
-    env_file: .env
+    image: ghcr.io/vacks/tdl:1.1.0
     ports:
       - "127.0.0.1:8080:8080"
     environment:
       TDL_DATA_DIR: /data
       TDL_DOWNLOAD_DIR: /downloads
       TDL_LISTEN_ADDR: :8080
-      TDL_DATABASE_URL: ${TDL_DATABASE_URL:?set TDL_DATABASE_URL in .env}
+      TDL_ADMIN_USERNAME: admin
+      TDL_ADMIN_INITIAL_PASSWORD: admin
+      TDL_DATABASE_URL: postgres://tdl:tdl-postgres-7rQ4mX9pL2vN8kD6@postgres:5432/tdl?sslmode=disable
     volumes:
       - ./data:/data
       - ./downloads:/downloads
     networks: [internal]
     depends_on:
-      permissions:
-        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     restart: unless-stopped

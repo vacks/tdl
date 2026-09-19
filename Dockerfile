@@ -25,8 +25,7 @@ RUN if [ "$RUN_TESTS" = "1" ]; then go test ./...; fi
 COPY --from=frontend /src/web/dist ./internal/httpapi/static
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/tdl ./cmd/tdl
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12
 COPY --from=backend /out/tdl /tdl
-USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/tdl"]

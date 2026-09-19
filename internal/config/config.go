@@ -13,10 +13,7 @@ type Config struct {
 	DownloadDir     string
 	AdminUsername   string
 	InitialPassword string
-	CookieSecure    bool
-	TrustProxy      bool
-	TrustedOrigins  []string
-	DatabaseURL     string
+	DatabaseDSN     string
 }
 
 func Load() (Config, error) {
@@ -26,10 +23,10 @@ func Load() (Config, error) {
 		DownloadDir:     value("TDL_DOWNLOAD_DIR", "./downloads"),
 		AdminUsername:   value("TDL_ADMIN_USERNAME", "admin"),
 		InitialPassword: value("TDL_ADMIN_INITIAL_PASSWORD", "admin"),
-		CookieSecure:    boolValue("TDL_COOKIE_SECURE", false),
-		TrustProxy:      boolValue("TDL_TRUST_PROXY", false),
-		TrustedOrigins:  splitValues(os.Getenv("TDL_TRUSTED_ORIGINS")),
-		DatabaseURL:     value("TDL_DATABASE_URL", "postgres://tdl:tdl@postgres:5432/tdl?sslmode=disable"),
+		DatabaseDSN: strings.TrimSpace(os.Getenv("TDL_DATABASE_URL")),
+	}
+	if cfg.DatabaseDSN == "" {
+		return Config{}, fmt.Errorf("TDL_DATABASE_URL is required")
 	}
 	if err := os.MkdirAll(filepath.Clean(cfg.DataDir), 0o700); err != nil {
 		return Config{}, fmt.Errorf("create data directory: %w", err)
@@ -38,25 +35,6 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("create download directory: %w", err)
 	}
 	return cfg, nil
-}
-
-func boolValue(key string, fallback bool) bool {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	return strings.EqualFold(value, "true") || value == "1" || strings.EqualFold(value, "yes")
-}
-
-func splitValues(value string) []string {
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part = strings.TrimSpace(part); part != "" {
-			result = append(result, part)
-		}
-	}
-	return result
 }
 
 func value(key, fallback string) string {

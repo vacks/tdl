@@ -1607,12 +1607,16 @@ func downloadFilterText(cfg settings.Download) string {
 		parts = append(parts, fmt.Sprintf("≤ %d MB", cfg.MaxFileSizeMB))
 	}
 	if len(cfg.FileTypes) > 0 {
-		names := map[string]string{"image": "图片", "video": "视频", "audio": "音频", "document": "文档"}
+		names := map[string]string{"image": "图片", "video": "视频", "gif": "GIF", "music": "音乐", "voice": "语音", "sticker": "贴纸", "document": "文档"}
 		labels := make([]string, 0, len(cfg.FileTypes))
 		for _, kind := range cfg.FileTypes {
-			labels = append(labels, names[kind])
+			if label, ok := names[kind]; ok {
+				labels = append(labels, label)
+			}
 		}
 		parts = append(parts, strings.Join(labels, "、"))
+	} else {
+		parts = append(parts, "不下载任何类型")
 	}
 	if len(parts) == 0 {
 		return "不限"

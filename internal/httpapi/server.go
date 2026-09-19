@@ -71,7 +71,7 @@ func New(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	downloads, err := download.Open(cfg.DataDir, cfg.DownloadDir, cfg.DatabaseURL, settingsStore, telegram)
+	downloads, err := download.Open(cfg.DataDir, cfg.DownloadDir, cfg.DatabaseDSN, settingsStore, telegram)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +180,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearLoginFailures(client)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: requestHTTPS(r), SameSite: http.SameSiteLaxMode, MaxAge: 86400})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -188,7 +188,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		s.sessions.Delete(c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestHTTPS(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -637,29 +637,26 @@ func (s *Server) validRequestOrigin(r *http.Request) bool {
 		return r.Header.Get("X-Requested-With") == "TDL-Web"
 	}
 	scheme := "http"
-	if r.TLS != nil {
+	if requestHTTPS(r) {
 		scheme = "https"
 	}
 	if origin == scheme+"://"+r.Host {
 		return true
 	}
-	for _, trusted := range s.cfg.TrustedOrigins {
-		if origin == trusted {
-			return true
-		}
-	}
 	return false
 }
 
-func (s *Server) loginClient(r *http.Request) string {
-	if s.cfg.TrustProxy {
-		for _, value := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
-			candidate := strings.TrimSpace(value)
-			if net.ParseIP(candidate) != nil {
-				return candidate
-			}
-		}
+// requestHTTPS supports ordinary HTTPS and standard reverse-proxy forwarding.
+// The header only affects cookie transport and same-origin validation; client
+// IP addresses are deliberately never read from forwarding headers.
+func requestHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
 	}
+	return strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")
+}
+
+func (s *Server) loginClient(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && host != "" {
 		return host

@@ -13,7 +13,7 @@ type Settings = {
 }
 type ConfigResponse = { settings: Settings; downloadDir: string; upstreamVersion: string }
 const router = useRouter()
-const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, tempFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}', finalFilenameTemplate: '{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}', minFileSizeMB: 0, maxFileSizeMB: 0, fileTypes: [], includeReplies: true }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] } })
+const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, tempFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}', finalFilenameTemplate: '{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}', minFileSizeMB: 0, maxFileSizeMB: 0, fileTypes: ['image', 'video'], includeReplies: true }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] } })
 const downloadDir = ref('')
 const saving = ref(false)
 const userIDs = ref<string[]>([])
@@ -71,8 +71,8 @@ onMounted(async () => { try { const session = await api<{ authenticated: boolean
           <el-divider class="download-config-divider" />
 	  <el-form-item label="文件体积筛选"><div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center"><span>最小</span><el-input-number v-model="form.download.minFileSizeMB" :min="0" :max="1048576" /><span>MB</span><span>最大</span><el-input-number v-model="form.download.maxFileSizeMB" :min="0" :max="1048576" /><span>MB</span></div></el-form-item>
 	  <p class="field-help">设为 0 表示不限制；最小值以下或最大值以上的文件不会创建下载任务。筛选会在解析消息和会话历史时生效。</p>
-	  <el-form-item label="文件类型筛选"><el-checkbox-group v-model="form.download.fileTypes" class="file-type-group"><el-checkbox label="image">图片</el-checkbox><el-checkbox label="video">视频</el-checkbox><el-checkbox label="audio">音频</el-checkbox><el-checkbox label="document">文档</el-checkbox></el-checkbox-group></el-form-item>
-	  <p class="field-help">不勾选表示下载全部类型；勾选后仅下载选中的类型。语音消息归入音频，圆形视频归入视频。</p>
+	  <el-form-item label="文件类型筛选"><el-checkbox-group v-model="form.download.fileTypes" class="file-type-group"><el-checkbox label="image">图片</el-checkbox><el-checkbox label="video">视频</el-checkbox><el-checkbox label="gif">GIF</el-checkbox><el-checkbox label="music">音乐</el-checkbox><el-checkbox label="voice">语音</el-checkbox><el-checkbox label="sticker">贴纸</el-checkbox><el-checkbox label="document">文档</el-checkbox></el-checkbox-group></el-form-item>
+	  <p class="field-help">默认下载图片和视频。仅下载勾选的类型；全部取消时不会下载任何文件。分类读取 Telegram 原生媒体属性：贴纸、GIF、音乐、语音和视频不会按文件扩展名猜测；作为文件发送的图片归入文档。</p>
 	  <el-divider class="download-config-divider filter-config-divider" />
           <el-form-item label="临时文件命名模板（上游 tdl）"><el-input v-model="form.download.tempFilenameTemplate" /></el-form-item>
           <div class="field-help template-help" v-pre>

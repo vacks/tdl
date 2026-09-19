@@ -31,6 +31,10 @@ type Download struct {
 	MinFileSizeMB int64    `json:"minFileSizeMB"`
 	MaxFileSizeMB int64    `json:"maxFileSizeMB"`
 	FileTypes     []string `json:"fileTypes"`
+	// FileTypesInitialized distinguishes an intentionally empty selection
+	// (download nothing) from settings saved before file types became an
+	// allow-list. It is an internal migration marker and has no UI meaning.
+	FileTypesInitialized bool `json:"fileTypesInitialized"`
 	// IncludeReplies controls channel discussion comments and group message
 	// replies. A task snapshots this value at creation time.
 	IncludeReplies bool `json:"includeReplies"`
@@ -75,6 +79,8 @@ func Defaults() Values {
 		// This is evaluated by the web application after download and therefore
 		// can include our MessageText mapping.
 		FinalFilenameTemplate: "{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}",
+		FileTypes:             []string{"image", "video"},
+		FileTypesInitialized:  true,
 		IncludeReplies:        true,
 	}, Bot: Bot{Notifications: BotNotifications{TaskCreated: true, TaskCompleted: true, TaskPartial: true, TaskFailed: true}}, Reaction: Reaction{Emojis: []string{"👍"}}}
 }
@@ -112,6 +118,13 @@ func Open(dataDir string) (*Store, error) {
 	if json.Unmarshal(data, &raw) == nil {
 		if _, present := raw.Download["includeReplies"]; !present {
 			s.values.Download.IncludeReplies = true
+		}
+		// Before the allow-list behaviour, an empty fileTypes list meant
+		// unrestricted. Migrate it once to the new safe default. After the
+		// marker is written, an empty list deliberately means download nothing.
+		if _, present := raw.Download["fileTypesInitialized"]; !present {
+			s.values.Download.FileTypes = append([]string(nil), Defaults().Download.FileTypes...)
+			s.values.Download.FileTypesInitialized = true
 		}
 	}
 	normalizeDownload(&s.values.Download)
@@ -191,9 +204,9 @@ func Validate(values Values) error {
 	}
 	for _, kind := range d.FileTypes {
 		switch kind {
-		case "image", "video", "audio", "document":
+		case "image", "video", "gif", "music", "voice", "sticker", "document":
 		default:
-			return errors.New("文件类型筛选仅支持图片、视频、音频或文档")
+			return errors.New("文件类型筛选仅支持图片、视频、GIF、音乐、语音、贴纸或文档")
 		}
 	}
 	if strings.TrimSpace(d.TempFilenameTemplate) == "" {
@@ -260,6 +273,7 @@ func validateFinalTemplate(pattern string) error {
 }
 
 func normalizeDownload(download *Download) {
+	download.FileTypesInitialized = true
 	if download.ConcurrentJobs == 0 {
 		download.ConcurrentJobs = Defaults().Download.ConcurrentJobs
 	}
@@ -270,11 +284,21 @@ func normalizeDownload(download *Download) {
 		if kind == "" {
 			continue
 		}
-		if _, ok := seen[kind]; ok {
+		// Prior versions had one MIME-based "audio" bucket. Expand it rather
+		// than silently changing an existing user's selection to music only.
+		if kind == "audio" {
+			for _, expanded := range []string{"music", "voice"} {
+				if _, ok := seen[expanded]; !ok {
+					seen[expanded] = struct{}{}
+					types = append(types, expanded)
+				}
+			}
 			continue
 		}
-		seen[kind] = struct{}{}
-		types = append(types, kind)
+		if _, ok := seen[kind]; !ok {
+			seen[kind] = struct{}{}
+			types = append(types, kind)
+		}
 	}
 	download.FileTypes = types
 }
