@@ -36,6 +36,43 @@ func TestFirstMessageID(t *testing.T) {
 	}
 }
 
+func TestChannelDiscussionExpectationUsesOfficialReplyMetadata(t *testing.T) {
+	first := &tg.Message{ID: 100}
+	first.SetReplies(tg.MessageReplies{Comments: true, Replies: 4, ChannelID: 200})
+	second := &tg.Message{ID: 101}
+	second.SetReplies(tg.MessageReplies{Comments: true, Replies: 7, ChannelID: 200})
+	got := channelDiscussionExpectation([]*tg.Message{first, second})
+	if got.dialogID != 200 || got.replyCount != 7 {
+		t.Fatalf("unexpected expectation: %#v", got)
+	}
+	if got := channelDiscussionExpectation([]*tg.Message{{ID: 102}}); got != (discussionExpectation{}) {
+		t.Fatalf("plain channel post must have no expectation: %#v", got)
+	}
+}
+
+func TestDiscussionRootIndexesPreferProtocolDefinedLastRoot(t *testing.T) {
+	messages := []tg.MessageClass{
+		&tg.Message{ID: 900, PeerID: &tg.PeerChannel{ChannelID: 10}},
+		&tg.Message{ID: 901, PeerID: &tg.PeerChannel{ChannelID: 20}},
+		&tg.Message{ID: 902, PeerID: &tg.PeerChannel{ChannelID: 20}},
+	}
+	indexes := discussionRootIndexes(messages, "channel:10", 20)
+	if len(indexes) == 0 || indexes[0] != 2 {
+		t.Fatalf("last discussion root must win, got %v", indexes)
+	}
+}
+
+func TestDiscussionRootIndexesFallsBackFromLastMessage(t *testing.T) {
+	messages := []tg.MessageClass{
+		&tg.Message{ID: 900, PeerID: &tg.PeerChannel{ChannelID: 10}},
+		&tg.Message{ID: 901, PeerID: &tg.PeerChannel{ChannelID: 20}},
+	}
+	indexes := discussionRootIndexes(messages, "channel:10", 0)
+	if len(indexes) == 0 || indexes[0] != 1 {
+		t.Fatalf("last returned message must be fallback root, got %v", indexes)
+	}
+}
+
 func TestNoDiscussionErrorsAreNonFatal(t *testing.T) {
 	if !isNoDiscussionError(assertError("rpc error: MSG_ID_INVALID")) {
 		t.Fatal("expected missing discussion error")

@@ -48,12 +48,21 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 	threadPeer := originPeer
 	threadMessageID := rootMessageID
 	isDiscussion := false
+	expectation := discussionExpectation{}
 	if _, channel := originPeer.(*tg.InputPeerChannel); channel {
-		resolvedPeer, resolvedRoot, found, err := discussionThread(ctx, api, accountID, originPeer, rootMessageID)
+		expectation = channelDiscussionExpectation(originMessages)
+		resolvedPeer, resolvedRoot, found, err := discussionThread(ctx, api, accountID, originPeer, rootMessageID, expectation.dialogID)
 		if err != nil {
 			return nil, err
 		}
 		if !found {
+			// A post with no comments is the usual case and deliberately remains
+			// silent. Telegram's MessageReplies metadata makes the opposite case
+			// actionable: comments were declared, but their discussion root could
+			// not be recovered.
+			if expectation.replyCount > 0 {
+				return nil, fmt.Errorf("频道帖子声明有 %d 条评论，但未能解析评论根", expectation.replyCount)
+			}
 			return nil, nil
 		}
 		threadPeer, threadMessageID, isDiscussion = resolvedPeer, resolvedRoot, true
@@ -67,6 +76,10 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 	}
 	seen := make(map[int]struct{})
 	items := make([]source, 0)
+	// This counts actual reply messages, not downloadable files. A discussion
+	// containing only text is a healthy, expected result and must not be
+	// confused with a failed reply read.
+	replyMessages := 0
 	// Telegram caps a single reply page. OffsetID is the lowest ID from the
 	// previous page, so this always walks newest to oldest until the server
 	// confirms there are no more replies. Never use a page length as proof that
@@ -95,6 +108,7 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 			if message.ID == threadMessageID {
 				continue
 			}
+			replyMessages++
 			// GetReplies normally returns every member of an album. Ask upstream for
 			// its complete group only once as a safety net for a page boundary.
 			messages := []*tg.Message{message}
@@ -127,7 +141,38 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 		}
 		offset = nextOffset
 	}
+	if isDiscussion && expectation.replyCount > 0 && replyMessages == 0 {
+		// This is not the normal empty-comment case: Telegram said that the
+		// channel post has comments, and we successfully located its root. Keep
+		// the original download usable, but surface the inconsistent reply read.
+		return nil, fmt.Errorf("频道帖子声明有 %d 条评论，但读取评论列表为空", expectation.replyCount)
+	}
 	return items, nil
+}
+
+// discussionExpectation is only meaningful for a channel post. Telegram puts
+// it on the original post, including the linked discussion supergroup ID and
+// the number of replies currently known to the server.
+type discussionExpectation struct {
+	dialogID   int64
+	replyCount int
+}
+
+func channelDiscussionExpectation(messages []*tg.Message) discussionExpectation {
+	var result discussionExpectation
+	for _, message := range messages {
+		replies, ok := message.GetReplies()
+		if !ok || !replies.Comments {
+			continue
+		}
+		if replies.Replies > result.replyCount {
+			result.replyCount = replies.Replies
+		}
+		if replies.ChannelID != 0 {
+			result.dialogID = replies.ChannelID
+		}
+	}
+	return result
 }
 
 func replyPageNextOffset(page []tg.MessageClass, previous int) int {
@@ -149,9 +194,14 @@ func replyPageNextOffset(page []tg.MessageClass, previous int) int {
 }
 
 // discussionThread resolves a channel post to the actual linked discussion
-// group root. It is also used for a newly received post with zero replies so
-// future comments can be mapped without waiting for the first media reply.
-func discussionThread(ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, messageID int) (tg.InputPeerClass, int, bool, error) {
+// group root. Telegram guarantees that messages.getDiscussionMessage returns
+// its messages in reverse chronological order and that the final message is
+// the auto-forwarded discussion root. The post's MessageReplies.ChannelID is
+// used as an additional identity check when available.
+//
+// It is also used for newly received posts with zero replies so future comments
+// can be mapped without waiting for the first media reply.
+func discussionThread(ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, messageID int, expectedDiscussionID int64) (tg.InputPeerClass, int, bool, error) {
 	discussion, err := api.MessagesGetDiscussionMessage(ctx, &tg.MessagesGetDiscussionMessageRequest{Peer: originPeer, MsgID: messageID})
 	if err != nil {
 		if isNoDiscussionError(err) {
@@ -161,11 +211,8 @@ func discussionThread(ctx context.Context, api *tg.Client, accountID string, ori
 	}
 	entities := peer.EntitiesFromResult(discussion)
 	originKey := dialogKeyForPeer(originPeer, accountID)
-	for _, raw := range discussion.Messages {
-		message, ok := raw.(*tg.Message)
-		if !ok {
-			continue
-		}
+	for _, index := range discussionRootIndexes(discussion.Messages, originKey, expectedDiscussionID) {
+		message := discussion.Messages[index].(*tg.Message)
 		candidate, extractErr := entities.ExtractPeer(message.PeerID)
 		if extractErr != nil || dialogKeyForPeer(candidate, accountID) == originKey {
 			continue
@@ -173,6 +220,58 @@ func discussionThread(ctx context.Context, api *tg.Client, accountID string, ori
 		return candidate, message.ID, true, nil
 	}
 	return nil, 0, false, nil
+}
+
+// discussionRootIndexes yields candidates from most to least authoritative.
+// The official protocol's final message wins; the reverse fallback preserves
+// compatibility with older or malformed server responses without treating a
+// random earlier message as the primary root.
+func discussionRootIndexes(messages []tg.MessageClass, originKey string, expectedDiscussionID int64) []int {
+	indexes := make([]int, 0, len(messages))
+	seen := make(map[int]struct{}, len(messages))
+	appendCandidate := func(index int, requireExpected bool) {
+		if _, ok := seen[index]; ok {
+			return
+		}
+		message, ok := messages[index].(*tg.Message)
+		if !ok || message.ID <= 0 {
+			return
+		}
+		if requireExpected && discussionMessagePeerID(message.PeerID) != expectedDiscussionID {
+			return
+		}
+		seen[index] = struct{}{}
+		indexes = append(indexes, index)
+	}
+	if expectedDiscussionID != 0 {
+		for index := len(messages) - 1; index >= 0; index-- {
+			appendCandidate(index, true)
+		}
+	}
+	// The final non-origin message is the protocol-defined root if metadata was
+	// unavailable. The caller still validates the resolved peer identity.
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, ok := messages[index].(*tg.Message)
+		if !ok {
+			continue
+		}
+		if discussionMessagePeerID(message.PeerID) == 0 && originKey != "" {
+			continue
+		}
+		appendCandidate(index, false)
+	}
+	return indexes
+}
+
+func discussionMessagePeerID(value tg.PeerClass) int64 {
+	switch peer := value.(type) {
+	case *tg.PeerChannel:
+		return peer.ChannelID
+	case *tg.PeerChat:
+		return peer.ChatID
+	default:
+		return 0
+	}
 }
 
 // discussionOriginFromRoot recovers the original channel post from a newly

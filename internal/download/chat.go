@@ -1496,7 +1496,7 @@ func (m *Manager) rememberChatDiscussionRoot(ctx context.Context, api *tg.Client
 	if _, ok := target.inputPeer().(*tg.InputPeerChannel); !ok {
 		return nil
 	}
-	peer, rootID, found, err := discussionThread(ctx, api, target.AccountID, target.inputPeer(), sourceMessageID)
+	peer, rootID, found, err := discussionThread(ctx, api, target.AccountID, target.inputPeer(), sourceMessageID, 0)
 	if err != nil || !found {
 		return err
 	}
