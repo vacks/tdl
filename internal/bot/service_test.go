@@ -104,6 +104,16 @@ func TestPollRetryDelayIsBoundedAndDeterministic(t *testing.T) {
 	}
 }
 
+func TestBotOutboundWaitHonorsServerCooldown(t *testing.T) {
+	s := &Service{}
+	s.noteOutboundWait(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if err := s.awaitOutbound(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("awaitOutbound during cooldown = %v, want deadline exceeded", err)
+	}
+}
+
 func TestRedactBotError(t *testing.T) {
 	token := "123456:secret-token"
 	message := "Post \"https://api.telegram.org/bot123456:secret-token/getUpdates\": timeout"

@@ -57,6 +57,29 @@ func TestValidateDownloadFilters(t *testing.T) {
 	}
 }
 
+func TestValidateDownloadSafetyCeilings(t *testing.T) {
+	values := Defaults()
+	values.Download.Threads = 17
+	if err := Validate(values); err == nil {
+		t.Fatal("unsafe thread count was accepted")
+	}
+	values = Defaults()
+	values.Download.TaskLimit = 5
+	if err := Validate(values); err == nil {
+		t.Fatal("unsafe per-task file concurrency was accepted")
+	}
+	values = Defaults()
+	values.Download.ConcurrentJobs = 5
+	if err := Validate(values); err == nil {
+		t.Fatal("unsafe global task concurrency was accepted")
+	}
+	values = Defaults()
+	values.Download.PoolSize = 17
+	if err := Validate(values); err == nil {
+		t.Fatal("unsafe connection pool size was accepted")
+	}
+}
+
 func TestDiscussionRepliesDefaultEnabled(t *testing.T) {
 	if !Defaults().Download.IncludeReplies {
 		t.Fatal("discussion/reply downloads must default to enabled")

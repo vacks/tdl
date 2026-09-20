@@ -133,6 +133,7 @@ func (m *Manager) Submit(ctx context.Context, intent DownloadIntent) (Submission
 		sources, err = m.resolve(ctx, accountID, intent.URL)
 	}
 	if err != nil {
+		m.recordTelegramRPCError(accountID, err)
 		return Submission{}, err
 	}
 	sources = filterSources(sources, m.settings.Get().Download)
@@ -197,6 +198,9 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 	var created ChatJob
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+			return err
+		}
 		peer, startID, err := resolveChatTarget(ctx, manager, intent.URL)
 		if err != nil {
 			return err
@@ -205,6 +209,9 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 		dialogType, dialogKey, dialogID := dialogIdentityForPeer(peer, accountID)
 		if dialogType != "channel" && dialogType != "chat" {
 			return errors.New("会话下载仅支持频道和群组")
+		}
+		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+			return err
 		}
 		it := query.Messages(client.API()).GetHistory(input).BatchSize(1).Iter()
 		if !it.Next(ctx) {
@@ -228,6 +235,7 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 		return err
 	})
 	if err != nil {
+		m.recordTelegramRPCError(accountID, err)
 		applog.Error("chat_download", "task_submit_failed", "source", intent.Source, "account_id", accountID, "error", err.Error())
 		return ChatJob{}, err
 	}

@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,10 +43,13 @@ type Service struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 
-	mu          sync.Mutex
-	clientMu    sync.Mutex
-	client      *http.Client
-	clientProxy string
+	mu                   sync.Mutex
+	clientMu             sync.Mutex
+	client               *http.Client
+	clientProxy          string
+	outboundMu           sync.Mutex
+	nextOutbound         time.Time
+	outboundBlockedUntil time.Time
 	// lifecycleMu serializes a status refresh with deletion. Without it a
 	// refresh holding an old completed snapshot could overwrite a later
 	// "task deleted" card or send a replacement notification.
@@ -70,8 +75,12 @@ type Service struct {
 	helpSent         map[int64]bool
 	helpRetry        map[int64]helpRetry
 	lastLiveEdit     map[string]time.Time
-	nextLiveEdit     time.Time
-	retryUpdates     map[int64]int
+	// liveRendered suppresses no-op Bot edits. Telegram counts an edit request
+	// even when its visible card is unchanged, so this protects both the Bot
+	// quota and active download throughput.
+	liveRendered map[string]string
+	nextLiveEdit time.Time
+	retryUpdates map[int64]int
 	// downloadWake receives coalesced domain events. It shortens lifecycle
 	// updates without making the Bot poll the task table more aggressively.
 	downloadWake chan struct{}
@@ -129,7 +138,7 @@ const (
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -186,7 +195,7 @@ func (s *Service) loop() {
 			} else {
 				s.offset = 0
 			}
-			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[int64]int{}, time.Time{}
+			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.liveRendered, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[string]string{}, map[int64]int{}, time.Time{}
 			s.chatTracked = map[string]chatTrackedRef{}
 			s.listPages = map[string]listPageState{}
 			commandsChanged = true
@@ -327,6 +336,9 @@ type apiResponse[T any] struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description"`
 	Result      T      `json:"result"`
+	Parameters  struct {
+		RetryAfter int `json:"retry_after"`
+	} `json:"parameters"`
 }
 type update struct {
 	UpdateID      int64          `json:"update_id"`
@@ -1050,7 +1062,15 @@ func (s *Service) track(id string, ref messageRef) {
 	s.tracked[id+":"+fmt.Sprint(ref.ChatID)] = trackedRef{JobID: id, messageRef: ref}
 	s.mu.Unlock()
 }
-func (s *Service) untrack(key string) { s.mu.Lock(); delete(s.tracked, key); s.mu.Unlock() }
+func (s *Service) untrack(key string) {
+	s.mu.Lock()
+	if ref, ok := s.tracked[key]; ok {
+		delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+		delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+	}
+	delete(s.tracked, key)
+	s.mu.Unlock()
+}
 
 func listPageKey(kind string, chatID, messageID int64) string {
 	return kind + ":" + fmt.Sprint(chatID) + ":" + fmt.Sprint(messageID)
@@ -1146,6 +1166,8 @@ func (s *Service) untrackJob(jobID string) {
 	defer s.mu.Unlock()
 	for key, ref := range s.tracked {
 		if ref.JobID == jobID {
+			delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+			delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
 			delete(s.tracked, key)
 		}
 	}
@@ -1155,6 +1177,8 @@ func (s *Service) untrackMessage(chatID, messageID int64) {
 	defer s.mu.Unlock()
 	for key, ref := range s.tracked {
 		if ref.ChatID == chatID && ref.MessageID == messageID {
+			delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+			delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
 			delete(s.tracked, key)
 		}
 	}
@@ -1165,12 +1189,22 @@ func (s *Service) trackChat(id string, ref messageRef) {
 	s.chatTracked[id+":"+fmt.Sprint(ref.ChatID)] = chatTrackedRef{JobID: id, messageRef: ref}
 	s.mu.Unlock()
 }
-func (s *Service) untrackChat(key string) { s.mu.Lock(); delete(s.chatTracked, key); s.mu.Unlock() }
+func (s *Service) untrackChat(key string) {
+	s.mu.Lock()
+	if ref, ok := s.chatTracked[key]; ok {
+		delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+		delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+	}
+	delete(s.chatTracked, key)
+	s.mu.Unlock()
+}
 func (s *Service) untrackChatMessage(chatID, messageID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key, ref := range s.chatTracked {
 		if ref.ChatID == chatID && ref.MessageID == messageID {
+			delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+			delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
 			delete(s.chatTracked, key)
 		}
 	}
@@ -1289,7 +1323,7 @@ func (s *Service) updateLifecycle(cfg settings.Bot, job download.Job) {
 	}
 	text := lifecycleText(job)
 	for _, ref := range refs {
-		if s.edit(cfg.Token, ref.ChatID, ref.MessageID, text, notificationKeyboard(job.ID)) {
+		if missing, _ := s.edit(cfg.Token, ref.ChatID, ref.MessageID, text, notificationKeyboard(job.ID)); missing {
 			s.forgetLifecycleMessage(job.ID, ref.ChatID)
 			continue
 		}
@@ -1681,6 +1715,11 @@ func (s *Service) call(token, method string, body any, out any) error {
 }
 
 func (s *Service) callWithTimeout(token, method string, body any, out any, timeout time.Duration) error {
+	if method != "getUpdates" {
+		if err := s.awaitOutbound(s.ctx); err != nil {
+			return err
+		}
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -1697,10 +1736,70 @@ func (s *Service) callWithTimeout(token, method string, body any, out any, timeo
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
+			s.noteOutboundWait(time.Duration(seconds) * time.Second)
+		}
+	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("Bot API %s returned HTTP %d", method, resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		OK         bool `json:"ok"`
+		Parameters struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return err
+	}
+	if !probe.OK && probe.Parameters.RetryAfter > 0 {
+		s.noteOutboundWait(time.Duration(probe.Parameters.RetryAfter) * time.Second)
+	}
+	return json.Unmarshal(payload, out)
+}
+
+// awaitOutbound serializes Bot API writes at a conservative eight requests
+// per second. Long polling is deliberately excluded: it is a held request,
+// not an outbound notification burst.
+func (s *Service) awaitOutbound(ctx context.Context) error {
+	for {
+		now := time.Now()
+		s.outboundMu.Lock()
+		ready := s.nextOutbound
+		if s.outboundBlockedUntil.After(ready) {
+			ready = s.outboundBlockedUntil
+		}
+		if !ready.After(now) {
+			s.nextOutbound = now.Add(125 * time.Millisecond)
+			s.outboundMu.Unlock()
+			return nil
+		}
+		s.outboundMu.Unlock()
+		timer := time.NewTimer(time.Until(ready))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Service) noteOutboundWait(wait time.Duration) {
+	if wait <= 0 {
+		return
+	}
+	s.outboundMu.Lock()
+	until := time.Now().Add(wait + 250*time.Millisecond)
+	if until.After(s.outboundBlockedUntil) {
+		s.outboundBlockedUntil = until
+	}
+	s.outboundMu.Unlock()
 }
 
 func waitContext(ctx context.Context, delay time.Duration) bool {
@@ -1768,8 +1867,17 @@ func normalizeCommand(text string) string {
 
 func (s *Service) editLive(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
 	key := fmt.Sprintf("%d:%d", chatID, messageID)
+	encoded, _ := json.Marshal(struct {
+		Text     string     `json:"text"`
+		Keyboard [][]button `json:"keyboard"`
+	}{Text: text, Keyboard: keyboard})
+	rendered := string(encoded)
 	now := time.Now()
 	s.mu.Lock()
+	if s.liveRendered[key] == rendered {
+		s.mu.Unlock()
+		return false
+	}
 	if now.Sub(s.lastLiveEdit[key]) < 3*time.Second || now.Before(s.nextLiveEdit) {
 		s.mu.Unlock()
 		return false
@@ -1777,7 +1885,13 @@ func (s *Service) editLive(token string, chatID, messageID int64, text string, k
 	s.lastLiveEdit[key] = now
 	s.nextLiveEdit = now.Add(50 * time.Millisecond)
 	s.mu.Unlock()
-	return s.edit(token, chatID, messageID, text, keyboard)
+	missing, updated := s.edit(token, chatID, messageID, text, keyboard)
+	if updated {
+		s.mu.Lock()
+		s.liveRendered[key] = rendered
+		s.mu.Unlock()
+	}
+	return missing
 }
 
 // configureCommands enables Telegram's native slash-command suggestions and
@@ -1824,8 +1938,9 @@ func (s *Service) send(token string, chatID int64, text string, keyboard [][]but
 	return result.Result.MessageID, nil
 }
 
-// edit returns true only when Telegram confirms that the message no longer exists.
-func (s *Service) edit(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
+// edit reports whether Telegram confirmed that the message no longer exists,
+// then whether the desired card is already/now rendered successfully.
+func (s *Service) edit(token string, chatID, messageID int64, text string, keyboard [][]button) (missing, updated bool) {
 	// editMessageText returns a Message object for normal chat messages, not a
 	// boolean. Keep the result opaque: only the API's OK/description fields are
 	// relevant here and decoding it as bool makes every successful edit fail.
@@ -1836,19 +1951,22 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 	}
 	if err := s.call(token, "editMessageText", payload, &result); err != nil {
 		applog.Error("bot", "message_edit_failed", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, err.Error()))
-		return false
+		return false, false
 	}
 	if !result.OK {
 		if isMissingMessage(result.Description) {
-			return true
+			return true, false
+		}
+		if strings.Contains(strings.ToLower(result.Description), "message is not modified") {
+			return false, true
 		}
 		applog.Error("bot", "message_edit_rejected", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, result.Description))
-		return false
+		return false, false
 	}
 	if keyboard == nil {
 		s.clearKeyboard(token, chatID, messageID)
 	}
-	return false
+	return false, true
 }
 
 func isMissingMessage(description string) bool {

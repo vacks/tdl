@@ -26,6 +26,12 @@ docker compose up -d
 
 需要改下载目录时，编辑 [compose.yaml](compose.yaml) 中的 `./downloads:/downloads`；NAS 可替换为绝对路径。
 
+本机开发使用当前源码构建：
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
+```
+
 ## 常用操作
 
 ```bash

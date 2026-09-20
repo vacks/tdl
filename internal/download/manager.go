@@ -249,21 +249,31 @@ type Manager struct {
 	chatEventWake chan struct{}
 	chatListeners map[string]*chatListener
 	chatWatched   map[string]map[string]struct{}
-	slotWake      chan struct{}
-	progress      *progressStore
-	events        *eventBus
-	slotMu        sync.Mutex
-	activeJobs    int
-	jobLocks      [64]sync.Mutex
-	chatLocks     [64]sync.Mutex
-	revision      atomic.Uint64
-	dbHealthMu    sync.RWMutex
-	dbHealth      DatabaseHealth
-	dbMonitorStop context.CancelFunc
-	cleanupStop   context.CancelFunc
-	dbOutage      atomic.Bool
-	visibleJobs   atomic.Int64
-	visibleChats  atomic.Int64
+	// potentialDiscussion is an account-level fast path for first replies to
+	// historical channel posts. It is derived together with chatWatched, so an
+	// unrelated discussion update never needs a database query.
+	potentialDiscussion   map[string]bool
+	listenerSnapshotReady bool
+	listenerDirty         atomic.Bool
+	listenerSnapshotAt    atomic.Int64
+	slotWake              chan struct{}
+	progress              *progressStore
+	events                *eventBus
+	slotMu                sync.Mutex
+	activeJobs            int
+	activeChats           int
+	rpcMu                 sync.Mutex
+	rpcState              map[string]*telegramRPCState
+	jobLocks              [64]sync.Mutex
+	chatLocks             [64]sync.Mutex
+	revision              atomic.Uint64
+	dbHealthMu            sync.RWMutex
+	dbHealth              DatabaseHealth
+	dbMonitorStop         context.CancelFunc
+	cleanupStop           context.CancelFunc
+	dbOutage              atomic.Bool
+	visibleJobs           atomic.Int64
+	visibleChats          atomic.Int64
 }
 
 type DatabaseHealth struct {
@@ -280,10 +290,17 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), slotWake: make(chan struct{}, 1), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), potentialDiscussion: make(map[string]bool), slotWake: make(chan struct{}, 1), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
+	// The first worker pass constructs the listener snapshot before accepting
+	// updates. Subsequent rebuilds are only needed after state changes.
+	m.listenerDirty.Store(true)
 	if err := m.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if err := m.loadTelegramRateLimits(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("load Telegram rate limits: %w", err)
 	}
 	if err := m.loadInstanceID(); err != nil {
 		_ = db.Close()
@@ -1006,60 +1023,33 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, MessageText: sources[0].MessageText, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
 	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
+	// Message tasks are interactive work. Wake chat workers so their next
+	// historical batch observes this newly queued higher-priority task.
+	m.signalChat()
 	return Submission{RequestID: requestID, Job: job, Created: true}, false, nil
 }
 
 func (m *Manager) worker() {
 	for {
 		m.reconcileMessageClaims()
-		if !m.acquireJobSlot() {
-			return
-		}
 		job, sources, err := m.nextQueued()
 		if err == nil && job.ID != "" {
+			release, acquired := m.tryAcquireTransfer(transferMessage, false)
+			if !acquired {
+				select {
+				case <-m.slotWake:
+				case <-time.After(time.Second):
+				}
+				continue
+			}
 			m.run(job, sources)
-			m.releaseJobSlot()
+			release()
 			continue
 		}
-		m.releaseJobSlot()
 		select {
 		case <-m.wake:
 		case <-time.After(3 * time.Second):
 		}
-	}
-}
-
-// acquireJobSlot applies the configured cross-task limit in this wrapper. It
-// is intentionally independent from upstream tdl's per-invocation media
-// limit, so two distinct Telegram links can run at the same time.
-func (m *Manager) acquireJobSlot() bool {
-	for {
-		m.slotMu.Lock()
-		limit := m.settings.Get().Download.ConcurrentJobs
-		if m.activeJobs < limit {
-			m.activeJobs++
-			m.slotMu.Unlock()
-			return true
-		}
-		m.slotMu.Unlock()
-		// A release wakes one waiting worker immediately. The timeout also
-		// picks up a changed concurrency setting without busy-waiting.
-		select {
-		case <-m.slotWake:
-		case <-time.After(time.Second):
-		}
-	}
-}
-
-func (m *Manager) releaseJobSlot() {
-	m.slotMu.Lock()
-	if m.activeJobs > 0 {
-		m.activeJobs--
-	}
-	m.slotMu.Unlock()
-	select {
-	case m.slotWake <- struct{}{}:
-	default:
 	}
 }
 
@@ -1309,6 +1299,10 @@ func (m *Manager) run(job Job, sources []source) {
 			_ = os.RemoveAll(tmpDir)
 			return
 		}
+		if m.recordTelegramRPCError(job.AccountID, err) {
+			_ = m.requeueRateLimitedMessage(job.ID)
+			return
+		}
 		m.fail(job.ID, pending, err)
 		return
 	}
@@ -1333,6 +1327,17 @@ func (m *Manager) run(job Job, sources []source) {
 		_ = m.setJob(job.ID, "completed", "")
 		_ = os.RemoveAll(tmpDir)
 	}
+}
+
+func (m *Manager) requeueRateLimitedMessage(id string) error {
+	if _, err := m.db.Exec(`UPDATE download_items SET status = 'queued', error = 'Telegram 限流中，等待自动恢复', started_at = '', finished_at = '' WHERE job_id = ? AND status = 'running'`, id); err != nil {
+		return err
+	}
+	if err := m.setJob(id, "queued", "Telegram 限流中，等待自动恢复"); err != nil {
+		return err
+	}
+	m.signal()
+	return nil
 }
 
 // stopForInactiveParent makes a running chat child obey its durable parent
@@ -1672,20 +1677,31 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+			return err
+		}
 		peer, messageID, err := tutil.ParseMessageLink(ctx, manager, sourceURL)
 		if err != nil {
 			return err
 		}
+		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+			return err
+		}
 		message, err := tutil.GetSingleMessage(ctx, client.API(), peer.InputPeer(), messageID)
 		if err != nil {
+			m.recordTelegramRPCError(accountID, err)
 			return err
 		}
 		messages := []*tg.Message{message}
 		groupedID := int64(0)
 		if group, ok := message.GetGroupedID(); ok {
 			groupedID = group
+			if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+				return err
+			}
 			messages, err = tutil.GetGroupedMessages(ctx, client.API(), peer.InputPeer(), message)
 			if err != nil {
+				m.recordTelegramRPCError(accountID, err)
 				return err
 			}
 		}
@@ -1702,8 +1718,11 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 		result = setOrigin(result, peer.VisibleName(), originID, false)
 		result = setSourcePeer(result, peer.InputPeer())
 		if m.settings.Get().Download.IncludeReplies {
-			related, relatedErr := relatedSources(ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID)
+			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID)
 			if relatedErr != nil {
+				if telegramWaitDuration(relatedErr) > 0 {
+					return relatedErr
+				}
 				logRelatedWarning(accountID, message.ID, relatedErr)
 			} else {
 				result = append(result, related...)
@@ -1724,16 +1743,24 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies bool) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
+		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+			return err
+		}
 		message, err := tutil.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
 		if err != nil {
+			m.recordTelegramRPCError(accountID, err)
 			return err
 		}
 		messages := []*tg.Message{message}
 		groupedID := int64(0)
 		if group, ok := message.GetGroupedID(); ok {
 			groupedID = group
+			if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+				return err
+			}
 			messages, err = tutil.GetGroupedMessages(ctx, client.API(), inputPeer, message)
 			if err != nil {
+				m.recordTelegramRPCError(accountID, err)
 				return err
 			}
 		}
@@ -1759,8 +1786,11 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		result = setOrigin(result, dialogName, originID, false)
 		result = setSourcePeer(result, inputPeer)
 		if includeReplies {
-			related, relatedErr := relatedSources(ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID)
+			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID)
 			if relatedErr != nil {
+				if telegramWaitDuration(relatedErr) > 0 {
+					return relatedErr
+				}
 				logRelatedWarning(accountID, message.ID, relatedErr)
 			} else {
 				result = append(result, related...)
@@ -1965,6 +1995,7 @@ func (m *Manager) transitionItems(id, expected, next, message, itemSQL string, a
 	}
 	m.touch()
 	m.emit(id, "", "job_status_changed", next)
+	m.signalChat()
 	return nil
 }
 
@@ -2055,6 +2086,7 @@ func (m *Manager) setJob(id, status, message string) error {
 	}
 	m.touch()
 	m.emit(id, "", "job_status_changed", status)
+	m.signalChat()
 	return nil
 }
 func (m *Manager) setItem(item source, status, path, message string) error {

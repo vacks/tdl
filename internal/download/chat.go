@@ -80,6 +80,54 @@ const (
 // last so a very large text history never blocks the first media downloads.
 var chatStreamKinds = []string{"photo_video", "document", "music", "round_voice", "reply_candidates"}
 
+// chatStreamEnabled keeps the server-side index plan aligned with the
+// immutable download-policy snapshot stored on the chat task. Telegram's
+// gallery filters are broader than our semantic file types, so an enabled
+// stream may still yield items that filterSources rejects; the reverse must
+// never happen, otherwise an allowed file could be missed.
+func chatStreamEnabled(kind string, config settings.Download) bool {
+	allowed := make(map[string]struct{}, len(config.FileTypes))
+	for _, fileType := range config.FileTypes {
+		allowed[fileType] = struct{}{}
+	}
+	has := func(types ...string) bool {
+		for _, fileType := range types {
+			if _, ok := allowed[fileType]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	switch kind {
+	case "photo_video":
+		return has("image", "video")
+	case "document":
+		return has("document", "sticker", "gif")
+	case "music":
+		return has("music")
+	case "round_voice":
+		// Telegram keeps round videos in this special gallery even though
+		// their semantic type is video.
+		return has("voice", "video")
+	case "reply_candidates":
+		// With no eligible types there is nothing to index or listen for.
+		return config.IncludeReplies && len(allowed) > 0
+	default:
+		return false
+	}
+}
+
+func chatDownloadConfig(target storedChatTarget) (settings.Download, error) {
+	config := settings.Defaults().Download
+	if target.configJSON == "" {
+		return config, nil
+	}
+	if err := json.Unmarshal([]byte(target.configJSON), &config); err != nil {
+		return settings.Download{}, fmt.Errorf("会话下载配置快照无效: %w", err)
+	}
+	return config, nil
+}
+
 // createChatJob persists only a resolved and bounded chat target. Discovery
 // workers are attached in a later layer; keeping creation transactional lets
 // callers safely retry an interrupted HTTP/Bot request without partial rows.
@@ -128,6 +176,7 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 	}
 	m.visibleChats.Add(1)
 	m.touch()
+	m.markChatListenerDirty()
 	return job, nil
 }
 
@@ -331,15 +380,25 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 			candidates[i] = setSourcePeer([]source{candidates[i]}, target.inputPeer())[0]
 		}
 	}
-	config := settings.Defaults().Download
-	if target.configJSON != "" {
-		if err := json.Unmarshal([]byte(target.configJSON), &config); err != nil {
-			return fmt.Errorf("会话下载配置快照无效: %w", err)
+	config, err := chatDownloadConfig(target)
+	if err != nil {
+		return err
+	}
+	hasReplyRoots := false
+	for _, item := range candidates {
+		if item.IsComment && item.ReplyRootID > 0 && item.DialogKey != "" {
+			hasReplyRoots = true
+			break
 		}
 	}
-	candidates = filterSources(candidates, config)
-	if len(candidates) == 0 {
-		return nil
+	// The overwhelmingly common historical-media path has no discussion root.
+	// Filter it before opening a transaction so a disabled subtype does not
+	// produce a PostgreSQL round trip for every indexed page.
+	if !hasReplyRoots {
+		candidates = filterSources(candidates, config)
+		if len(candidates) == 0 {
+			return nil
+		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	inserted := int64(0)
@@ -348,15 +407,24 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		return err
 	}
 	defer tx.Rollback()
-	// Persist the discussion-root map even when the currently discovered reply
-	// is filtered out. Future matching replies can then be associated with this
-	// listening task without scanning the channel again.
+	// Persist the discussion-root map before applying the file policy. A thread
+	// with only currently filtered files can later receive an allowed comment;
+	// that event must still be associated with this listening task.
 	for _, item := range candidates {
 		if !item.IsComment || item.ReplyRootID <= 0 || item.DialogKey == "" {
 			continue
 		}
 		if _, err := tx.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO NOTHING`, chatID, target.AccountID, item.DialogKey, item.ReplyRootID, item.OriginMessageID); err != nil {
 			return err
+		}
+	}
+	if hasReplyRoots {
+		candidates = filterSources(candidates, config)
+		if len(candidates) == 0 {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			return nil
 		}
 	}
 	for _, item := range candidates {
@@ -548,6 +616,14 @@ func (m *Manager) claimChatMedia(chatID string, item source) (string, string, er
 // the chat job owns the context, temporary directory and all durable item
 // state.
 func (m *Manager) runOneChatBatch() error {
+	// A message task created from a link, Bot command or reaction is interactive
+	// work. While any such task is ready, the shared scheduler caps chat batches
+	// at half of global capacity. Existing batches are allowed to finish safely;
+	// each is bounded and then releases its global permit.
+	priority, err := m.hasPriorityMessageTask()
+	if err != nil {
+		return err
+	}
 	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE status IN ('scanning', 'downloading', 'listening') AND EXISTS (SELECT 1 FROM chat_download_items i WHERE i.chat_job_id = chat_download_jobs.id AND i.status = 'queued') ORDER BY created_at LIMIT 16`)
 	if err != nil {
 		return err
@@ -577,6 +653,13 @@ func (m *Manager) runOneChatBatch() error {
 	if err != nil {
 		return err
 	}
+	releaseTransfer, acquired := m.tryAcquireTransfer(transferChat, priority)
+	if !acquired {
+		// Keep the durable media rows queued. Another worker will retry after a
+		// permit is released, without creating a competing upstream transfer.
+		return nil
+	}
+	defer releaseTransfer()
 	if target.inputPeer() == nil {
 		return errors.New("会话下载任务缺少 Telegram 会话引用")
 	}
@@ -765,6 +848,12 @@ func (m *Manager) runOneChatBatch() error {
 		return m.requeueStalledChatBatch(id, batch)
 	}
 	if err != nil && m.chatStatus(id) != ChatStatusPaused && m.chatStatus(id) != ChatStatusCancelled {
+		if m.recordTelegramRPCError(target.AccountID, err) {
+			_, _ = m.db.Exec(`UPDATE chat_download_items SET status = 'queued', error = 'Telegram 限流中，等待自动恢复', started_at = '', finished_at = '' WHERE chat_job_id = ? AND status = 'running'`, id)
+			m.touch()
+			m.signalChat()
+			return nil
+		}
 		for _, item := range batch {
 			// Another file in this upstream call can fail after this one has
 			// completed its final move. Never overwrite that completed state.
@@ -966,15 +1055,27 @@ func (m *Manager) publishChatItem(chatID, path string, item source, config setti
 }
 
 func (m *Manager) reconcileChatListeners() {
+	const listenerSafetyRefresh = 5 * time.Minute
+	now := time.Now()
+	due := m.listenerSnapshotAt.Load() == 0 || now.UnixNano()-m.listenerSnapshotAt.Load() >= listenerSafetyRefresh.Nanoseconds()
+	if !due && !m.listenerDirty.Load() {
+		return
+	}
+	// Clear before querying. A concurrent state change sets it again, ensuring
+	// this slightly older snapshot is promptly replaced instead of losing the
+	// wake-up.
+	m.listenerDirty.Store(false)
 	rows, err := m.db.Query(`SELECT account_id, dialog_key FROM chat_download_jobs WHERE listen_new = 1 AND scan_state = ? AND status IN (?, ?)
 UNION
 SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE j.listen_new = 1 AND j.scan_state = ? AND j.status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 	if err != nil {
+		m.listenerDirty.Store(true)
 		return
 	}
 	defer rows.Close()
 	wanted := make(map[string]struct{})
 	watched := make(map[string]map[string]struct{})
+	potential := make(map[string]bool)
 	for rows.Next() {
 		var accountID, dialogKey string
 		if rows.Scan(&accountID, &dialogKey) == nil && accountID != "" && dialogKey != "" {
@@ -985,9 +1086,25 @@ SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_d
 			watched[accountID][dialogKey] = struct{}{}
 		}
 	}
+	// Keep the inexpensive account flag separate from the UNION above: only an
+	// original listened channel can receive a first, as-yet-unmapped reply.
+	rows2, err := m.db.Query(`SELECT DISTINCT account_id FROM chat_download_jobs WHERE dialog_type = 'channel' AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	if err != nil {
+		m.listenerDirty.Store(true)
+		return
+	}
+	for rows2.Next() {
+		var accountID string
+		if rows2.Scan(&accountID) == nil && accountID != "" {
+			potential[accountID] = true
+		}
+	}
+	_ = rows2.Close()
 	proxyURL := m.settings.ProxyURL()
 	m.mu.Lock()
 	m.chatWatched = watched
+	m.potentialDiscussion = potential
+	m.listenerSnapshotReady = true
 	for accountID := range wanted {
 		if current, exists := m.chatListeners[accountID]; exists && current.proxy == proxyURL {
 			continue
@@ -1008,6 +1125,15 @@ SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_d
 		}
 	}
 	m.mu.Unlock()
+	m.listenerSnapshotAt.Store(now.UnixNano())
+}
+
+func (m *Manager) markChatListenerDirty() {
+	m.listenerDirty.Store(true)
+	select {
+	case m.chatWake <- struct{}{}:
+	default:
+	}
 }
 
 // addChatWatched closes the interval between persisting a discussion mapping
@@ -1188,7 +1314,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			includeReplies = false
 		}
 		if _, done := resolved[includeReplies]; !done && resolvedErr[includeReplies] == nil {
-			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, event.DialogName, includeReplies)
+			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies)
 		}
 		if resolveErr := resolvedErr[includeReplies]; resolveErr != nil {
 			applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", resolveErr.Error())
@@ -1204,11 +1330,6 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			applog.Error("chat_download", "new_media_register_failed", "chat_job_id", id, "message_id", event.MessageID, "error", err.Error())
 			return err
 		}
-		if originByJob[id] == 0 && includeReplies {
-			if err := m.rememberNewChatDiscussion(event, target); err != nil {
-				logRelatedWarning(event.AccountID, event.MessageID, err)
-			}
-		}
 		applog.Info("chat_download", "new_media_queued", "chat_job_id", id, "message_id", event.MessageID, "item_count", len(items))
 	}
 	return nil
@@ -1222,21 +1343,12 @@ func targetIncludesReplies(target storedChatTarget) bool {
 	return config.IncludeReplies
 }
 
-func (m *Manager) rememberNewChatDiscussion(event telegram.NewMessageEvent, target storedChatTarget) error {
-	if target.DialogType != "channel" || event.InputPeer == nil || event.MessageID <= 0 {
-		return nil
-	}
-	return m.accounts.Run(context.Background(), event.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
-		return m.rememberChatDiscussionRoot(ctx, client.API(), target, event.MessageID, event.MessageID)
-	})
-}
-
 func (m *Manager) discoverDiscussionOrigin(event telegram.NewMessageEvent, rootID int) (string, int, int, error) {
 	var originKey string
 	var originID, resolvedRootID int
 	err := m.accounts.Run(context.Background(), event.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
 		var err error
-		originKey, originID, resolvedRootID, err = discussionOriginFromRoot(ctx, client.API(), event.InputPeer, rootID)
+		originKey, originID, resolvedRootID, err = discussionOriginFromRoot(m, ctx, client.API(), event.AccountID, event.InputPeer, rootID)
 		return err
 	})
 	return originKey, originID, resolvedRootID, err
@@ -1262,12 +1374,46 @@ func (m *Manager) scanOneChat() error {
 	if err != nil {
 		return err
 	}
+	config, err := chatDownloadConfig(target)
+	if err != nil {
+		_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, ChatStatusFailed, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning)
+		m.touch()
+		return err
+	}
+	hasEnabledStream := false
+	for _, kind := range chatStreamKinds {
+		if chatStreamEnabled(kind, config) {
+			hasEnabledStream = true
+			break
+		}
+	}
+	if !hasEnabledStream {
+		// An explicit empty file-type selection means "download nothing".
+		// Do not establish a Telegram connection or perform an otherwise
+		// pointless history scan for a task that cannot admit any file.
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ?`, id); err != nil {
+			return err
+		}
+		_, err := m.db.Exec(`UPDATE chat_download_jobs SET scan_state = ?, status = ?, error = '', updated_at = ? WHERE id = ? AND status = ?`, chatScanCompleted, ChatStatusCompleted, now, id, ChatStatusScanning)
+		if err == nil {
+			m.touch()
+			m.markChatListenerDirty()
+		}
+		return err
+	}
 	ctx, release := m.beginChatExecution(id)
 	defer release()
 	err = m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
 		for _, kind := range chatStreamKinds {
 			if _, err := m.db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind) VALUES (?, ?) ON CONFLICT(chat_job_id, stream_kind) DO NOTHING`, target.ID, kind); err != nil {
 				return err
+			}
+			if !chatStreamEnabled(kind, config) {
+				if _, err := m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = ?`, target.ID, kind); err != nil {
+					return err
+				}
+				continue
 			}
 			if kind == "reply_candidates" {
 				if err := m.scanChatReplyCandidates(ctx, client, target); err != nil {
@@ -1282,8 +1428,19 @@ func (m *Manager) scanOneChat() error {
 		return nil
 	})
 	if err != nil {
+		if m.recordTelegramRPCError(target.AccountID, err) {
+			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, ChatStatusQueued, "Telegram 限流中，等待自动恢复", time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning)
+			m.touch()
+			m.markChatListenerDirty()
+			return nil
+		}
+		// A real indexing failure must stop any batches already admitted while
+		// history scanning ran in parallel. Leaving them alive would expose a
+		// failed parent whose child files are still downloading.
+		m.cancelChatExecutions(id)
 		_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, ChatStatusFailed, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning)
 		m.touch()
+		m.markChatListenerDirty()
 		return err
 	}
 	current, err := m.chatTarget(id)
@@ -1298,6 +1455,7 @@ func (m *Manager) scanOneChat() error {
 	_, err = m.db.Exec(`UPDATE chat_download_jobs SET scan_state = ?, status = ?, error = '', updated_at = ? WHERE id = ? AND status = ?`, chatScanCompleted, ChatStatusDownloading, time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning)
 	if err == nil {
 		m.touch()
+		m.markChatListenerDirty()
 	}
 	return err
 }
@@ -1306,6 +1464,14 @@ func (m *Manager) scanOneChat() error {
 // persisted after every page, so recovery never has to start the history over;
 // MinID/MaxID keep the immutable range fixed at task creation time.
 func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, target storedChatTarget, kind string) error {
+	config, err := chatDownloadConfig(target)
+	if err != nil {
+		return err
+	}
+	if !chatStreamEnabled(kind, config) {
+		_, err = m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = ?`, target.ID, kind)
+		return err
+	}
 	var offset int
 	var completed int
 	if err := m.db.QueryRow(`SELECT offset_message_id, completed FROM chat_download_streams WHERE chat_job_id = ? AND stream_kind = ?`, target.ID, kind).Scan(&offset, &completed); err != nil {
@@ -1318,6 +1484,10 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 	if err != nil {
 		return err
 	}
+	// A grouped album can straddle only a page boundary. Keep successful
+	// boundary expansions for this scan so the same album is not looked up
+	// again on the following page.
+	expandedGroups := make(map[int64]struct{})
 	for {
 		current, err := m.chatTarget(target.ID)
 		if err != nil {
@@ -1330,8 +1500,12 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 		if minID < 0 {
 			minID = 0
 		}
+		if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
+			return err
+		}
 		result, err := client.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{Peer: target.inputPeer(), Q: "", Filter: filter, OffsetID: offset, Limit: 100, MinID: minID, MaxID: target.UpperMessageID + 1})
 		if err != nil {
+			m.recordTelegramRPCError(target.AccountID, err)
 			return fmt.Errorf("搜索%s文件: %w", label, err)
 		}
 		messages := searchMessages(result)
@@ -1339,30 +1513,30 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 			_, err := m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = ?`, target.ID, kind)
 			return err
 		}
+		page := chatPageGroups(messages, target.StartMessageID, target.UpperMessageID)
 		candidates := make([]source, 0, len(messages))
-		seenGroups := make(map[int64]struct{})
-		nextOffset := offset
-		for _, raw := range messages {
-			message, ok := raw.(*tg.Message)
-			if !ok || message.ID < target.StartMessageID || message.ID > target.UpperMessageID {
-				continue
-			}
-			if nextOffset == 0 || message.ID < nextOffset {
-				nextOffset = message.ID
-			}
-			groupedID, grouped := message.GetGroupedID()
-			if grouped {
-				if _, exists := seenGroups[groupedID]; exists {
+		for _, group := range page {
+			members := group.members
+			if group.id != 0 && group.boundary {
+				if _, done := expandedGroups[group.id]; done {
 					continue
 				}
-				seenGroups[groupedID] = struct{}{}
-			}
-			members := []*tg.Message{message}
-			if grouped {
-				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), message); groupErr == nil && len(expanded) > 0 {
+				if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
+					return err
+				}
+				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), group.members[0]); groupErr == nil && len(expanded) > 0 {
 					members = expanded
+					expandedGroups[group.id] = struct{}{}
+				} else if groupErr != nil && m.recordTelegramRPCError(target.AccountID, groupErr) {
+					// Keep the durable page cursor in place after a flood response;
+					// otherwise an album crossing a page boundary could be incomplete.
+					return fmt.Errorf("展开相册: %w", groupErr)
 				}
 			}
+			if len(members) == 0 {
+				continue
+			}
+			message := members[0]
 			originID := firstMessageID(members, message.ID)
 			caption := groupDisplayText(members)
 			for _, member := range members {
@@ -1376,18 +1550,22 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 				memberGroup, _ := member.GetGroupedID()
 				candidates = append(candidates, source{Item: Item{DialogType: target.DialogType, DialogKey: target.DialogKey, DialogID: target.DialogID, MessageID: member.ID, GroupedID: memberGroup, MessageText: caption, OriginalName: media.Name, Size: media.Size, OriginDialogName: target.DialogName, OriginMessageID: originID}, DialogName: target.DialogName, MediaType: messageMediaType(member), Direct: makeDirectPeer(target.inputPeer())})
 			}
-			config := settings.Defaults().Download
-			if target.configJSON != "" {
-				_ = json.Unmarshal([]byte(target.configJSON), &config)
-			}
 		}
 		if err := m.registerChatMedia(target.ID, candidates, false); err != nil {
 			return err
 		}
-		if nextOffset == 0 || nextOffset == offset {
-			return errors.New("Telegram 文件搜索未推进分页游标")
+		nextOffset, exhausted, cursorErr := nextChatPageCursor(messages, offset, minID)
+		if cursorErr != nil {
+			return fmt.Errorf("%s文件索引分页: %w", label, cursorErr)
 		}
 		offset = nextOffset
+		if exhausted {
+			if _, err := m.db.Exec(`UPDATE chat_download_streams SET offset_message_id = ?, completed = 1 WHERE chat_job_id = ? AND stream_kind = ?`, offset, target.ID, kind); err != nil {
+				return err
+			}
+			m.touch()
+			return nil
+		}
 		if _, err := m.db.Exec(`UPDATE chat_download_streams SET offset_message_id = ? WHERE chat_job_id = ? AND stream_kind = ?`, offset, target.ID, kind); err != nil {
 			return err
 		}
@@ -1400,14 +1578,12 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 // streams. The expensive discussion/replies APIs are invoked only for a
 // message Telegram marks as having replies.
 func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Client, target storedChatTarget) error {
-	config := settings.Defaults().Download
-	if target.configJSON != "" {
-		if err := json.Unmarshal([]byte(target.configJSON), &config); err != nil {
-			return fmt.Errorf("会话下载配置快照无效: %w", err)
-		}
+	config, err := chatDownloadConfig(target)
+	if err != nil {
+		return err
 	}
-	if !config.IncludeReplies {
-		_, err := m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = 'reply_candidates'`, target.ID)
+	if !chatStreamEnabled("reply_candidates", config) {
+		_, err = m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = 'reply_candidates'`, target.ID)
 		return err
 	}
 	var offset, completed int
@@ -1429,8 +1605,12 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 		if minID < 0 {
 			minID = 0
 		}
+		if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
+			return err
+		}
 		result, err := client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: target.inputPeer(), OffsetID: offset, Limit: 100, MinID: minID, MaxID: target.UpperMessageID + 1})
 		if err != nil {
+			m.recordTelegramRPCError(target.AccountID, err)
 			return fmt.Errorf("读取会话回复索引: %w", err)
 		}
 		messages := searchMessages(result)
@@ -1438,16 +1618,12 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 			_, err := m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = 'reply_candidates'`, target.ID)
 			return err
 		}
-		nextOffset := offset
 		candidates := make([]source, 0)
 		seenGroups := make(map[int64]struct{})
 		for _, raw := range messages {
 			message, ok := raw.(*tg.Message)
 			if !ok || message.ID < target.StartMessageID || message.ID > target.UpperMessageID {
 				continue
-			}
-			if nextOffset == 0 || message.ID < nextOffset {
-				nextOffset = message.ID
 			}
 			replies, hasReplies := message.GetReplies()
 			if !hasReplies || replies.GetReplies() <= 0 {
@@ -1462,16 +1638,23 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 			}
 			members := []*tg.Message{message}
 			if grouped {
+				if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
+					return err
+				}
 				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), message); groupErr == nil && len(expanded) > 0 {
 					members = expanded
+				} else if groupErr != nil && m.recordTelegramRPCError(target.AccountID, groupErr) {
+					return fmt.Errorf("展开回复相册: %w", groupErr)
 				}
 			}
 			originID := firstMessageID(members, message.ID)
-			if err := m.rememberChatDiscussionRoot(ctx, client.API(), target, message.ID, originID); err != nil {
-				logRelatedWarning(target.AccountID, message.ID, err)
-			}
-			related, relatedErr := relatedSources(ctx, client.API(), target.AccountID, target.inputPeer(), target.DialogName, members, message.ID, originID)
+			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.inputPeer(), target.DialogName, members, message.ID, originID)
 			if relatedErr != nil {
+				if telegramWaitDuration(relatedErr) > 0 {
+					// A rate-limited reply lookup must retry this durable history
+					// page, rather than silently advancing past its comments.
+					return relatedErr
+				}
 				// A missing or inaccessible discussion never fails channel history.
 				logRelatedWarning(target.AccountID, message.ID, relatedErr)
 				continue
@@ -1481,35 +1664,23 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 		if err := m.registerChatMedia(target.ID, candidates, false); err != nil {
 			return err
 		}
-		if nextOffset == 0 || nextOffset == offset {
-			return errors.New("Telegram 回复索引未推进分页游标")
+		nextOffset, exhausted, cursorErr := nextChatPageCursor(messages, offset, minID)
+		if cursorErr != nil {
+			return fmt.Errorf("回复索引分页: %w", cursorErr)
 		}
 		offset = nextOffset
+		if exhausted {
+			if _, err := m.db.Exec(`UPDATE chat_download_streams SET offset_message_id = ?, completed = 1 WHERE chat_job_id = ? AND stream_kind = 'reply_candidates'`, offset, target.ID); err != nil {
+				return err
+			}
+			m.touch()
+			return nil
+		}
 		if _, err := m.db.Exec(`UPDATE chat_download_streams SET offset_message_id = ? WHERE chat_job_id = ? AND stream_kind = 'reply_candidates'`, offset, target.ID); err != nil {
 			return err
 		}
 		m.touch()
 	}
-}
-
-func (m *Manager) rememberChatDiscussionRoot(ctx context.Context, api *tg.Client, target storedChatTarget, sourceMessageID, originMessageID int) error {
-	if _, ok := target.inputPeer().(*tg.InputPeerChannel); !ok {
-		return nil
-	}
-	peer, rootID, found, err := discussionThread(ctx, api, target.AccountID, target.inputPeer(), sourceMessageID, 0)
-	if err != nil || !found {
-		return err
-	}
-	_, key, _ := dialogIdentity(peer, target.AccountID)
-	if key == "" {
-		return nil
-	}
-	direct := makeDirectPeer(peer)
-	_, err = m.db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id, discussion_peer_type, discussion_peer_id, discussion_peer_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, discussion_dialog_key, root_message_id) DO UPDATE SET discussion_peer_type = EXCLUDED.discussion_peer_type, discussion_peer_id = EXCLUDED.discussion_peer_id, discussion_peer_hash = EXCLUDED.discussion_peer_hash`, target.ID, target.AccountID, key, rootID, originMessageID, direct.kind, direct.id, direct.hash)
-	if err == nil {
-		m.addChatWatched(target.AccountID, key)
-	}
-	return err
 }
 
 func chatStreamFilter(kind string) (tg.MessagesFilterClass, string, error) {
@@ -1538,6 +1709,109 @@ func searchMessages(result tg.MessagesMessagesClass) []tg.MessageClass {
 	default:
 		return nil
 	}
+}
+
+type chatPageGroup struct {
+	id       int64
+	members  []*tg.Message
+	boundary bool
+}
+
+// chatPageGroups mirrors Telegram's local history model: messages carrying a
+// GroupedID are contiguous in a history/search page. Therefore every group
+// wholly inside the page is already complete; only the first and last group
+// may continue on an adjacent page and need an optional API expansion.
+func chatPageGroups(raw []tg.MessageClass, startID, upperID int) []chatPageGroup {
+	groups := make([]chatPageGroup, 0, len(raw))
+	positions := make(map[int64]int)
+	var firstGroup, lastGroup int64
+	first := true
+	for _, entry := range raw {
+		message, ok := entry.(*tg.Message)
+		if !ok || message.ID < startID || message.ID > upperID {
+			continue
+		}
+		groupID, grouped := message.GetGroupedID()
+		if first {
+			if grouped {
+				firstGroup = groupID
+			}
+			first = false
+		}
+		if grouped {
+			lastGroup = groupID
+		} else {
+			lastGroup = 0
+		}
+		if !grouped {
+			groups = append(groups, chatPageGroup{members: []*tg.Message{message}})
+			continue
+		}
+		if position, exists := positions[groupID]; exists {
+			groups[position].members = append(groups[position].members, message)
+			continue
+		}
+		positions[groupID] = len(groups)
+		groups = append(groups, chatPageGroup{id: groupID, members: []*tg.Message{message}})
+	}
+	for index := range groups {
+		if groups[index].id != 0 && (groups[index].id == firstGroup || groups[index].id == lastGroup) {
+			groups[index].boundary = true
+		}
+	}
+	return groups
+}
+
+// pageOldestMessageID returns the oldest message identity Telegram supplied,
+// including deleted placeholders and service messages. Those records cannot
+// produce a download, but they are still part of the cursor space and must
+// advance pagination.
+func pageOldestMessageID(page []tg.MessageClass) int {
+	oldest := 0
+	for _, raw := range page {
+		var id int
+		switch message := raw.(type) {
+		case *tg.Message:
+			id = message.ID
+		case *tg.MessageEmpty:
+			id = message.ID
+		case *tg.MessageService:
+			id = message.ID
+		}
+		if id > 0 && (oldest == 0 || id < oldest) {
+			oldest = id
+		}
+	}
+	return oldest
+}
+
+// nextChatPageCursor turns a Telegram page into a durable history cursor.
+// OffsetID pages occasionally repeat their boundary record. That record has
+// already been observed and persisted (or was a non-downloadable placeholder),
+// so moving one ID older is safe and prevents a false fatal "cursor stuck".
+// A page that reaches minID has exhausted this task's fixed range.
+func nextChatPageCursor(page []tg.MessageClass, previous, minID int) (next int, completed bool, err error) {
+	oldest := pageOldestMessageID(page)
+	if oldest == 0 {
+		return 0, false, errors.New("Telegram 分页响应不含可用消息 ID")
+	}
+	if oldest <= minID {
+		return oldest, true, nil
+	}
+	if previous > 0 {
+		switch {
+		case oldest < previous:
+			return oldest, false, nil
+		case oldest == previous:
+			if previous-1 <= minID {
+				return previous - 1, true, nil
+			}
+			return previous - 1, false, nil
+		default:
+			return 0, false, fmt.Errorf("Telegram 分页游标倒退异常（当前 %d，页面最早 %d）", previous, oldest)
+		}
+	}
+	return oldest, false, nil
 }
 
 func (m *Manager) refreshChatStates() {
@@ -1573,6 +1847,7 @@ WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanComplet
 		if next != status {
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id)
 			m.touch()
+			m.markChatListenerDirty()
 		}
 		if next == ChatStatusListening && failed > 0 {
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("历史下载有 %d 个文件失败，可重新开始失败项", failed), id)
@@ -1718,6 +1993,7 @@ func (m *Manager) SetChatListening(id string, enabled bool) error {
 		}
 	}
 	m.touch()
+	m.markChatListenerDirty()
 	m.signalChat()
 	return nil
 }
@@ -1754,6 +2030,7 @@ func (m *Manager) transitionChatItems(id, expected, next, message, itemSQL strin
 		return err
 	}
 	m.touch()
+	m.markChatListenerDirty()
 	return nil
 }
 
@@ -1807,6 +2084,7 @@ func (m *Manager) DeleteChat(id string) error {
 	m.visibleChats.Add(-1)
 	_ = os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id))
 	m.touch()
+	m.markChatListenerDirty()
 	return nil
 }
 
@@ -1839,5 +2117,6 @@ func (m *Manager) PurgeChat(id string) error {
 	}
 	_ = os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id))
 	m.touch()
+	m.markChatListenerDirty()
 	return nil
 }

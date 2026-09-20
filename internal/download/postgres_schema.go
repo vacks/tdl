@@ -59,7 +59,11 @@ func (m *Manager) migratePostgres() error {
 		`CREATE TABLE IF NOT EXISTS downloaded_media (
  dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, final_path TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, owner_kind TEXT NOT NULL DEFAULT '', owner_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(dialog_key, message_id)
 )`,
+		`CREATE TABLE IF NOT EXISTS telegram_rate_limits (
+ account_id TEXT PRIMARY KEY, blocked_until TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+)`,
 		`CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
+		`CREATE INDEX IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
 		`CREATE INDEX IF NOT EXISTS download_items_status ON download_items(status)`,
 		`CREATE INDEX IF NOT EXISTS download_items_failed_finished_at ON download_items(status, finished_at) WHERE status = 'failed'`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
@@ -90,6 +94,7 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS chat_download_items_active_status ON chat_download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_state_by_job ON chat_download_items(chat_job_id, status) WHERE status IN ('queued', 'running', 'downloaded', 'failed')`,
 		`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS telegram_rate_limits_blocked_until ON telegram_rate_limits(blocked_until)`,
 	}
 	for _, statement := range statements {
 		if _, err := m.db.Exec(statement); err != nil {
@@ -298,6 +303,19 @@ END $$`,
 			`ALTER TABLE chat_reply_roots ADD COLUMN IF NOT EXISTS discussion_peer_type TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE chat_reply_roots ADD COLUMN IF NOT EXISTS discussion_peer_id BIGINT NOT NULL DEFAULT 0`,
 			`ALTER TABLE chat_reply_roots ADD COLUMN IF NOT EXISTS discussion_peer_hash BIGINT NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		version: 13,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS telegram_rate_limits (account_id TEXT PRIMARY KEY, blocked_until TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)`,
+			`CREATE INDEX IF NOT EXISTS telegram_rate_limits_blocked_until ON telegram_rate_limits(blocked_until)`,
+		},
+	},
+	{
+		version: 14,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
 		},
 	},
 }

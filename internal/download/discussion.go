@@ -41,7 +41,7 @@ func firstMessageID(messages []*tg.Message, fallback int) int {
 // A missing discussion is expected and returns no items. Transport/permission
 // failures are deliberately returned to the caller, which may retain original
 // media and surface a non-fatal warning.
-func relatedSources(ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, originName string, originMessages []*tg.Message, rootMessageID, originMessageID int) ([]source, error) {
+func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, originName string, originMessages []*tg.Message, rootMessageID, originMessageID int) ([]source, error) {
 	if len(originMessages) == 0 || originPeer == nil || rootMessageID <= 0 || originMessageID <= 0 {
 		return nil, nil
 	}
@@ -51,7 +51,7 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 	expectation := discussionExpectation{}
 	if _, channel := originPeer.(*tg.InputPeerChannel); channel {
 		expectation = channelDiscussionExpectation(originMessages)
-		resolvedPeer, resolvedRoot, found, err := discussionThread(ctx, api, accountID, originPeer, rootMessageID, expectation.dialogID)
+		resolvedPeer, resolvedRoot, found, err := discussionThread(m, ctx, api, accountID, originPeer, rootMessageID, expectation.dialogID)
 		if err != nil {
 			return nil, err
 		}
@@ -86,8 +86,12 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 	// a thread ended: sparse/deleted messages may yield short intermediate pages.
 	offset := 0
 	for {
+		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+			return nil, err
+		}
 		result, err := api.MessagesGetReplies(ctx, &tg.MessagesGetRepliesRequest{Peer: threadPeer, MsgID: threadMessageID, OffsetID: offset, Limit: 100})
 		if err != nil {
+			m.recordTelegramRPCError(accountID, err)
 			if isNoDiscussionError(err) {
 				return items, nil
 			}
@@ -113,7 +117,17 @@ func relatedSources(ctx context.Context, api *tg.Client, accountID string, origi
 			// its complete group only once as a safety net for a page boundary.
 			messages := []*tg.Message{message}
 			if _, grouped := message.GetGroupedID(); grouped {
+				if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+					return nil, err
+				}
 				group, groupErr := tutil.GetGroupedMessages(ctx, api, threadPeer, message)
+				if groupErr != nil {
+					if m.recordTelegramRPCError(accountID, groupErr) {
+						// Keep the reply-page cursor intact during a Telegram cooldown.
+						// Continuing with a partial group here could lose album members.
+						return nil, fmt.Errorf("展开评论相册: %w", groupErr)
+					}
+				}
 				if groupErr == nil && len(group) > 0 {
 					messages = group
 				}
@@ -201,9 +215,13 @@ func replyPageNextOffset(page []tg.MessageClass, previous int) int {
 //
 // It is also used for newly received posts with zero replies so future comments
 // can be mapped without waiting for the first media reply.
-func discussionThread(ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, messageID int, expectedDiscussionID int64) (tg.InputPeerClass, int, bool, error) {
+func discussionThread(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, messageID int, expectedDiscussionID int64) (tg.InputPeerClass, int, bool, error) {
+	if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+		return nil, 0, false, err
+	}
 	discussion, err := api.MessagesGetDiscussionMessage(ctx, &tg.MessagesGetDiscussionMessageRequest{Peer: originPeer, MsgID: messageID})
 	if err != nil {
+		m.recordTelegramRPCError(accountID, err)
 		if isNoDiscussionError(err) {
 			return nil, 0, false, nil
 		}
@@ -279,16 +297,20 @@ func discussionMessagePeerID(value tg.PeerClass) int64 {
 // for that post. Telegram stores the source channel/post in the forwarded
 // discussion-root header, so this costs one request only for the first unknown
 // thread instead of an API call for every historical channel message.
-func discussionOriginFromRoot(ctx context.Context, api *tg.Client, discussionPeer tg.InputPeerClass, rootMessageID int) (originKey string, originMessageID int, resolvedRootMessageID int, err error) {
+func discussionOriginFromRoot(m *Manager, ctx context.Context, api *tg.Client, accountID string, discussionPeer tg.InputPeerClass, rootMessageID int) (originKey string, originMessageID int, resolvedRootMessageID int, err error) {
 	channel, ok := discussionPeer.(*tg.InputPeerChannel)
 	if !ok {
 		return "", 0, rootMessageID, nil
+	}
+	if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
+		return "", 0, rootMessageID, err
 	}
 	result, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 		Channel: &tg.InputChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: rootMessageID}},
 	})
 	if err != nil {
+		m.recordTelegramRPCError(accountID, err)
 		return "", 0, rootMessageID, fmt.Errorf("读取讨论根消息: %w", err)
 	}
 	for _, raw := range searchMessages(result) {

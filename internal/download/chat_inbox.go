@@ -32,13 +32,15 @@ func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
 	}
 	m.mu.Lock()
 	_, watched := m.chatWatched[event.AccountID][key]
+	potential := m.potentialDiscussion[event.AccountID]
+	snapshotReady := m.listenerSnapshotReady
 	m.mu.Unlock()
 	if !watched {
 		// The first reply under an old channel post has no stored discussion
 		// mapping yet, so its discussion group is not in chatWatched. Admit only
 		// reply-shaped channel events while this account has an eligible channel
 		// listener; the durable worker will then either map it or discard it.
-		if event.InputPeer == nil || (event.ReplyToTopID <= 0 && event.ReplyToMessageID <= 0) || !m.hasPotentialDiscussionListener(event.AccountID) {
+		if event.InputPeer == nil || (event.ReplyToTopID <= 0 && event.ReplyToMessageID <= 0) || !m.hasPotentialDiscussionListener(event.AccountID, potential, snapshotReady) {
 			return
 		}
 	}
@@ -86,7 +88,17 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account
 	}
 }
 
-func (m *Manager) hasPotentialDiscussionListener(accountID string) bool {
+func (m *Manager) hasPotentialDiscussionListener(accountID string, potential, snapshotReady bool) bool {
+	// A positive snapshot is safe even while a newer rebuild is pending: it can
+	// only admit a reply for later durable validation. A negative snapshot is
+	// trusted only once it is current; otherwise fall back to the old query so a
+	// just-enabled listener can never lose its first reply.
+	if potential {
+		return true
+	}
+	if snapshotReady && !m.listenerDirty.Load() {
+		return false
+	}
 	var exists bool
 	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'channel' AND listen_new = 1 AND scan_state = ? AND status IN (?, ?))`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&exists); err != nil {
 		return false

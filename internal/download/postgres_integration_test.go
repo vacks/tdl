@@ -296,7 +296,7 @@ func TestPostgresRegisterFirstChatMediaCreatesClaim(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('first-media-chat','tg://chat','channel','channel:first-media',1,'test','account','scanning','indexing','{}',?,?)`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.registerChatMedia("first-media-chat", []source{{Item: Item{DialogType: "channel", DialogKey: "channel:first-media", DialogID: 1, MessageID: 42, OriginalName: "first.bin"}, DialogName: "test"}}, false); err != nil {
+	if err := m.registerChatMedia("first-media-chat", []source{{Item: Item{DialogType: "channel", DialogKey: "channel:first-media", DialogID: 1, MessageID: 42, OriginalName: "first.bin"}, DialogName: "test", MediaType: "image"}}, false); err != nil {
 		t.Fatalf("registerChatMedia() first media: %v", err)
 	}
 	var itemStatus, ownerKind, ownerID string
@@ -305,6 +305,46 @@ func TestPostgresRegisterFirstChatMediaCreatesClaim(t *testing.T) {
 	}
 	if err := db.QueryRow(`SELECT owner_kind, owner_id FROM downloaded_media WHERE dialog_key = 'channel:first-media' AND message_id = 42`).Scan(&ownerKind, &ownerID); err != nil || ownerKind != "chat" || ownerID != "first-media-chat" {
 		t.Fatalf("claim=%q/%q err=%v, want chat/first-media-chat", ownerKind, ownerID, err)
+	}
+}
+
+func TestPostgresChatReplyRootSurvivesFilePolicy(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// The snapshot permits only images; this discovered document must not be
+	// indexed, while its root still has to remain available for a later image
+	// posted to the same discussion thread.
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('filtered-reply-chat','tg://chat','channel','channel:root',1,'test','account','scanning','indexing','{"fileTypes":["image"],"includeReplies":true}',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	item := source{Item: Item{DialogType: "chat", DialogKey: "chat:discussion", DialogID: 2, MessageID: 42, OriginalName: "filtered.bin", IsComment: true, ReplyRootID: 7, OriginMessageID: 11}, DialogName: "discussion", MediaType: "document"}
+	if err := m.registerChatMedia("filtered-reply-chat", []source{item}, false); err != nil {
+		t.Fatal(err)
+	}
+	var roots, indexed int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_reply_roots WHERE chat_job_id = 'filtered-reply-chat' AND discussion_dialog_key = 'chat:discussion' AND root_message_id = 7`).Scan(&roots); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = 'filtered-reply-chat'`).Scan(&indexed); err != nil {
+		t.Fatal(err)
+	}
+	if roots != 1 || indexed != 0 {
+		t.Fatalf("roots=%d indexed=%d, want 1 and 0", roots, indexed)
 	}
 }
 

@@ -432,6 +432,15 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 		}
 		input, extractErr := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
 		name := "会话"
+		if extractErr == nil {
+			// The update already carries an authoritative InputPeer. Do not ask
+			// Telegram to resolve a display name for every unrelated message on
+			// an account that happens to watch one busy channel.
+			dialogID, _ := inputPeerInfo(input)
+			key := newMessageDialogKey(input, accountID)
+			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+			return
+		}
 		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
 		if peer, err := manager.ResolvePeer(updateCtx, message.PeerID); err == nil {
 			input, name = peer.InputPeer(), peer.VisibleName()

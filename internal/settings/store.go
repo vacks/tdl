@@ -181,17 +181,17 @@ func Validate(values Values) error {
 		}
 	}
 	d := values.Download
-	if d.Threads < 1 || d.Threads > 32 {
-		return errors.New("单任务下载线程数需在 1 至 32 之间")
+	if d.Threads < 1 || d.Threads > 16 {
+		return errors.New("单任务下载线程数需在 1 至 16 之间")
 	}
-	if d.TaskLimit < 1 || d.TaskLimit > 16 {
-		return errors.New("单任务同时下载文件数需在 1 至 16 之间")
+	if d.TaskLimit < 1 || d.TaskLimit > 4 {
+		return errors.New("单任务同时下载文件数需在 1 至 4 之间")
 	}
-	if d.ConcurrentJobs < 1 || d.ConcurrentJobs > 16 {
-		return errors.New("同时执行下载任务数需在 1 至 16 之间")
+	if d.ConcurrentJobs < 1 || d.ConcurrentJobs > 4 {
+		return errors.New("同时执行下载任务数需在 1 至 4 之间")
 	}
-	if d.PoolSize < 0 || d.PoolSize > 64 {
-		return errors.New("连接池大小需在 0 至 64 之间")
+	if d.PoolSize < 0 || d.PoolSize > 16 {
+		return errors.New("连接池大小需在 0 至 16 之间")
 	}
 	if d.DelayMS < 0 || d.DelayMS > 60000 {
 		return errors.New("下载间隔需在 0 至 60000 毫秒之间")
@@ -274,6 +274,20 @@ func validateFinalTemplate(pattern string) error {
 
 func normalizeDownload(download *Download) {
 	download.FileTypesInitialized = true
+	// Safety ceilings prevent a previously saved experimental configuration from
+	// making the service fail to start or overwhelming Telegram after upgrade.
+	if download.Threads > 16 {
+		download.Threads = 16
+	}
+	if download.TaskLimit > 4 {
+		download.TaskLimit = 4
+	}
+	if download.ConcurrentJobs > 4 {
+		download.ConcurrentJobs = 4
+	}
+	if download.PoolSize > 16 {
+		download.PoolSize = 16
+	}
 	if download.ConcurrentJobs == 0 {
 		download.ConcurrentJobs = Defaults().Download.ConcurrentJobs
 	}
