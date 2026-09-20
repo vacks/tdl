@@ -24,16 +24,6 @@ func TestValidateFilenameTemplatesBeforeSaving(t *testing.T) {
 	if err := Validate(values); err == nil {
 		t.Fatal("invalid final template was accepted")
 	}
-	values = Defaults()
-	values.Download.TempFilenameTemplate = "{{ if .FileName }}"
-	if err := Validate(values); err == nil {
-		t.Fatal("invalid temporary template was accepted")
-	}
-	values = Defaults()
-	values.Download.TempFilenameTemplate = "{{ .Missing }}"
-	if err := Validate(values); err == nil {
-		t.Fatal("temporary template with an unknown variable was accepted")
-	}
 }
 
 func TestValidateDownloadFilters(t *testing.T) {

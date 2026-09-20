@@ -49,6 +49,9 @@ const (
 	upstreamInitialTimeout = 2 * time.Minute
 	upstreamIdleTimeout    = 10 * time.Minute
 	upstreamWatchPeriod    = 5 * time.Second
+	// Temporary files are isolated by complete Telegram dialog identity below,
+	// so the message ID is sufficient within each private directory.
+	temporaryFilenameTemplate = "{{ .MessageID }}_{{ filenamify .FileName }}"
 )
 
 type Item struct {
@@ -1137,11 +1140,7 @@ func (m *Manager) run(job Job, sources []source) {
 	// A media transfer must not fail merely because it is slow. Cancellation is
 	// controlled by pause/cancel and graceful application shutdown instead of a
 	// fixed wall-clock deadline.
-	tmpDir := filepath.Join(m.downloadDir, ".tdl-tmp", job.ID)
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		m.fail(job.ID, pending, err)
-		return
-	}
+	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", job.ID)
 	config := m.settings.Get()
 	if job.ConfigJSON != "" {
 		var snapshot settings.Download
@@ -1202,6 +1201,10 @@ func (m *Manager) run(job Job, sources []source) {
 			if peer == nil {
 				return errors.New("下载文件缺少 Telegram 会话引用")
 			}
+			tmpDir, err := temporaryDialogDirectory(tmpRoot, batch[0].DialogKey)
+			if err != nil {
+				return fmt.Errorf("创建会话临时目录: %w", err)
+			}
 			byMessage := make(map[int]source, len(batch))
 			messageIDs := make([]int, 0, len(batch))
 			seenMessages := make(map[int]struct{}, len(batch))
@@ -1220,7 +1223,7 @@ func (m *Manager) run(job Job, sources []source) {
 				seenMessages[item.MessageID] = struct{}{}
 				messageIDs = append(messageIDs, item.MessageID)
 			}
-			opts := upstreamDL.Options{Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Restart: restart && groupNumber == 0, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
+			opts := upstreamDL.Options{Dir: tmpDir, Template: temporaryFilenameTemplate, Group: true, Continue: true, Restart: restart && groupNumber == 0, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
 				if m.status(job.ID) != "running" {
 					return
 				}
@@ -1296,7 +1299,7 @@ func (m *Manager) run(job Job, sources []source) {
 		// The observable task result is still successful in that case.
 		if m.allItemsCompleted(job.ID) {
 			_ = m.setJob(job.ID, "completed", "")
-			_ = os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpRoot)
 			return
 		}
 		if m.recordTelegramRPCError(job.AccountID, err) {
@@ -1325,7 +1328,7 @@ func (m *Manager) run(job Job, sources []source) {
 		m.fail(job.ID, pending, errors.New("部分文件未收到收尾完成回调或移动失败"))
 	} else {
 		_ = m.setJob(job.ID, "completed", "")
-		_ = os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpRoot)
 	}
 }
 
@@ -2337,6 +2340,22 @@ func normalizeRelativePath(raw string) (string, error) {
 		cleaned = append(cleaned, part)
 	}
 	return filepath.Join(cleaned...), nil
+}
+
+// temporaryDialogDirectory isolates upstream tdl's temporary files by the
+// complete Telegram dialog identity. Message IDs are unique only inside one
+// dialog, so a channel post and a linked-discussion reply with the same
+// numeric ID must never share a continuation path.
+func temporaryDialogDirectory(taskRoot, dialogKey string) (string, error) {
+	name := sanitizeComponent(dialogKey)
+	if name == "" || name == "." || name == ".." {
+		return "", errors.New("临时目录的会话身份无效")
+	}
+	dir := filepath.Join(taskRoot, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 func sanitizeComponent(input string) string {

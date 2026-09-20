@@ -7,13 +7,13 @@ import { projectVersion } from '@/buildInfo'
 
 type Settings = {
   proxyUrl: string
-  download: { threads: number; taskLimit: number; concurrentJobs: number; poolSize: number; delayMs: number; tempFilenameTemplate: string; finalFilenameTemplate: string; minFileSizeMB: number; maxFileSizeMB: number; fileTypes: string[]; includeReplies: boolean }
+  download: { threads: number; taskLimit: number; concurrentJobs: number; poolSize: number; delayMs: number; finalFilenameTemplate: string; minFileSizeMB: number; maxFileSizeMB: number; fileTypes: string[]; includeReplies: boolean }
   bot: { enabled: boolean; token: string; controlUserIds: number[]; notifications: { taskCreated: boolean; taskCompleted: boolean; taskPartial: boolean; taskFailed: boolean } }
   reaction: { enabled: boolean; emojis: string[] }
 }
 type ConfigResponse = { settings: Settings; downloadDir: string; upstreamVersion: string }
 const router = useRouter()
-const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, tempFilenameTemplate: '{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}', finalFilenameTemplate: '{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}', minFileSizeMB: 0, maxFileSizeMB: 0, fileTypes: ['image', 'video'], includeReplies: true }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] } })
+const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, finalFilenameTemplate: '{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}', minFileSizeMB: 0, maxFileSizeMB: 0, fileTypes: ['image', 'video'], includeReplies: true }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] } })
 const downloadDir = ref('')
 const saving = ref(false)
 const userIDs = ref<string[]>([])
@@ -74,12 +74,6 @@ onMounted(async () => { try { const session = await api<{ authenticated: boolean
 	  <el-form-item label="文件类型筛选"><el-checkbox-group v-model="form.download.fileTypes" class="file-type-group"><el-checkbox label="image">图片</el-checkbox><el-checkbox label="video">视频</el-checkbox><el-checkbox label="gif">GIF</el-checkbox><el-checkbox label="music">音乐</el-checkbox><el-checkbox label="voice">语音</el-checkbox><el-checkbox label="sticker">贴纸</el-checkbox><el-checkbox label="document">文档</el-checkbox></el-checkbox-group></el-form-item>
 	  <p class="field-help">默认下载图片和视频。仅下载勾选的类型；全部取消时不会下载任何文件。分类读取 Telegram 原生媒体属性：贴纸、GIF、音乐、语音和视频不会按文件扩展名猜测；作为文件发送的图片归入文档。</p>
 	  <el-divider class="download-config-divider filter-config-divider" />
-          <el-form-item label="临时文件命名模板（上游 tdl）"><el-input v-model="form.download.tempFilenameTemplate" /></el-form-item>
-          <div class="field-help template-help" v-pre>
-            <p>仅用于上游 tdl 写入私有临时目录。可用变量：</p>
-            <ul><li><code>.DialogID</code>：Telegram 对话 ID</li><li><code>.MessageID</code>：文件所在消息 ID</li><li><code>.MessageDate</code>：消息发送时间的 Unix 时间戳（秒）</li><li><code>.FileName</code>：Telegram 原始文件名</li><li><code>.FileCaption</code>：该文件消息附带的文字</li><li><code>.FileSize</code>：上游格式化后的文件大小</li><li><code>.DownloadDate</code>：命名时的 Unix 时间戳（秒）</li></ul>
-            <p>可继续使用上游函数，例如 <code>filenamify .FileName</code>、<code>formatDate .MessageDate "2006-01-02"</code>、<code>upper .FileName</code>。</p>
-          </div>
           <el-form-item label="最终文件命名模板"><el-input v-model="form.download.finalFilenameTemplate" /></el-form-item>
           <div class="field-help template-help" v-pre>
             <p>临时下载完成后由本项目移动至最终目录。可用变量：</p>

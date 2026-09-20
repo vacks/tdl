@@ -14,7 +14,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/iyear/tdl/pkg/tplfunc"
 	"github.com/vacks/tdl/internal/applog"
 )
 
@@ -24,7 +23,6 @@ type Download struct {
 	ConcurrentJobs        int    `json:"concurrentJobs"`
 	PoolSize              int    `json:"poolSize"`
 	DelayMS               int    `json:"delayMs"`
-	TempFilenameTemplate  string `json:"tempFilenameTemplate"`
 	FinalFilenameTemplate string `json:"finalFilenameTemplate"`
 	// Zero means unrestricted. Values are stored in MiB so the Web and Bot can
 	// present them without exposing implementation-level byte counts.
@@ -72,10 +70,6 @@ type Values struct {
 func Defaults() Values {
 	return Values{Download: Download{
 		Threads: 4, TaskLimit: 2, ConcurrentJobs: 1, PoolSize: 8, DelayMS: 0,
-		// This is evaluated by upstream tdl while it writes to the private
-		// temporary directory. Keep it limited to variables/functions supported
-		// by upstream tdl.
-		TempFilenameTemplate: "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}",
 		// This is evaluated by the web application after download and therefore
 		// can include our MessageText mapping.
 		FinalFilenameTemplate: "{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}",
@@ -209,14 +203,8 @@ func Validate(values Values) error {
 			return errors.New("文件类型筛选仅支持图片、视频、GIF、音乐、语音、贴纸或文档")
 		}
 	}
-	if strings.TrimSpace(d.TempFilenameTemplate) == "" {
-		return errors.New("临时文件命名模板不能为空")
-	}
 	if strings.TrimSpace(d.FinalFilenameTemplate) == "" {
 		return errors.New("最终文件命名模板不能为空")
-	}
-	if err := validateTempTemplate(d.TempFilenameTemplate); err != nil {
-		return err
 	}
 	if err := validateFinalTemplate(d.FinalFilenameTemplate); err != nil {
 		return err
@@ -235,23 +223,6 @@ func Validate(values Values) error {
 		if !validReactionEmoji(emoji) {
 			return errors.New("触发表情仅支持普通 Unicode 表情")
 		}
-	}
-	return nil
-}
-
-func validateTempTemplate(pattern string) error {
-	// Use the exact function registry linked into upstream tdl. This keeps the
-	// Web validator in lockstep with its temporary-file renderer instead of
-	// rejecting a valid upstream helper or accepting a nonexistent one.
-	funcs := tplfunc.FuncMap(tplfunc.All...)
-	tpl, err := template.New("temporary filename").Option("missingkey=error").Funcs(funcs).Parse(pattern)
-	if err != nil {
-		return fmt.Errorf("临时文件命名模板无效: %w", err)
-	}
-	var rendered bytes.Buffer
-	data := map[string]any{"DialogID": int64(1), "MessageID": 1, "MessageDate": time.Now().Unix(), "FileName": "file.txt", "FileCaption": "caption", "FileSize": "1 KB", "DownloadDate": time.Now().Unix()}
-	if err := tpl.Execute(&rendered, data); err != nil {
-		return fmt.Errorf("临时文件命名模板无效: %w", err)
 	}
 	return nil
 }

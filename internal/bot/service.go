@@ -1621,7 +1621,7 @@ func configText(cfg settings.Values) string {
 	if cfg.Download.IncludeReplies {
 		replies = "已开启"
 	}
-	return fmt.Sprintf("<b>当前配置</b>\n代理：%s\n下载：线程 %d · 单任务文件并发 %d · 任务并发 %d · 连接池 %d · 间隔 %dms\n文件筛选：%s\n关联评论/回复：%s\nBot：%s\n表情监听：%s（%s）\n临时命名模板：<code>%s</code>\n最终命名模板：<code>%s</code>", html.EscapeString(proxy), cfg.Download.Threads, cfg.Download.TaskLimit, cfg.Download.ConcurrentJobs, cfg.Download.PoolSize, cfg.Download.DelayMS, html.EscapeString(downloadFilterText(cfg.Download)), replies, botState, reactionState, html.EscapeString(reactionEmojiText(cfg.Reaction.Emojis)), html.EscapeString(short(cfg.Download.TempFilenameTemplate, 180)), html.EscapeString(short(cfg.Download.FinalFilenameTemplate, 180)))
+	return fmt.Sprintf("<b>当前配置</b>\n代理：%s\n下载：线程 %d · 单任务文件并发 %d · 任务并发 %d · 连接池 %d · 间隔 %dms\n文件筛选：%s\n关联评论/回复：%s\nBot：%s\n表情监听：%s（%s）\n最终命名模板：<code>%s</code>", html.EscapeString(proxy), cfg.Download.Threads, cfg.Download.TaskLimit, cfg.Download.ConcurrentJobs, cfg.Download.PoolSize, cfg.Download.DelayMS, html.EscapeString(downloadFilterText(cfg.Download)), replies, botState, reactionState, html.EscapeString(reactionEmojiText(cfg.Reaction.Emojis)), html.EscapeString(short(cfg.Download.FinalFilenameTemplate, 180)))
 }
 
 func reactionEmojiText(emojis []string) string {

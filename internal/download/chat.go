@@ -767,9 +767,10 @@ func (m *Manager) runOneChatBatch() error {
 		}
 		ids = append(ids, item.MessageID)
 	}
-	tmpDir := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return err
+	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
+	tmpDir, err := temporaryDialogDirectory(tmpRoot, batch[0].DialogKey)
+	if err != nil {
+		return fmt.Errorf("创建会话临时目录: %w", err)
 	}
 	watchdog := startTransferWatchdog(transferCtx, upstreamWatchPeriod, upstreamInitialTimeout, upstreamIdleTimeout, stopTransfer, func() bool {
 		status := m.chatStatus(id)
@@ -796,7 +797,7 @@ func (m *Manager) runOneChatBatch() error {
 		if peer == nil {
 			return errors.New("会话下载文件缺少 Telegram 来源会话")
 		}
-		opts := upstreamDL.Options{Dir: tmpDir, Template: config.Download.TempFilenameTemplate, Group: true, Continue: true, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: ids}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
+		opts := upstreamDL.Options{Dir: tmpDir, Template: temporaryFilenameTemplate, Group: true, Continue: true, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: ids}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
 			item, ok := byMessage[update.MessageID]
 			if !ok {
 				return
