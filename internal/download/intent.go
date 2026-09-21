@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +75,91 @@ type ChatIntent struct {
 	AccountID string
 	URL       string
 	ListenNew bool
+}
+
+// SavedIntent targets the Saved Messages dialog of the specified Telegram
+// account. It intentionally carries the Telegram user ID for stable directory
+// naming; AccountID selects the authenticated session.
+type SavedIntent struct {
+	Source     SourceKind
+	AccountID  string
+	TelegramID int64
+	ListenOnly bool
+}
+
+// SubmitSaved creates a history or listen-only Saved Messages task. The
+// listen-only task starts with an already-completed scan state and therefore
+// never walks historical messages.
+func (m *Manager) SubmitSaved(ctx context.Context, intent SavedIntent) (ChatJob, bool, error) {
+	if intent.AccountID == "" || intent.TelegramID <= 0 {
+		return ChatJob{}, false, errors.New("收藏夹账号信息不完整")
+	}
+	if intent.Source == "" {
+		intent.Source = SourceBot
+	}
+	var created ChatJob
+	var duplicate bool
+	err := m.accounts.Run(ctx, intent.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+		key := "self:" + intent.AccountID
+		start := 0
+		if intent.ListenOnly {
+			var existingID string
+			err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND start_message_id < 0 AND status IN (?, ?, ?, ?, ?) LIMIT 1`, intent.AccountID, key, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&existingID)
+			if err == nil {
+				created, err = m.GetChat(existingID)
+				duplicate = err == nil
+				return err
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			start = -1
+		} else {
+			var existingID string
+			err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND start_message_id = 0 AND listen_new = 0 AND status IN (?, ?, ?, ?, ?) LIMIT 1`, intent.AccountID, key, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&existingID)
+			if err == nil {
+				created, err = m.GetChat(existingID)
+				duplicate = err == nil
+				return err
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		latestID := 0
+		it := query.Messages(client.API()).GetHistory((&tg.InputPeerSelf{})).BatchSize(1).Iter()
+		if it.Next(ctx) {
+			if latest, ok := it.Value().Msg.(*tg.Message); ok {
+				latestID = latest.ID
+			}
+		} else if err := it.Err(); err != nil {
+			return fmt.Errorf("读取收藏消息: %w", err)
+		}
+		name := fmt.Sprintf("收藏消息_%d", intent.TelegramID)
+		status, scanState := ChatStatusQueued, chatScanPending
+		if intent.ListenOnly {
+			status, scanState = ChatStatusListening, chatScanCompleted
+		}
+		configJSON, marshalErr := json.Marshal(m.settings.Get().Download)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		var createErr error
+		created, createErr = m.createChatJob(ChatJob{SourceURL: savedSourcePrefix + intent.AccountID, DialogType: "self", DialogKey: key, DialogName: name, AccountID: intent.AccountID, StartMessageID: start, UpperMessageID: latestID, ListenNew: intent.ListenOnly, Status: status, ScanState: scanState}, directPeer{kind: "self"}, string(configJSON))
+		return createErr
+	})
+	if err != nil {
+		return ChatJob{}, false, err
+	}
+	if !duplicate {
+		m.signalChat()
+		m.markChatListenerDirty()
+		if intent.ListenOnly {
+			go m.reconcileSavedTask(created.ID)
+		}
+		applog.Info("chat_download", "saved_task_created", "chat_job_id", created.ID, "account_id", intent.AccountID, "telegram_id", intent.TelegramID, "listen_only", intent.ListenOnly)
+	}
+	return created, duplicate, nil
 }
 
 // Submission says whether a new job was made or this request was attached to

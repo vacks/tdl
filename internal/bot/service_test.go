@@ -255,6 +255,11 @@ func TestTaskSourcePresentation(t *testing.T) {
 			want: `<b>来源：</b><a href="https://t.me/c/100/42">点击查看</a>`,
 		},
 		{
+			name: "basic group states limitation",
+			job:  download.Job{SourceURL: "tg://reaction/chat/100/42", DialogType: "chat", Items: []download.Item{{DialogID: 100, MessageID: 42}}},
+			want: "<b>来源：</b>普通群组不支持跳转",
+		},
+		{
 			name: "does not expose internal private chat identifier",
 			job:  download.Job{SourceURL: "tg://reaction/user/100/42", DialogType: "user"},
 			want: "<b>来源：</b>私聊不支持跳转",

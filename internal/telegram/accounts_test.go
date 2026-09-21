@@ -71,6 +71,16 @@ func TestReactionFallbackURLKeepsDialogType(t *testing.T) {
 	}
 }
 
+func TestNormalizeRawSelfPeerWhenEntitiesAreMissing(t *testing.T) {
+	m := &Manager{accounts: []Account{{ID: "account-1", TelegramID: 12345, State: "authorized"}}}
+	if _, ok := m.normalizeRawSelfPeer("account-1", &tg.PeerUser{UserID: 12345}).(*tg.InputPeerSelf); !ok {
+		t.Fatal("current user's raw peer was not normalized to InputPeerSelf")
+	}
+	if peer := m.normalizeRawSelfPeer("account-1", &tg.PeerUser{UserID: 999}); peer != nil {
+		t.Fatal("unrelated user was incorrectly normalized to InputPeerSelf")
+	}
+}
+
 func TestOwnReactionEmojisOnlyReturnsCurrentAccountStandardEmoji(t *testing.T) {
 	chosen := tg.ReactionCount{Reaction: &tg.ReactionEmoji{Emoticon: "❤️"}, Count: 1}
 	chosen.SetChosenOrder(1)

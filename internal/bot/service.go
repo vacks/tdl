@@ -460,6 +460,8 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 		s.sendChatList(cfg, msg.Chat.ID)
 	case strings.HasPrefix(text, "/chats "):
 		s.createChatTask(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/chats ")))
+	case text == "/saved" || strings.HasPrefix(text, "/saved "):
+		s.handleSavedCommand(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/saved")))
 	case text == "/status":
 		s.send(cfg.Token, msg.Chat.ID, s.statusText(), nil)
 	case text == "/config":
@@ -735,6 +737,72 @@ func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
 	}
 }
 
+func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, raw string) {
+	command := strings.ToLower(strings.TrimSpace(raw))
+	account, err := s.telegram.AuthorizedByTelegramID(msg.From.ID)
+	if err != nil {
+		message := "当前 Telegram 用户尚未登录，无法下载收藏消息。请先在登录管理完成该账号登录。"
+		if !errors.Is(err, telegram.ErrNotAuthorized) {
+			message = err.Error()
+		}
+		s.send(cfg.Token, msg.Chat.ID, "❌ "+html.EscapeString(message), nil)
+		return
+	}
+	switch command {
+	case "all", "listen":
+		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+		job, duplicate, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID, ListenOnly: command == "listen"})
+		cancel()
+		if submitErr != nil {
+			s.send(cfg.Token, msg.Chat.ID, "❌ 创建收藏夹任务失败："+html.EscapeString(submitErr.Error()), nil)
+			return
+		}
+		if duplicate {
+			s.send(cfg.Token, msg.Chat.ID, "已有相同的收藏夹任务正在运行。", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
+			return
+		}
+		label := "收藏夹历史下载任务已创建"
+		if command == "listen" {
+			label = "收藏夹新消息监听已开启"
+		}
+		s.send(cfg.Token, msg.Chat.ID, "✅ "+label, [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
+	case "stop":
+		job, found, findErr := s.downloads.FindSavedListener(account.ID)
+		if findErr != nil {
+			s.send(cfg.Token, msg.Chat.ID, "❌ 读取收藏夹任务失败："+html.EscapeString(findErr.Error()), nil)
+			return
+		}
+		if !found || !download.IsSavedListenForBot(job) {
+			s.send(cfg.Token, msg.Chat.ID, "当前没有运行中的收藏夹新消息监听。", nil)
+			return
+		}
+		if err := s.downloads.SetChatListening(job.ID, false); err != nil {
+			s.send(cfg.Token, msg.Chat.ID, "❌ 停止收藏夹监听失败："+html.EscapeString(err.Error()), nil)
+			return
+		}
+		s.send(cfg.Token, msg.Chat.ID, "✅ 已停止收藏夹新消息监听。", nil)
+	case "status":
+		jobs, listErr := s.downloads.ListSavedChats(account.ID)
+		if listErr != nil {
+			s.send(cfg.Token, msg.Chat.ID, "❌ 读取收藏夹任务失败："+html.EscapeString(listErr.Error()), nil)
+			return
+		}
+		if len(jobs) == 0 {
+			s.send(cfg.Token, msg.Chat.ID, "暂无收藏夹任务。", nil)
+			return
+		}
+		lines := []string{"<b>收藏夹任务</b>"}
+		buttons := make([][]button, 0, len(jobs))
+		for _, job := range jobs {
+			lines = append(lines, fmt.Sprintf("%s %s：%d/%d", statusIcon(job.Status), html.EscapeString(short(job.DialogName, 28)), job.Completed, job.Discovered))
+			buttons = append(buttons, []button{{Text: "查看详情", CallbackData: "c:v:" + job.ID}})
+		}
+		s.send(cfg.Token, msg.Chat.ID, strings.Join(lines, "\n"), buttons)
+	default:
+		s.send(cfg.Token, msg.Chat.ID, "用法：<code>/saved all</code> 下载历史收藏消息；<code>/saved listen</code> 监听新消息；<code>/saved stop</code> 停止监听；<code>/saved status</code> 查看状态。", nil)
+	}
+}
+
 func (s *Service) sendChatList(cfg settings.Bot, chatID int64) {
 	state := listPageState{kind: "chat", page: 1}
 	text, buttons, err := s.chatTaskList(&state)
@@ -882,7 +950,11 @@ func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id str
 }
 
 func chatTaskText(job download.ChatJob) string {
-	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), "<b>对话：</b>" + html.EscapeString(short(job.DialogName, 36)), "<b>范围：</b>" + chatRangeLabel(job), fmt.Sprintf("<b>进度：</b>%d/%d", job.Completed, job.Discovered)}
+	rangeLabel := chatRangeLabel(job)
+	if download.IsSavedListenForBot(job) {
+		rangeLabel = "仅监听新消息"
+	}
+	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), "<b>对话：</b>" + html.EscapeString(short(job.DialogName, 36)), "<b>范围：</b>" + rangeLabel, fmt.Sprintf("<b>进度：</b>%d/%d", job.Completed, job.Discovered)}
 	if job.Failed > 0 {
 		lines = append(lines, fmt.Sprintf("<b>失败：</b>%d", job.Failed))
 	}
@@ -1571,7 +1643,7 @@ func messageFullText(value string) string {
 }
 
 func helpText() string {
-	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、等待中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
+	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、等待中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/saved all</code> 下载本人收藏夹历史消息\n<code>/saved listen</code> 监听本人收藏夹新消息\n<code>/saved stop</code> 停止收藏夹监听\n<code>/saved status</code> 查看收藏夹任务\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
 }
 
 func (s *Service) statusText() string {
@@ -1902,6 +1974,7 @@ func (s *Service) configureCommands(token string) {
 		{"command": "help", "description": "获取帮助信息"},
 		{"command": "tasks", "description": "获取或筛选下载任务"},
 		{"command": "chats", "description": "获取或创建会话下载"},
+		{"command": "saved", "description": "管理本人收藏夹下载"},
 		{"command": "status", "description": "获取当前状态"},
 		{"command": "config", "description": "获取当前配置"},
 		{"command": "restart", "description": "重启所有服务"},

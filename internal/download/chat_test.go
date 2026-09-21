@@ -26,3 +26,17 @@ func TestChatLocksDoNotShareChildTaskLocks(t *testing.T) {
 	}
 	job.Unlock()
 }
+
+func TestSavedChatIdentityAndMode(t *testing.T) {
+	history := ChatJob{DialogType: "self", SourceURL: "tg://saved/account-a", ListenNew: false, StartMessageID: 0}
+	if !isSavedChat(history) || isSavedListen(history) {
+		t.Fatal("saved history task classification is incorrect")
+	}
+	listener := ChatJob{DialogType: "self", SourceURL: "tg://saved/account-a", ListenNew: true, StartMessageID: -1}
+	if !isSavedChat(listener) || !isSavedListen(listener) {
+		t.Fatal("saved listener task classification is incorrect")
+	}
+	if isSavedChat(ChatJob{DialogType: "channel", SourceURL: "tg://saved/account-a"}) {
+		t.Fatal("non-self task must not be classified as a saved task")
+	}
+}

@@ -30,6 +30,12 @@ func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
 	if key == "" {
 		return
 	}
+	if event.InputPeer == nil {
+		// Telegram may omit entities from an update. Resolve the durable peer
+		// before consulting the in-memory snapshot; otherwise an otherwise valid
+		// watched message could be discarded before recovery gets a chance.
+		event.InputPeer = m.recoverChatEventPeer(event.AccountID, key)
+	}
 	m.mu.Lock()
 	_, watched := m.chatWatched[event.AccountID][key]
 	potential := m.potentialDiscussion[event.AccountID]
@@ -45,31 +51,10 @@ func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
 		}
 	}
 	if event.InputPeer == nil {
-		// An update without entities can still be for a watched target. Recover
-		// its durable InputPeer (including a channel access hash) from that
-		// target instead of dropping the new message.
-		var kind string
-		var id, hash int64
-		err := m.db.QueryRow(`SELECT direct_peer_type, direct_peer_id, direct_peer_hash FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) ORDER BY updated_at DESC LIMIT 1`, event.AccountID, key, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
-		if err != nil {
-			// A discussion-group update has a different dialog key from its
-			// channel task. Its persisted root mapping holds the actual peer,
-			// including the access hash needed for Telegram API calls.
-			err = m.db.QueryRow(`SELECT r.discussion_peer_type, r.discussion_peer_id, r.discussion_peer_hash FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE r.account_id = ? AND r.discussion_dialog_key = ? AND j.listen_new = 1 AND j.scan_state = ? AND j.status IN (?, ?) AND r.discussion_peer_type <> '' ORDER BY j.updated_at DESC LIMIT 1`, event.AccountID, key, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
-		}
-		if err != nil {
-			return
-		}
-		event.InputPeer = chatInboxPeer(kind, id, hash)
-		if event.InputPeer == nil {
-			return
-		}
-		if event.DialogID == 0 {
-			event.DialogID = id
-		}
+		return
 	}
 	direct := makeDirectPeer(event.InputPeer)
-	if direct.kind != "chat" && direct.kind != "channel" {
+	if direct.kind != "self" && direct.kind != "chat" && direct.kind != "channel" {
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -86,6 +71,21 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account
 		default:
 		}
 	}
+}
+
+func (m *Manager) recoverChatEventPeer(accountID, dialogKey string) tg.InputPeerClass {
+	var kind string
+	var id, hash int64
+	err := m.db.QueryRow(`SELECT direct_peer_type, direct_peer_id, direct_peer_hash FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) ORDER BY updated_at DESC LIMIT 1`, accountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
+	if err != nil {
+		// A discussion-group update has a different dialog key from its channel
+		// task. Its persisted root mapping contains the authoritative peer.
+		err = m.db.QueryRow(`SELECT r.discussion_peer_type, r.discussion_peer_id, r.discussion_peer_hash FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE r.account_id = ? AND r.discussion_dialog_key = ? AND j.listen_new = 1 AND j.scan_state = ? AND j.status IN (?, ?) AND r.discussion_peer_type <> '' ORDER BY j.updated_at DESC LIMIT 1`, accountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
+	}
+	if err != nil {
+		return nil
+	}
+	return chatInboxPeer(kind, id, hash)
 }
 
 func (m *Manager) hasPotentialDiscussionListener(accountID string, potential, snapshotReady bool) bool {
@@ -169,6 +169,8 @@ FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER 
 
 func chatInboxPeer(kind string, id, hash int64) tg.InputPeerClass {
 	switch kind {
+	case "self":
+		return &tg.InputPeerSelf{}
 	case "chat":
 		return &tg.InputPeerChat{ChatID: id}
 	case "channel":

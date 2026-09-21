@@ -85,6 +85,8 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_scan ON chat_download_jobs(status, scan_state, created_at)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_listener ON chat_download_jobs(account_id, dialog_key, listen_new, scan_state, status)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status)`,
+		`CREATE INDEX IF NOT EXISTS chat_download_jobs_self_created ON chat_download_jobs(account_id, dialog_type, created_at DESC, id DESC) WHERE status != 'deleted'`,
+		`CREATE INDEX IF NOT EXISTS chat_download_jobs_self_listener ON chat_download_jobs(account_id, dialog_type, listen_new, start_message_id, status, updated_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_job_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_items_child_job ON chat_download_items(child_job_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,

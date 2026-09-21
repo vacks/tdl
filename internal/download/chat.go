@@ -51,6 +51,20 @@ type ChatJob struct {
 	SpeedBPS        float64 `json:"speedBps"`
 }
 
+const savedSourcePrefix = "tg://saved/"
+
+func isSavedChat(job ChatJob) bool {
+	return job.DialogType == "self" && strings.HasPrefix(job.SourceURL, savedSourcePrefix)
+}
+
+func isSavedListen(job ChatJob) bool {
+	return isSavedChat(job) && job.ListenNew && job.StartMessageID < 0
+}
+
+// IsSavedListenForBot exposes only the task classification needed by the Bot
+// control layer; task storage details remain internal to the downloader.
+func IsSavedListenForBot(job ChatJob) bool { return isSavedListen(job) }
+
 const (
 	ChatStatusQueued      = "queued"
 	ChatStatusScanning    = "scanning"
@@ -132,8 +146,11 @@ func chatDownloadConfig(target storedChatTarget) (settings.Download, error) {
 // workers are attached in a later layer; keeping creation transactional lets
 // callers safely retry an interrupted HTTP/Bot request without partial rows.
 func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON string) (ChatJob, error) {
-	if job.DialogType != "channel" && job.DialogType != "chat" {
+	if job.DialogType != "channel" && job.DialogType != "chat" && job.DialogType != "self" {
 		return ChatJob{}, errors.New("会话下载仅支持频道和群组")
+	}
+	if job.DialogType == "self" && !isSavedChat(job) {
+		return ChatJob{}, errors.New("收藏夹任务标识无效")
 	}
 	if job.DialogKey == "" || job.AccountID == "" || job.UpperMessageID < job.StartMessageID {
 		return ChatJob{}, errors.New("会话下载目标不完整")
@@ -151,7 +168,13 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 		return ChatJob{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	job.ID, job.Status, job.ScanState, job.CreatedAt, job.UpdatedAt = id, ChatStatusQueued, chatScanPending, now, now
+	if job.Status == "" {
+		job.Status = ChatStatusQueued
+	}
+	if job.ScanState == "" {
+		job.ScanState = chatScanPending
+	}
+	job.ID, job.CreatedAt, job.UpdatedAt = id, now, now
 	tx, err := m.db.Begin()
 	if err != nil {
 		return ChatJob{}, err
@@ -205,6 +228,43 @@ func (m *Manager) GetChat(id string) (ChatJob, error) {
 	job.ListenNew = listen != 0
 	job.ActiveFiles, job.SpeedBPS = m.progress.Aggregate(job.ID)
 	return job, nil
+}
+
+// ListSavedChats returns the small set of saved-message tasks for one
+// Telegram account. It is intentionally bounded: Bot status is not a
+// replacement for the paginated Web task list.
+func (m *Manager) ListSavedChats(accountID string) ([]ChatJob, error) {
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND status != ? ORDER BY created_at DESC, id DESC LIMIT 20`, accountID, ChatStatusDeleted)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]ChatJob, 0, 4)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		job, err := m.GetChat(id)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func (m *Manager) FindSavedListener(accountID string) (ChatJob, bool, error) {
+	var id string
+	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND listen_new = 1 AND start_message_id < 0 AND status IN (?, ?, ?, ?, ?) ORDER BY updated_at DESC LIMIT 1`, accountID, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ChatJob{}, false, nil
+	}
+	if err != nil {
+		return ChatJob{}, false, err
+	}
+	job, err := m.GetChat(id)
+	return job, err == nil, err
 }
 
 // ListChats uses the same opaque cursor approach as message downloads. The
@@ -345,6 +405,8 @@ func targetConfigJSON(target storedChatTarget) string {
 
 func (target storedChatTarget) inputPeer() tg.InputPeerClass {
 	switch target.direct.kind {
+	case "self":
+		return &tg.InputPeerSelf{}
 	case "channel":
 		return &tg.InputPeerChannel{ChannelID: target.direct.id, AccessHash: target.direct.hash}
 	case "chat":
@@ -1156,7 +1218,13 @@ func (m *Manager) addChatWatched(accountID, dialogKey string) {
 func (m *Manager) runChatListener(ctx context.Context, accountID string, listener *chatListener) {
 	err := m.accounts.ListenNewMessages(ctx, accountID, func(_ context.Context, event telegram.NewMessageEvent) {
 		m.enqueueChatMessage(event)
-	}, nil)
+	}, func() {
+		// Recover the small interval between the persisted listener watermark and
+		// the shared update connection becoming ready. This is only performed for
+		// Saved Messages; ordinary chat listeners rely on Telegram's update stream
+		// and their existing discussion recovery logic.
+		go m.reconcileSavedListeners(accountID)
+	})
 	if err != nil && ctx.Err() == nil {
 		applog.Error("chat_download", "new_message_listener_failed", "account_id", accountID, "error", err.Error())
 	}
@@ -1165,6 +1233,93 @@ func (m *Manager) runChatListener(ctx context.Context, accountID string, listene
 		delete(m.chatListeners, accountID)
 	}
 	m.mu.Unlock()
+}
+
+func (m *Manager) reconcileSavedListeners(accountID string) {
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND listen_new = 1 AND start_message_id < 0 AND scan_state = ? AND status IN (?, ?)`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	ids := make([]string, 0, 2)
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range ids {
+		for attempt := 0; attempt < 3; attempt++ {
+			if err := m.reconcileSavedTask(id); err == nil {
+				break
+			} else {
+				applog.Info("chat_download", "saved_listener_reconcile_failed", "chat_job_id", id, "account_id", accountID, "attempt", attempt+1, "error", err.Error())
+				if attempt == 2 {
+					break
+				}
+				timer := time.NewTimer(time.Duration(2*(attempt+1)) * time.Second)
+				<-timer.C
+			}
+		}
+	}
+}
+
+func (m *Manager) reconcileSavedTask(id string) error {
+	target, err := m.chatTarget(id)
+	if err != nil || !isSavedListen(target.ChatJob) {
+		return err
+	}
+	m.addChatWatched(target.AccountID, target.DialogKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+		offset := 0
+		boundary := target.UpperMessageID
+		watermark := boundary
+		for {
+			current, currentErr := m.chatTarget(id)
+			if currentErr != nil {
+				return currentErr
+			}
+			if !isSavedListen(current.ChatJob) {
+				return nil
+			}
+			result, err := client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: &tg.InputPeerSelf{}, OffsetID: offset, Limit: 100})
+			if err != nil {
+				return err
+			}
+			messages := searchMessages(result)
+			if len(messages) == 0 {
+				return nil
+			}
+			oldest := 0
+			for _, raw := range messages {
+				message, ok := raw.(*tg.Message)
+				if !ok {
+					continue
+				}
+				if oldest == 0 || message.ID < oldest {
+					oldest = message.ID
+				}
+				if message.ID <= boundary {
+					continue
+				}
+				m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: target.DialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: &tg.InputPeerSelf{}})
+				if message.ID > watermark {
+					watermark = message.ID
+				}
+			}
+			if watermark > target.UpperMessageID {
+				if _, err := m.db.Exec(`UPDATE chat_download_jobs SET upper_message_id = ?, updated_at = ? WHERE id = ? AND upper_message_id < ?`, watermark, time.Now().UTC().Format(time.RFC3339Nano), id, watermark); err != nil {
+					return err
+				}
+			}
+			if oldest == 0 || oldest <= boundary {
+				return nil
+			}
+			offset = oldest
+		}
+	})
 }
 
 func (m *Manager) chatEventWorker() {
@@ -1579,6 +1734,13 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 // streams. The expensive discussion/replies APIs are invoked only for a
 // message Telegram marks as having replies.
 func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Client, target storedChatTarget) error {
+	// Saved Messages are a private self-dialog and do not have Telegram
+	// channel discussion threads. Avoid walking the entire history for reply
+	// metadata when this task uses the global comment setting.
+	if target.DialogType == "self" {
+		_, err := m.db.Exec(`UPDATE chat_download_streams SET completed = 1 WHERE chat_job_id = ? AND stream_kind = 'reply_candidates'`, target.ID)
+		return err
+	}
 	config, err := chatDownloadConfig(target)
 	if err != nil {
 		return err

@@ -1,2 +1,2 @@
 // Keep presentation-only version labels in one place for every Web page.
-export const projectVersion = 'v1.3.0'
+export const projectVersion = 'v1.4.0'

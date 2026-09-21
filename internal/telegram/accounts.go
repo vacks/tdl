@@ -312,6 +312,56 @@ func (m *Manager) CurrentID() (string, error) {
 	return account.ID, nil
 }
 
+// AuthorizedByTelegramID resolves the local session belonging to one
+// Telegram user. Saved Messages are private to that user and must not follow
+// the globally selected account.
+func (m *Manager) AuthorizedByTelegramID(telegramID int64) (Account, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var found Account
+	for _, account := range m.accounts {
+		if account.TelegramID != telegramID || account.State != "authorized" {
+			continue
+		}
+		if found.ID != "" {
+			return Account{}, errors.New("同一个 Telegram 用户存在多个已登录会话")
+		}
+		found = account
+	}
+	if found.ID == "" {
+		return Account{}, ErrNotAuthorized
+	}
+	return found, nil
+}
+
+func (m *Manager) normalizeSelfPeer(accountID string, input tg.InputPeerClass) tg.InputPeerClass {
+	user, ok := input.(*tg.InputPeerUser)
+	if !ok {
+		return input
+	}
+	m.mu.RLock()
+	account, found := m.accountLocked(accountID)
+	m.mu.RUnlock()
+	if found && account.TelegramID != 0 && user.UserID == account.TelegramID {
+		return &tg.InputPeerSelf{}
+	}
+	return input
+}
+
+func (m *Manager) normalizeRawSelfPeer(accountID string, raw tg.PeerClass) tg.InputPeerClass {
+	user, ok := raw.(*tg.PeerUser)
+	if !ok {
+		return nil
+	}
+	m.mu.RLock()
+	account, found := m.accountLocked(accountID)
+	m.mu.RUnlock()
+	if found && account.TelegramID != 0 && account.TelegramID == user.UserID {
+		return &tg.InputPeerSelf{}
+	}
+	return nil
+}
+
 // ListenReactions subscribes to the account's shared Telegram update
 // connection and reports only reactions made by that account.
 func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(context.Context, ReactionEvent), onReady func()) error {
@@ -433,6 +483,7 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 		input, extractErr := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
 		name := "会话"
 		if extractErr == nil {
+			input = m.normalizeSelfPeer(accountID, input)
 			// The update already carries an authoritative InputPeer. Do not ask
 			// Telegram to resolve a display name for every unrelated message on
 			// an account that happens to watch one busy channel.
@@ -452,6 +503,13 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			// Keep the raw stable identity. A watched private group/channel has
 			// its authoritative InputPeer saved with its chat task, so downstream
 			// code can restore that peer even when this update omitted entities.
+			// Saved Messages are represented by the current user's raw peer. When
+			// Telegram omits entities, normalize that raw identity as well; using
+			// user:<id> here would never match the durable self:<account> key.
+			if input := m.normalizeRawSelfPeer(accountID, message.PeerID); input != nil {
+				m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: "self:" + accountID, DialogID: 0, DialogName: "收藏消息", MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+				return
+			}
 			kind, id := peerIdentity(message.PeerID)
 			key := kind + ":" + fmt.Sprint(id)
 			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
