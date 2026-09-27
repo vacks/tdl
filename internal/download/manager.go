@@ -1430,12 +1430,21 @@ func dialogIdentity(peer tg.InputPeerClass, accountID string) (kind, key string,
 }
 
 // dialogIdentityForPeer preserves the stable InputPeer-based identity key but
-// uses Telegram's Broadcast flag to distinguish a broadcast channel from a
-// supergroup. Both are represented by InputPeerChannel at the protocol level.
+// refines the display kind from flags that are only visible on a resolved peer.
+// A supergroup and a broadcast channel are both InputPeerChannel at the
+// protocol level, and a bot is a User at the protocol level.
+//
+// Only the returned kind may change here: the key must stay derived from
+// dialogIdentity so deduplication and direct-peer round-trips are unaffected.
 func dialogIdentityForPeer(peer peers.Peer, accountID string) (kind, key string, id int64) {
 	kind, key, id = dialogIdentity(peer.InputPeer(), accountID)
 	if channel, ok := peer.(peers.Channel); ok && !channel.IsBroadcast() {
 		return "chat", key, id
+	}
+	// Read the decoded field, not GetBot(): the accessor reports the wire flag,
+	// which is only populated alongside the field on the decode path.
+	if user, ok := peer.(peers.User); ok && user.Raw().Bot {
+		return "bot", key, id
 	}
 	return kind, key, id
 }
@@ -1774,6 +1783,12 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
 		if peer, resolveErr := manager.FromInputPeer(ctx, inputPeer); resolveErr == nil {
 			dialogType, dialogKey, resolvedDialogID = dialogIdentityForPeer(peer, accountID)
+			// An event queued before its name could be resolved carries an empty
+			// name. Fill it from the authoritative peer here so the name is
+			// correct the first time it is written; never invent a substitute.
+			if strings.TrimSpace(dialogName) == "" {
+				dialogName = peer.VisibleName()
+			}
 		}
 		if resolvedDialogID == 0 && dialogID != 0 {
 			resolvedDialogID = dialogID

@@ -265,6 +265,11 @@ func TestTaskSourcePresentation(t *testing.T) {
 			want: "<b>来源：</b>私聊不支持跳转",
 		},
 		{
+			name: "bot chat states limitation",
+			job:  download.Job{SourceURL: "tg://reaction/bot/100/42", DialogType: "bot"},
+			want: "<b>来源：</b>Bot不支持跳转",
+		},
+		{
 			name: "saved messages states limitation",
 			job:  download.Job{DialogType: "self"},
 			want: "<b>来源：</b>收藏消息不支持跳转",

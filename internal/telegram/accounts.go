@@ -481,21 +481,25 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			return
 		}
 		input, extractErr := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(message.PeerID)
-		name := "会话"
 		if extractErr == nil {
 			input = m.normalizeSelfPeer(accountID, input)
-			// The update already carries an authoritative InputPeer. Do not ask
-			// Telegram to resolve a display name for every unrelated message on
-			// an account that happens to watch one busy channel.
-			dialogID, _ := inputPeerInfo(input)
+			// The update already carries an authoritative InputPeer, and the
+			// display name travels in the same entity map. Reading it here is a
+			// lookup, not an RPC — resolving a name only when ExtractPeer failed
+			// is what left every ordinary message labelled with a placeholder.
+			dialogID := inputPeerID(input)
 			key := newMessageDialogKey(input, accountID)
-			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: inputPeerDisplayName(input, entities), MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 			return
 		}
+		// The entity is missing from this update, so only a resolved peer can
+		// supply the InputPeer. It is also the only source of a name here; when
+		// it fails the name stays empty rather than becoming a dialog type label.
+		name := ""
 		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
 		if peer, err := manager.ResolvePeer(updateCtx, message.PeerID); err == nil {
 			input, name = peer.InputPeer(), peer.VisibleName()
-		} else if extractErr != nil {
+		} else {
 			// Telegram occasionally omits an entity from an otherwise valid
 			// update. The persistent peer cache can still resolve it; only drop
 			// the event when both sources fail, rather than losing a watched
@@ -515,7 +519,7 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 			return
 		}
-		dialogID, _ := inputPeerInfo(input)
+		dialogID := inputPeerID(input)
 		key := newMessageDialogKey(input, accountID)
 		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 	}
@@ -641,10 +645,18 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 		applog.Error("reaction", "peer_extract_failed", "account_id", accountID, "peer_type", peerType, "dialog_id", peerID, "message_id", messageID, "error", err.Error())
 		return ReactionEvent{}, false
 	}
-	dialogID, dialogName := inputPeerInfo(inputPeer)
+	dialogID := inputPeerID(inputPeer)
+	// A dialog name that cannot be resolved stays empty. Falling back to a type
+	// label would attribute unrelated dialogs to the same download directory.
+	dialogName := ""
 	sourceURL := reactionFallbackURL(inputPeer, accountID, messageID)
 	manager := peers.Options{Storage: storage.NewPeers(m.accountStore(accountID))}.Build(client.API())
-	peer, resolveErr := manager.ResolvePeer(ctx, rawPeer)
+	// Resolve through the InputPeer extracted from this update: ExtractPeer only
+	// succeeds when the entity is present, and it copies that entity's access
+	// hash into the InputPeer. ResolvePeer(rawPeer) would discard the hash and
+	// look the peer up by ID alone, which fails whenever the peers storage has
+	// not been seeded yet and silently degraded the name to a type label.
+	peer, resolveErr := manager.FromInputPeer(ctx, inputPeer)
 	if resolveErr != nil {
 		applog.Info("reaction", "peer_name_unavailable", "account_id", accountID, "dialog_id", dialogID, "message_id", messageID, "error", resolveErr.Error())
 	} else {
@@ -680,19 +692,59 @@ func peerIdentity(peer tg.PeerClass) (string, int64) {
 	}
 }
 
-func inputPeerInfo(input tg.InputPeerClass) (int64, string) {
+// inputPeerID returns the stable Telegram ID of a dialog. It intentionally
+// returns no name: a dialog *type* label is not a name, and using one as a name
+// collapsed every unresolved private dialog onto a single download directory.
+// Type labels belong to the presentation layer only.
+func inputPeerID(input tg.InputPeerClass) int64 {
 	switch peer := input.(type) {
 	case *tg.InputPeerSelf:
-		return 0, "收藏消息"
+		return 0
 	case *tg.InputPeerUser:
-		return peer.UserID, "私聊"
+		return peer.UserID
 	case *tg.InputPeerChat:
-		return peer.ChatID, "群组"
+		return peer.ChatID
 	case *tg.InputPeerChannel:
-		return peer.ChannelID, "频道"
+		return peer.ChannelID
 	default:
-		return 0, "会话"
+		return 0
 	}
+}
+
+// inputPeerDisplayName reads a dialog display name out of the entity map that
+// accompanied the update. Callers must already have established that the entity
+// is present, which is what makes this a map lookup instead of an RPC.
+//
+// It returns "" rather than a dialog type label when nothing is available: a
+// label is not a name, and persisting one attributes unrelated dialogs to the
+// same download directory.
+func inputPeerDisplayName(input tg.InputPeerClass, entities tg.Entities) string {
+	switch peer := input.(type) {
+	case *tg.InputPeerSelf:
+		return "收藏消息"
+	case *tg.InputPeerUser:
+		if user, ok := entities.Users[peer.UserID]; ok {
+			return visibleUserName(user)
+		}
+	case *tg.InputPeerChat:
+		if chat, ok := entities.Chats[peer.ChatID]; ok {
+			return chat.Title
+		}
+	case *tg.InputPeerChannel:
+		if channel, ok := entities.Channels[peer.ChannelID]; ok {
+			return channel.Title
+		}
+	}
+	return ""
+}
+
+// visibleUserName mirrors gotd's peers.User.VisibleName so a dialog named from
+// an update entity matches the same dialog named through a resolved peer.
+func visibleUserName(user *tg.User) string {
+	if user.LastName == "" {
+		return user.FirstName
+	}
+	return fmt.Sprintf("%s %s", user.FirstName, user.LastName)
 }
 
 func newMessageDialogKey(input tg.InputPeerClass, accountID string) string {

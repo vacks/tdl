@@ -10,6 +10,41 @@ import (
 	"github.com/gotd/td/tg"
 )
 
+// A listener-named dialog must read its display name from the same entity map
+// ExtractPeer already matched against. Replacing that with a dialog type label
+// is what made unrelated dialogs share one download directory.
+func TestInputPeerDisplayNameUsesUpdateEntities(t *testing.T) {
+	entities := tg.Entities{
+		Users: map[int64]*tg.User{
+			7:  {ID: 7, FirstName: "TDL", LastName: "DEV"},
+			10: {ID: 10, FirstName: "SomeBot"},
+		},
+		Chats:    map[int64]*tg.Chat{8: {ID: 8, Title: "群组名"}},
+		Channels: map[int64]*tg.Channel{9: {ID: 9, Title: "频道名"}},
+	}
+
+	tests := []struct {
+		name  string
+		input tg.InputPeerClass
+		want  string
+	}{
+		{name: "saved messages", input: &tg.InputPeerSelf{}, want: "收藏消息"},
+		{name: "user uses first and last name", input: &tg.InputPeerUser{UserID: 7}, want: "TDL DEV"},
+		{name: "user without last name", input: &tg.InputPeerUser{UserID: 10}, want: "SomeBot"},
+		{name: "chat uses title", input: &tg.InputPeerChat{ChatID: 8}, want: "群组名"},
+		{name: "channel uses title", input: &tg.InputPeerChannel{ChannelID: 9}, want: "频道名"},
+		{name: "missing entity stays empty", input: &tg.InputPeerUser{UserID: 404}, want: ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := inputPeerDisplayName(test.input, entities); got != test.want {
+				t.Errorf("inputPeerDisplayName() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSessionCheckOnlyMarksSuccessfulProbe(t *testing.T) {
 	if !shouldMarkSessionChecked(nil) {
 		t.Fatal("successful probe was not accepted")

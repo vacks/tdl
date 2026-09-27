@@ -31,7 +31,7 @@ async function chatControl(job: ChatJob, action: 'pause' | 'resume' | 'retry' | 
 function type(status: string) { return status === 'completed' || status === 'downloaded' ? 'success' : status === 'failed' ? 'danger' : status === 'partial' || status === 'running' ? 'warning' : 'info' }
 function statusLabel(status: string) { return ({ queued: '排队中', waiting: '等待中', running: '下载中', downloaded: '下载完成', paused: '已暂停', completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消', scanning: '索引中', downloading: '下载中', listening: '监听中' } as Record<string, string>)[status] || status }
 function statusTip(item: Item) { return item.error || ({ queued: '等待可用下载槽位，尚未开始传输', waiting: '同一文件正由其他任务下载，完成后会自动复用', running: '正在下载文件', downloaded: '下载已完成，等待移动到最终路径', paused: '下载已暂停，可恢复', completed: '文件已下载并移动至最终路径', failed: '文件下载或处理失败', cancelled: '下载已取消' } as Record<string, string>)[item.status] || item.status }
-function dialogTypeLabel(value: string) { return ({ user: '私聊', chat: '群组', channel: '频道', self: '收藏消息', legacy: '会话' } as Record<string, string>)[value] || '会话' }
+function dialogTypeLabel(value: string) { return ({ user: '私聊', bot: 'Bot', chat: '群组', channel: '频道', self: '收藏消息', legacy: '会话' } as Record<string, string>)[value] || '会话' }
 function sourceLabel(job: Job) { return job.hasPublicLink ? job.sourceUrl : '私有会话（无公开消息链接）' }
 function progressFor(item: Item) { return liveProgress.value[`${item.dialogKey}:${item.messageId}`] }
 function byteLabel(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let index = 0; let result = value; while (result >= 1024 && index < units.length - 1) { result /= 1024; index++ }; return `${result >= 10 || index === 0 ? result.toFixed(0) : result.toFixed(1)} ${units[index]}` }

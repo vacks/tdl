@@ -490,18 +490,14 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 		job := submission.Job
 		if submission.Duplicate {
 			applog.Info("bot", "task_request_attached", "user_id", msg.From.ID, "job_id", job.ID)
+		} else {
+			applog.Info("bot", "task_created", "user_id", msg.From.ID, "job_id", job.ID, "item_count", job.TotalItems)
 		}
-		applog.Info("bot", "task_created", "user_id", msg.From.ID, "job_id", job.ID, "item_count", job.TotalItems)
-		s.mu.Lock()
-		s.known[job.ID] = job.Status
-		s.mu.Unlock()
-		text := lifecycleText(job)
-		messageID, err := s.send(cfg.Token, msg.Chat.ID, text, notificationKeyboard(job.ID))
-		if err != nil {
-			applog.Error("bot", "lifecycle_message_send_failed", "job_id", job.ID, "error", redactBotError(cfg.Token, err.Error()))
-			return true
-		}
-		s.rememberLifecycle(job.ID, messageRef{ChatID: msg.Chat.ID, MessageID: messageID, Text: text})
+		// The lifecycle card is deliberately not rendered here. Submit emits
+		// job_created before it returns, and the refresh loop renders exactly one
+		// card for a job it has not seen yet — the same single path the Web UI and
+		// reactions already rely on. Sending a card from this handler as well raced
+		// with that loop and produced "下载任务已创建" plus a second progress card.
 	default:
 		s.send(cfg.Token, msg.Chat.ID, "发送 <code>/help</code> 查看可用命令。", nil)
 	}
@@ -1613,6 +1609,8 @@ func sourceTypeName(job download.Job) string {
 		return "收藏消息"
 	case "user":
 		return "私聊"
+	case "bot":
+		return "Bot"
 	case "chat":
 		return "普通群组"
 	case "channel":
