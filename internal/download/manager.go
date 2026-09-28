@@ -38,11 +38,21 @@ var (
 )
 
 const (
-	linuxNameMaxBytes   = 255
-	linuxPathMaxBytes   = 4096
-	workerCount         = 16
-	maxDuplicateRetries = 4
-	maxStalledAttempts  = 3
+	linuxNameMaxBytes = 255
+	linuxPathMaxBytes = 4096
+	workerCount       = 16
+	// messageIdleInterval is the fallback only. Creating, reactivating, resuming
+	// and retrying a task each wake every worker directly, so this bounds how
+	// long a missed wake can stall a queued task rather than how fast the queue
+	// drains. It is deliberately long because the poll itself is multiplied by
+	// workerCount.
+	messageIdleInterval = 15 * time.Second
+	// chatDownloadWorkerCount bounds how many session batches can transfer at
+	// once. The global concurrency setting remains the real cap; these workers
+	// only need to be numerous enough to keep that many batches in flight.
+	chatDownloadWorkerCount = 3
+	maxDuplicateRetries     = 4
+	maxStalledAttempts      = 3
 	// A request which never receives its first byte is likely a dead
 	// connection. After a large file starts, allow a much longer quiet period
 	// so slow proxy links are not treated as a stalled transfer.
@@ -285,9 +295,18 @@ type Manager struct {
 	chatActive    map[string]struct{}
 	wake          chan struct{}
 	chatWake      chan struct{}
-	chatEventWake chan struct{}
-	chatListeners map[string]*chatListener
-	chatWatched   map[string]map[string]struct{}
+	// chatDownloadWake holds one channel per chat download worker. It is
+	// deliberately separate from chatWake for the same reason reconcileWake is
+	// separate from wake: a token consumed by the wrong class of consumer is a
+	// lost wakeup, because the indexing loop would swallow the signal a transfer
+	// worker is waiting for and that worker would then sit out a full idle
+	// interval. One channel per worker rather than one shared buffered channel,
+	// so that a single signal can start every idle worker: indexing a history
+	// page usually queues far more media than the transfer concurrency.
+	chatDownloadWake []chan struct{}
+	chatEventWake    chan struct{}
+	chatListeners    map[string]*chatListener
+	chatWatched      map[string]map[string]struct{}
 	// potentialDiscussion is an account-level fast path for first replies to
 	// historical channel posts. It is derived together with chatWatched, so an
 	// unrelated discussion update never needs a database query.
@@ -349,7 +368,11 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), potentialDiscussion: make(map[string]bool), slotWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1), stopCh: make(chan struct{}), inboxRetry: make(chan inboxRetry, inboxRetryQueueSize), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
+	chatDownloadWake := make([]chan struct{}, chatDownloadWorkerCount)
+	for i := range chatDownloadWake {
+		chatDownloadWake[i] = make(chan struct{}, 1)
+	}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatDownloadWake: chatDownloadWake, chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), potentialDiscussion: make(map[string]bool), slotWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1), stopCh: make(chan struct{}), inboxRetry: make(chan inboxRetry, inboxRetryQueueSize), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
 	// The first worker pass constructs the listener snapshot before accepting
 	// updates. Subsequent rebuilds are only needed after state changes.
 	m.listenerDirty.Store(true)
@@ -411,8 +434,8 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 		go m.worker()
 	}
 	go m.chatWorker()
-	for worker := 0; worker < 3; worker++ {
-		go m.chatDownloadWorker()
+	for worker := 0; worker < chatDownloadWorkerCount; worker++ {
+		go m.chatDownloadWorker(m.chatDownloadWake[worker])
 	}
 	for worker := 0; worker < 2; worker++ {
 		go m.chatEventWorker()
@@ -1235,7 +1258,7 @@ func (m *Manager) worker() {
 		case <-m.stopCh:
 			return
 		case <-m.wake:
-		case <-time.After(3 * time.Second):
+		case <-time.After(messageIdleInterval):
 		}
 	}
 }
@@ -2414,17 +2437,50 @@ func (m *Manager) sources(jobID string) ([]source, error) {
 }
 func (m *Manager) signal() {
 	// Keep one wake-up per worker so several newly queued jobs can begin in
-	// parallel instead of waiting for the workers' idle polling timeout.
+	// parallel instead of waiting for the workers' idle polling timeout. A
+	// single token would wake exactly one of them, because a receive from a
+	// buffered channel hands the value to one receiver; the rest would then
+	// have to wait out the whole idle interval. Fill the buffer until it is
+	// full, which also bounds this to workerCount sends.
+	for sent := 0; sent < workerCount; sent++ {
+		select {
+		case m.wake <- struct{}{}:
+		default:
+			return
+		}
+	}
+}
+
+// signalChat wakes both the indexing loop and every transfer worker. Nearly
+// every session state transition concerns both classes, and an extra wake on an
+// idle worker costs one cheap query while a missed one costs a full idle
+// interval.
+//
+// Callers that only create transfer work should use signalChatDownload instead.
+// That matters most inside chatWorker itself: signalling chatWake from its own
+// iteration would consume the token it just sent and spin the loop without its
+// fallback delay.
+func (m *Manager) signalChat() {
+	m.signalChatIndex()
+	m.signalChatDownload()
+}
+
+// signalChatIndex wakes only the indexing/reconciliation loop.
+func (m *Manager) signalChatIndex() {
 	select {
-	case m.wake <- struct{}{}:
+	case m.chatWake <- struct{}{}:
 	default:
 	}
 }
 
-func (m *Manager) signalChat() {
-	select {
-	case m.chatWake <- struct{}{}:
-	default:
+// signalChatDownload wakes every transfer worker, so a page of newly indexed
+// media can fill the whole transfer concurrency instead of one slot.
+func (m *Manager) signalChatDownload() {
+	for _, wake := range m.chatDownloadWake {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
 	}
 }
 func (m *Manager) status(id string) string {

@@ -83,12 +83,24 @@ func (m *Manager) ClaimReactionInbox(limit int) ([]ReactionInboxEvent, error) {
 	if limit > 8 {
 		limit = 8
 	}
+	now := time.Now().UTC()
+	// Probe before opening a transaction. Each resident worker polls this queue
+	// on a one second timer, and BEGIN + SELECT + COMMIT costs three statements
+	// on the common empty case where a single index probe answers the same
+	// question. The poll stays short because a reaction is interactive work and
+	// has no wake channel of its own.
+	var pending bool
+	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at <= ?)`, now.Format(time.RFC3339Nano)).Scan(&pending); err != nil {
+		return nil, err
+	}
+	if !pending {
+		return nil, nil
+	}
 	tx, err := m.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC()
 	rows, err := tx.Query(`SELECT id, account_id, dialog_name, dialog_id, message_id, source_url, peer_type, peer_id, peer_hash, emoji, attempts
 FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?`, now.Format(time.RFC3339Nano), limit)
 	if err != nil {

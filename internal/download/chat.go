@@ -83,6 +83,15 @@ const (
 	chatScanIndexing  = "indexing"
 	chatScanCompleted = "completed"
 	chatBatchSize     = 64
+	// chatDownloadIdleInterval is the fallback only. Every transition that
+	// queues media signals this worker class directly, and a filled claim
+	// window continues without waiting at all, so this bounds how long a missed
+	// wake can stall a transfer rather than how fast a queue drains.
+	chatDownloadIdleInterval = 3 * time.Second
+	// chatEventIdleInterval is likewise a fallback. Registering a listener
+	// event signals chatEventWake, and the empty-queue probe is a single index
+	// lookup, so this only bounds the cost of idle polling.
+	chatEventIdleInterval = 3 * time.Second
 )
 
 // Telegram exposes the media gallery as separate server-side filters. These
@@ -598,18 +607,36 @@ func (m *Manager) chatWorker() {
 	}
 }
 
-func (m *Manager) chatDownloadWorker() {
+// chatDownloadWorker owns one private wake channel. Chat transfers may run
+// concurrently up to the configured global limit, so several of these workers
+// exist; sharing a single token between them and the indexing loop would let
+// either class consume the other's wakeup.
+func (m *Manager) chatDownloadWorker(wake <-chan struct{}) {
 	for {
 		if m.DatabaseAvailable() {
-			if err := m.runOneChatBatch(); err != nil {
+			more, err := m.runOneChatBatch()
+			if err != nil {
 				applog.Error("chat_download", "media_transfer_failed", "error", err.Error())
+			}
+			if more {
+				// The claim window filled, so more media is already indexed
+				// behind this batch. Start the next one immediately instead of
+				// idling out the fallback interval; the batch itself is the
+				// rate limit. Stop is still checked so a long queue cannot
+				// delay shutdown.
+				select {
+				case <-m.stopCh:
+					return
+				default:
+				}
+				continue
 			}
 		}
 		select {
 		case <-m.stopCh:
 			return
-		case <-m.chatWake:
-		case <-time.After(750 * time.Millisecond):
+		case <-wake:
+		case <-time.After(chatDownloadIdleInterval):
 		}
 	}
 }
@@ -735,14 +762,32 @@ func (m *Manager) claimChatMedia(chatID string, item source) (string, string, er
 // message IDs always take precedence. There is no per-media download task:
 // the chat job owns the context, temporary directory and all durable item
 // state.
-func (m *Manager) runOneChatBatch() error {
+//
+// more reports that the claim window was full and this call moved at least one
+// item forward, so the caller should start the next batch without waiting out
+// its idle fallback. Leaving that to the fallback would add a full idle
+// interval between batches, which is minutes of dead time on a ten-thousand
+// file task. The batch itself is the rate limit, and a full window that only
+// produced "waiting" items is excluded because those are held by other tasks:
+// re-claiming them immediately would spin without transferring anything.
+func (m *Manager) runOneChatBatch() (more bool, err error) {
+	// claimedWindow counts the rows the bounded claim returned, before the
+	// dialog filter narrows what a single upstream call may transfer. adopted
+	// counts items this call moved straight to completed by adopting media an
+	// earlier task had already fetched.
+	claimedWindow := 0
+	adopted := 0
+	transfer := make([]source, 0)
+	defer func() {
+		more = err == nil && claimedWindow == chatBatchSize && adopted+len(transfer) > 0
+	}()
 	// A message task created from a link, Bot command or reaction is interactive
 	// work. While any such task is ready, the shared scheduler caps chat batches
 	// at half of global capacity. Existing batches are allowed to finish safely;
 	// each is bounded and then releases its global permit.
 	priority, err := m.hasPriorityMessageTask()
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Accounts inside a Telegram cooldown are excluded by the query, not only by
 	// the in-memory guard below: the candidate window is bounded, so filtering
@@ -752,7 +797,7 @@ func (m *Manager) runOneChatBatch() error {
 	// lexicographic comparison wrong.
 	rows, err := m.db.Query(`SELECT id, account_id FROM chat_download_jobs WHERE status IN ('scanning', 'downloading', 'listening') AND EXISTS (SELECT 1 FROM chat_download_items i WHERE i.chat_job_id = chat_download_jobs.id AND i.status = 'queued') AND NOT EXISTS (SELECT 1 FROM telegram_rate_limits l WHERE l.account_id = chat_download_jobs.account_id AND l.blocked_until::timestamptz > ?::timestamptz) ORDER BY created_at LIMIT 16`, time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
-		return err
+		return false, err
 	}
 	var id string
 	for rows.Next() {
@@ -778,26 +823,26 @@ func (m *Manager) runOneChatBatch() error {
 	}
 	_ = rows.Close()
 	if id == "" {
-		return nil
+		return false, nil
 	}
 	defer func() { m.mu.Lock(); delete(m.chatActive, id); m.mu.Unlock() }()
 	target, err := m.chatTarget(id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	releaseTransfer, acquired := m.tryAcquireTransfer(transferChat, priority)
 	if !acquired {
 		// Keep the durable media rows queued. Another worker will retry after a
 		// permit is released, without creating a competing upstream transfer.
-		return nil
+		return false, nil
 	}
 	defer releaseTransfer()
 	if target.inputPeer() == nil {
-		return errors.New("会话下载任务缺少 Telegram 会话引用")
+		return false, errors.New("会话下载任务缺少 Telegram 会话引用")
 	}
 	rows, err = m.db.Query(`SELECT dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size FROM chat_download_items WHERE chat_job_id = ? AND status = 'queued' ORDER BY message_id DESC LIMIT ?`, id, chatBatchSize)
 	if err != nil {
-		return err
+		return false, err
 	}
 	batch := make([]source, 0, chatBatchSize)
 	for rows.Next() {
@@ -805,16 +850,17 @@ func (m *Manager) runOneChatBatch() error {
 		var isComment int
 		if err := rows.Scan(&item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginDialogName, &item.OriginMessageID, &isComment, &item.SourcePeerType, &item.SourcePeerID, &item.SourcePeerHash, &item.OriginalName, &item.Size); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		item.IsComment = isComment != 0
 		batch = append(batch, source{Item: item, DialogName: target.DialogName, Direct: directPeer{kind: item.SourcePeerType, id: item.SourcePeerID, hash: item.SourcePeerHash}})
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
+	claimedWindow = len(batch)
 	if len(batch) == 0 {
-		return nil
+		return false, nil
 	}
 	// A session may now contain channel media and linked-discussion replies.
 	// Upstream completion callbacks carry only MessageID, so never place two
@@ -837,20 +883,21 @@ func (m *Manager) runOneChatBatch() error {
 		filtered = append(filtered, item)
 	}
 	batch = filtered
-	transfer := make([]source, 0, len(batch))
+	transfer = make([]source, 0, len(batch))
 	for _, item := range batch {
 		claim, path, err := m.claimChatMedia(id, item)
 		if err != nil {
-			return err
+			return false, err
 		}
 		switch claim {
 		case "completed":
 			if err := m.setChatItem(id, item, "completed", path, ""); err != nil {
-				return err
+				return false, err
 			}
+			adopted++
 		case "waiting":
 			if _, err := m.db.Exec(`UPDATE chat_download_items SET status = 'waiting', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
-				return err
+				return false, err
 			}
 		default:
 			transfer = append(transfer, item)
@@ -858,11 +905,11 @@ func (m *Manager) runOneChatBatch() error {
 	}
 	batch = transfer
 	if len(batch) == 0 {
-		return nil
+		return false, nil
 	}
 	for _, item := range batch {
 		if _, err := m.db.Exec(`UPDATE chat_download_items SET attempts = attempts + 1, error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
-			return err
+			return false, err
 		}
 	}
 	// Register this transfer while holding the same lock as pause/cancel. This
@@ -873,7 +920,7 @@ func (m *Manager) runOneChatBatch() error {
 	lock.Lock()
 	if !chatRunnable(m.chatStatus(id)) {
 		lock.Unlock()
-		return nil
+		return false, nil
 	}
 	ctx, release := m.beginChatExecution(id)
 	lock.Unlock()
@@ -883,7 +930,7 @@ func (m *Manager) runOneChatBatch() error {
 	config := m.settings.Get()
 	if target.configJSON != "" {
 		if err := json.Unmarshal([]byte(target.configJSON), &config.Download); err != nil {
-			return fmt.Errorf("会话下载配置快照无效: %w", err)
+			return false, fmt.Errorf("会话下载配置快照无效: %w", err)
 		}
 	}
 	byMessage := make(map[int]source, len(batch))
@@ -902,7 +949,7 @@ func (m *Manager) runOneChatBatch() error {
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
 	tmpDir, err := temporaryDialogDirectory(tmpRoot, batch[0].DialogKey)
 	if err != nil {
-		return fmt.Errorf("创建会话临时目录: %w", err)
+		return false, fmt.Errorf("创建会话临时目录: %w", err)
 	}
 	watchdog := startTransferWatchdog(transferCtx, upstreamWatchPeriod, upstreamInitialTimeout, upstreamIdleTimeout, stopTransfer, func() bool {
 		status := m.chatStatus(id)
@@ -964,7 +1011,7 @@ func (m *Manager) runOneChatBatch() error {
 	})
 	publishWG.Wait()
 	if reconcileErr := m.reconcileChatPublishedItems(); reconcileErr != nil {
-		return fmt.Errorf("核对已移动文件: %w", reconcileErr)
+		return false, fmt.Errorf("核对已移动文件: %w", reconcileErr)
 	}
 	publishMu.Lock()
 	persistErr := publishErr
@@ -974,11 +1021,11 @@ func (m *Manager) runOneChatBatch() error {
 		// item running. Put only those still-running rows back on the durable
 		// queue; rows that were already reconciled to completed are untouched.
 		if recoverErr := m.requeueChatPublishFailures(id, batch); recoverErr != nil {
-			return fmt.Errorf("恢复文件发布状态: %w", recoverErr)
+			return false, fmt.Errorf("恢复文件发布状态: %w", recoverErr)
 		}
 	}
 	if watchdog.Stalled() && (m.chatStatus(id) == ChatStatusScanning || m.chatStatus(id) == ChatStatusDownloading || m.chatStatus(id) == ChatStatusListening) {
-		return m.requeueStalledChatBatch(id, batch)
+		return false, m.requeueStalledChatBatch(id, batch)
 	}
 	if err != nil && m.chatStatus(id) != ChatStatusPaused && m.chatStatus(id) != ChatStatusCancelled {
 		if m.recordTelegramRPCError(target.AccountID, err) {
@@ -987,7 +1034,7 @@ func (m *Manager) runOneChatBatch() error {
 			// waiting for. No immediate wake either — the account-wide cooldown
 			// now keeps this task out of the scheduler until the window expires.
 			//
-			return m.requeueFloodedChatItems(id)
+			return false, m.requeueFloodedChatItems(id)
 		}
 		for _, item := range batch {
 			// Another file in this upstream call can fail after this one has
@@ -996,10 +1043,10 @@ func (m *Manager) runOneChatBatch() error {
 				_ = m.setChatItem(id, item, "failed", "", err.Error())
 			}
 		}
-		return err
+		return false, err
 	}
 	m.touch()
-	return nil
+	return false, nil
 }
 
 // requeueChatPublishFailures recovers only rows whose final-path state could
@@ -1464,7 +1511,7 @@ func (m *Manager) chatEventWorker() {
 			case <-m.stopCh:
 				return
 			case <-m.chatEventWake:
-			case <-time.After(time.Second):
+			case <-time.After(chatEventIdleInterval):
 			}
 			continue
 		}
@@ -2139,7 +2186,10 @@ WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanComplet
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("历史下载有 %d 个文件失败，可重新开始失败项", failed), id)
 		}
 		if pending > 0 {
-			m.signalChat()
+			// This runs inside chatWorker, so it must wake only the transfer
+			// workers: signalling chatWake here would hand chatWorker the token
+			// it just sent and spin the loop without its fallback delay.
+			m.signalChatDownload()
 		}
 	}
 }

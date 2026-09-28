@@ -1317,7 +1317,8 @@ func TestPostgresStopEndsEveryWorkerLoop(t *testing.T) {
 	}
 	m := &Manager{db: db, settings: store, events: newEventBus(), progress: newProgressStore(),
 		stopCh: make(chan struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1),
-		chatEventWake: make(chan struct{}, 1), slotWake: make(chan struct{}, 1),
+		chatDownloadWake: []chan struct{}{make(chan struct{}, 1)},
+		chatEventWake:    make(chan struct{}, 1), slotWake: make(chan struct{}, 1),
 		rpcState: make(map[string]*telegramRPCState), chatActive: make(map[string]struct{}),
 		chatCancels: make(map[string]map[uint64]context.CancelFunc), cancels: make(map[string]context.CancelFunc)}
 	if err := m.migratePostgres(); err != nil {
@@ -1331,7 +1332,7 @@ func TestPostgresStopEndsEveryWorkerLoop(t *testing.T) {
 	loops := map[string]func(){
 		"worker":             m.worker,
 		"chatWorker":         m.chatWorker,
-		"chatDownloadWorker": m.chatDownloadWorker,
+		"chatDownloadWorker": func() { m.chatDownloadWorker(m.chatDownloadWake[0]) },
 		"chatEventWorker":    m.chatEventWorker,
 	}
 	done := make(chan string, len(loops))

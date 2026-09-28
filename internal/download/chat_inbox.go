@@ -138,12 +138,22 @@ func (m *Manager) claimChatMessageInbox(limit int) ([]chatMessageInboxEvent, err
 	if limit < 1 {
 		limit = 1
 	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// Probe before opening a transaction. An idle listener polls this queue on
+	// a timer, and BEGIN + SELECT + COMMIT costs three statements on the common
+	// empty case where a single index probe answers the same question.
+	var pending bool
+	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ?)`, now).Scan(&pending); err != nil {
+		return nil, err
+	}
+	if !pending {
+		return nil, nil
+	}
 	tx, err := m.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := tx.Query(`SELECT id, account_id, dialog_name, dialog_id, message_id, reply_to_message_id, reply_to_top_id, peer_type, peer_id, peer_hash, attempts
 FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?`, now, limit)
 	if err != nil {
