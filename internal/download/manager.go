@@ -1296,6 +1296,14 @@ func (m *Manager) nextQueued() (Job, []source, error) {
 func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner bool) {
 	if m.allItemsCompleted(jobID) {
 		_ = m.setJob(jobID, "completed", "")
+		// Every file is published, so this task's private temporary directory
+		// holds only leftovers. The usual case is a task that paused part-way and
+		// then found another task had completed the media: its own partial
+		// download is never resumed, because the items were adopted rather than
+		// transferred. The normal completion paths remove this directory, and
+		// this one returns before reaching them, so without this the partial file
+		// stays on disk until the task is deleted.
+		_ = os.RemoveAll(filepath.Join(m.downloadDir, ".tdl-tmp", jobID))
 		return
 	}
 	if waitingForOwner || m.hasWaitingMessageItems(jobID) {
@@ -2070,6 +2078,26 @@ func (m *Manager) releaseFailedMessageClaims(jobID string) {
 	m.signalReconcile()
 }
 
+// releaseMessageClaims drops every media claim this message task still owns,
+// whatever state its items are in. It mirrors releaseChatClaims, and the
+// difference from releaseFailedMessageClaims is the point: that one only covers
+// failed, cancelled and deleted items, so it cannot serve a pause — a paused item
+// matches none of them and the claim would survive.
+//
+// A task that is not transferring must not keep owning media in downloaded_media,
+// because a waiter tests the claim rather than the item's status. Otherwise every
+// other task that wants the same media waits until this one is resumed, and a
+// claim left by a task the user paused is never released by anything.
+//
+// Resuming is unaffected: the item rows, the temporary file and the upstream
+// resume state all stay on disk, and claimMedia re-acquires the claim (or the
+// resuming task adopts the file when another task finished it first).
+func (m *Manager) releaseMessageClaims(jobID string) {
+	_, _ = m.db.Exec(`DELETE FROM downloaded_media WHERE status = 'claimed' AND owner_kind = 'message' AND owner_id = ?`, jobID)
+	m.signalChat()
+	m.signalReconcile()
+}
+
 // reconcilePublishedItems completes the narrow crash window between moving a
 // file and persisting its terminal status. A path is trusted only when it is
 // still a regular file; otherwise a normal resumable retry remains possible.
@@ -2425,6 +2453,10 @@ func (m *Manager) Pause(id string) error {
 	if err := m.transitionItems(id, status, "paused", "已暂停，可继续恢复", m.pauseItemsSQL(), now, id); err != nil {
 		return fmt.Errorf("暂停任务: %w", err)
 	}
+	// A paused task transfers nothing, so it must not keep owning media: a
+	// waiting task tests the claim, and a claim held by a task the user paused is
+	// released by nothing else. PauseChat does the same for the same reason.
+	m.releaseMessageClaims(id)
 	m.mu.Lock()
 	cancel := m.cancels[id]
 	m.mu.Unlock()

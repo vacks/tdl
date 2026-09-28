@@ -85,6 +85,11 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 	// confirms there are no more replies. Never use a page length as proof that
 	// a thread ended: sparse/deleted messages may yield short intermediate pages.
 	offset := 0
+	// Albums already expanded during this read of the thread, so a group split
+	// across a page boundary is not asked for twice. Scoped to this call on
+	// purpose: a grouped id is only unique within one dialog, so anything wider
+	// could skip a different album that happens to share an id.
+	expandedGroups := make(map[int64]struct{})
 	for {
 		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
 			return nil, err
@@ -113,10 +118,20 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 				continue
 			}
 			replyMessages++
-			// GetReplies normally returns every member of an album. Ask upstream for
-			// its complete group only once as a safety net for a page boundary.
+			// GetReplies normally returns every member of an album, so the lookup
+			// below is only a safety net for a group split across a page boundary.
+			// It has to happen once per album, not once per member: without the
+			// guard a ten-photo album asks the identical question ten times and
+			// spends ten of the account's rate-limit tokens on one answer. Members
+			// already emitted by the first expansion are skipped by seen below, so
+			// leaving early loses nothing. Only a successful expansion is
+			// remembered, so a failure is retried on the next member rather than
+			// silently dropping the group.
 			messages := []*tg.Message{message}
-			if _, grouped := message.GetGroupedID(); grouped {
+			if groupID, grouped := message.GetGroupedID(); grouped {
+				if _, alreadyExpanded := expandedGroups[groupID]; alreadyExpanded {
+					continue
+				}
 				if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
 					return nil, err
 				}
@@ -129,6 +144,7 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 					}
 				}
 				if groupErr == nil && len(group) > 0 {
+					expandedGroups[groupID] = struct{}{}
 					messages = group
 				}
 			}

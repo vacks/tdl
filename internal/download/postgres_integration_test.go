@@ -1364,6 +1364,255 @@ func TestPostgresStopEndsEveryWorkerLoop(t *testing.T) {
 	}
 }
 
+func seedWaitingChatItem(t *testing.T, db *database, chatID, dialogKey string, messageID int, mediaOwner string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, status, discovered_at) VALUES (?,?,?,'wait.bin','waiting',?)`, chatID, dialogKey, messageID, now); err != nil {
+		t.Fatal(err)
+	}
+	if mediaOwner == "" {
+		return
+	}
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?,?,'claimed','chat',?,?)`, dialogKey, messageID, mediaOwner, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedChatJobWithStatus(t *testing.T, db *database, id, dialogKey, status string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES (?,'tg://c','channel',?,1,'test','account',?,'completed',?,?)`, id, dialogKey, status, now, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The chat waiting-item scan must rotate like the message one. A blocked head
+// that fills the whole LIMIT window would otherwise be re-read on every pass
+// while everything behind it went unexamined — and an item whose blocker has
+// been released would never be promoted.
+func TestPostgresChatReconcileCursorRotatesPastBlockedItems(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore(), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	seedChatJobWithStatus(t, db, "chat-rotate", "channel:chatrotate", ChatStatusDownloading)
+	total := chatClaimBatchSize + 4
+	for i := 1; i <= total; i++ {
+		seedWaitingChatItem(t, db, "chat-rotate", "channel:chatrotate", i, "other-owner")
+	}
+	// Only the last item, past one full batch, has its blocker released.
+	if _, err := db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = 'channel:chatrotate' AND message_id = ?`, total); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := m.reconcileChatClaims(chatClaimCursor{})
+	if cursor == (chatClaimCursor{}) {
+		t.Fatal("the pass did not advance the cursor past the blocked batch; a blocked head would be re-examined forever")
+	}
+	var state string
+	if err := db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = 'chat-rotate' AND message_id = ?`, total).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "waiting" {
+		t.Fatalf("the blocked batch already promoted item %d to %q; want it untouched on the first pass", total, state)
+	}
+
+	m.reconcileChatClaims(cursor)
+	if err := db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = 'chat-rotate' AND message_id = ?`, total).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "queued" {
+		t.Fatalf("item %d state = %q after resuming from the cursor; want queued, the released item behind the blocked batch", total, state)
+	}
+}
+
+// A task that cannot transfer must not be handed ownership of media: the claim
+// would be held by nobody and would block every message task waiting on it,
+// which is exactly the stall that releasing claims on pause fixes from the
+// other side.
+func TestPostgresChatReconcileRefusesToClaimForANonRunnableTask(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore(), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	seedChatJobWithStatus(t, db, "chat-paused", "channel:chatpaused", ChatStatusPaused)
+	seedWaitingChatItem(t, db, "chat-paused", "channel:chatpaused", 31, "")
+	seedChatJobWithStatus(t, db, "chat-live", "channel:chatlive", ChatStatusDownloading)
+	seedWaitingChatItem(t, db, "chat-live", "channel:chatlive", 32, "")
+
+	m.reconcileChatClaims(chatClaimCursor{})
+
+	var pausedClaims, liveClaims int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:chatpaused' AND message_id = 31`).Scan(&pausedClaims); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:chatlive' AND message_id = 32`).Scan(&liveClaims); err != nil {
+		t.Fatal(err)
+	}
+	if pausedClaims != 0 {
+		t.Fatalf("a non-runnable task was granted %d claim(s); the media is now held by a task that will never transfer it", pausedClaims)
+	}
+	if liveClaims != 1 {
+		t.Fatalf("a runnable task holds %d claim(s) for its waiting item; want 1 so it can proceed", liveClaims)
+	}
+}
+
+// Pausing a message task must release the media it holds, exactly as PauseChat
+// does. A parked task transfers nothing, and a claim it keeps is released by
+// nothing else, so every other task wanting that media waits until the user
+// resumes — visible as "等待其他任务完成同一文件" with no error and no timeout.
+// Releasing must not cost the paused task anything: resuming re-acquires the
+// claim and continues from the temporary file and upstream resume state.
+func TestPostgresPausingMessageTaskReleasesClaimsWithoutLosingResume(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	// downloadDir must be a temporary directory: this test writes a partial
+	// download, and an empty downloadDir resolves relative to the package
+	// directory, leaving the artifact inside the source tree.
+	m := &Manager{db: db, downloadDir: t.TempDir(), events: newEventBus(), progress: newProgressStore(),
+		cancels: make(map[string]context.CancelFunc), chatWake: make(chan struct{}, 1),
+		reconcileWake: make(chan struct{}, 1), wake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('pause-msg','tg://m','channel','channel:pausemsg','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('pause-msg','channel','channel:pausemsg',1,88,'paused.bin','running')`); err != nil {
+		t.Fatal(err)
+	}
+	// The claim this running task holds, plus the partial download it must keep.
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:pausemsg',88,'claimed','message','pause-msg',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(m.downloadDir, ".tdl-tmp", "pause-msg")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	partial := filepath.Join(tmpDir, "88_paused.bin")
+	if err := os.WriteFile(partial, []byte("half"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Pause("pause-msg"); err != nil {
+		t.Fatalf("Pause(): %v", err)
+	}
+
+	var claims int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:pausemsg' AND message_id = 88`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Fatalf("a paused task still holds %d claim(s); every other task wanting that media is blocked until it is resumed", claims)
+	}
+	// The paused task keeps everything it needs to resume.
+	wantDownloadItemStatus(t, db, "pause-msg", "paused")
+	if _, statErr := os.Stat(partial); statErr != nil {
+		t.Fatalf("the partial download was discarded on pause: %v", statErr)
+	}
+	item := source{Item: Item{DialogKey: "channel:pausemsg", MessageID: 88}}
+	// Resuming re-acquires the freed claim, so the release costs the paused task
+	// nothing: it continues from its own temporary file.
+	if resumedClaim, _, err := m.claimMessageMedia("pause-msg", item); err != nil || resumedClaim != "queued" {
+		t.Fatalf("claimMessageMedia()=%q,%v on resume; want queued so the task continues from its temporary file", resumedClaim, err)
+	}
+	// Hand the media to the competing chat task instead, as would happen if the
+	// pause had stood. It must now be able to proceed.
+	if _, err := db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = 'channel:pausemsg' AND message_id = 88`); err != nil {
+		t.Fatal(err)
+	}
+	if otherClaim, _, err := m.claimChatMedia("chat-wants", item); err != nil || otherClaim != "queued" {
+		t.Fatalf("claimChatMedia()=%q,%v after a pause; want queued so the waiting task proceeds", otherClaim, err)
+	}
+	// With the chat task holding it, the message task waits and will adopt the
+	// finished file rather than downloading the same media a second time.
+	if laterClaim, _, err := m.claimMessageMedia("pause-msg", item); err != nil || laterClaim != "waiting" {
+		t.Fatalf("claimMessageMedia()=%q,%v while another task owns the media; want waiting so it adopts instead of re-downloading", laterClaim, err)
+	}
+}
+
+// A task that pauses part-way and later finds another task has published the
+// media adopts those files, so it never resumes its own transfer. That path
+// returns before the code that removes a task's temporary directory, leaving the
+// partial download on disk until the task is deleted.
+func TestPostgresAdoptingEveryItemRemovesTheStaleTemporaryDirectory(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	root := t.TempDir()
+	m := &Manager{db: db, downloadDir: root, events: newEventBus(), progress: newProgressStore(), settings: nil}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('adopt-all','tg://m','channel','channel:adopt','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('adopt-all','channel','channel:adopt',1,91,'done.bin','completed')`); err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := filepath.Join(root, ".tdl-tmp", "adopt-all")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "91_done.bin"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m.finishTaskWithoutPendingWork("adopt-all", false)
+
+	if state := m.status("adopt-all"); state != "completed" {
+		t.Fatalf("task state = %q; want completed", state)
+	}
+	if _, statErr := os.Stat(tmpDir); !os.IsNotExist(statErr) {
+		t.Fatalf("the task's temporary directory survived completion (stat err = %v); its partial download leaks on disk", statErr)
+	}
+}
+
 // A chat item that exhausts its flood retry budget becomes terminal, and every
 // other chat transition to a terminal state releases the item's global claim.
 // An item that keeps owning media in downloaded_media blocks every other task

@@ -563,6 +563,8 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 // inexpensive because it asks only for media, and serializing it keeps API
 // pressure predictable even when a user creates many large chat tasks.
 func (m *Manager) chatWorker() {
+	// The waiting-item rotation is owned by this single goroutine.
+	var claimCursor chatClaimCursor
 	for {
 		if !m.DatabaseAvailable() {
 			select {
@@ -581,7 +583,7 @@ func (m *Manager) chatWorker() {
 		if err := m.reconcileChatPublishedItems(); err != nil {
 			applog.Error("chat_download", "published_file_reconcile_failed", "error", err.Error())
 		}
-		m.reconcileChatClaims()
+		claimCursor = m.reconcileChatClaims(claimCursor)
 		m.refreshChatStates()
 		m.reconcileChatListeners()
 		// Neither inbox has a maintenance loop of its own, so their lease safety
@@ -615,18 +617,53 @@ func (m *Manager) chatDownloadWorker() {
 // reconcileChatClaims wakes media that was held by another active task. A
 // completed claim is adopted without another download; a released claim is
 // atomically acquired on the next pass.
-func (m *Manager) reconcileChatClaims() {
-	rows, err := m.db.Query(`SELECT i.chat_job_id, i.dialog_key, i.message_id, m.status, m.final_path FROM chat_download_items i LEFT JOIN downloaded_media m ON m.dialog_key = i.dialog_key AND m.message_id = i.message_id WHERE i.status = 'waiting' LIMIT 256`)
+// chatClaimBatchSize bounds one waiting-item reconcile pass.
+const chatClaimBatchSize = 256
+
+// chatClaimCursor is the composite key of the last waiting row a pass examined.
+// chat_download_items has no surrogate id, so its primary key is the rotation
+// key. It lives only in the caller's memory: losing it restarts the rotation,
+// which costs nothing but a re-read of rows already known to be blocked.
+type chatClaimCursor struct {
+	chatJobID string
+	dialogKey string
+	messageID int
+}
+
+// reconcileChatClaims makes one bounded pass over waiting chat items and returns
+// the cursor for the next pass. Two things it must do, and previously did not:
+//
+//   - Rotate. The scan is ordered by the primary key and resumes after the last
+//     row it saw, so a permanently blocked head cannot keep the whole LIMIT
+//     window to itself while everything behind it goes unexamined.
+//   - Refuse to grant a claim on behalf of a task that is not runnable. A paused
+//     or cancelled task transfers nothing, so a fresh claim taken for it is held
+//     by nobody and silently blocks every message task waiting on that media —
+//     the same stall that releasing claims on pause fixes from the other side.
+//
+// Adopting media another task already published is always safe and stays
+// unconditional.
+func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
+	// the ownership columns are coalesced, not read raw: the LEFT JOIN yields NULL
+	// when nothing owns the media, and scanning NULL into a string fails, which
+	// silently dropped exactly the rows this pass exists to promote — an item
+	// whose blocker has released its claim. An empty status is the "unowned" case
+	// the logic below already handles.
+	rows, err := m.db.Query(`SELECT i.chat_job_id, i.dialog_key, i.message_id, COALESCE(m.status, ''), COALESCE(m.final_path, ''), j.status FROM chat_download_items i LEFT JOIN downloaded_media m ON m.dialog_key = i.dialog_key AND m.message_id = i.message_id JOIN chat_download_jobs j ON j.id = i.chat_job_id WHERE i.status = 'waiting' AND (i.chat_job_id, i.dialog_key, i.message_id) > (?, ?, ?) ORDER BY i.chat_job_id, i.dialog_key, i.message_id LIMIT ?`, cursor.chatJobID, cursor.dialogKey, cursor.messageID, chatClaimBatchSize)
 	if err != nil {
-		return
+		return cursor
 	}
 	defer rows.Close()
+	scanned := 0
+	next := cursor
 	for rows.Next() {
-		var chatID, key, status, path string
+		var chatID, key, status, path, parentStatus string
 		var messageID int
-		if rows.Scan(&chatID, &key, &messageID, &status, &path) != nil {
+		if rows.Scan(&chatID, &key, &messageID, &status, &path, &parentStatus) != nil {
 			continue
 		}
+		scanned++
+		next = chatClaimCursor{chatJobID: chatID, dialogKey: key, messageID: messageID}
 		if status == "completed" && path != "" && regularFileExists(path) {
 			if result, err := m.db.Exec(`UPDATE chat_download_items SET status = 'completed', final_path = ?, error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, path, chatID, key, messageID); err == nil {
 				if changed, _ := result.RowsAffected(); changed == 1 {
@@ -658,6 +695,12 @@ func (m *Manager) reconcileChatClaims() {
 		if messageErr != nil && !errors.Is(messageErr, sql.ErrNoRows) {
 			continue
 		}
+		// Only a task that can actually transfer may take ownership. A paused or
+		// cancelled task transfers nothing, so a claim granted on its behalf would
+		// be held by nobody and block every message task waiting on this media.
+		if !chatRunnable(parentStatus) {
+			continue
+		}
 		result, claimErr := m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, key, messageID, chatID, time.Now().UTC().Format(time.RFC3339Nano))
 		if claimErr == nil {
 			if changed, _ := result.RowsAffected(); changed == 1 {
@@ -670,6 +713,14 @@ func (m *Manager) reconcileChatClaims() {
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return next
+	}
+	// A short pass means the rotation reached the end of the waiting set.
+	if scanned < chatClaimBatchSize {
+		next = chatClaimCursor{}
+	}
+	return next
 }
 
 // claimChatMedia validates a queued media row immediately before transferring
