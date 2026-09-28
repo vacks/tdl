@@ -452,7 +452,7 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 	case strings.HasPrefix(text, "/tasks "):
 		status, err := download.NormalizeTaskStatusFilter(strings.TrimSpace(strings.TrimPrefix(text, "/tasks ")))
 		if err != nil {
-			s.send(cfg.Token, msg.Chat.ID, err.Error()+"。可用状态：排队中、等待中、下载中、已暂停、已完成、部分完成、失败、已取消。", nil)
+			s.send(cfg.Token, msg.Chat.ID, err.Error()+"。可用状态：排队中、下载中、已暂停、已完成、部分完成、失败、已取消。", nil)
 			break
 		}
 		s.sendTaskList(cfg, msg.Chat.ID, status)
@@ -1641,7 +1641,7 @@ func messageFullText(value string) string {
 }
 
 func helpText() string {
-	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、等待中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/saved all</code> 下载本人收藏夹历史消息\n<code>/saved listen</code> 监听本人收藏夹新消息\n<code>/saved stop</code> 停止收藏夹监听\n<code>/saved status</code> 查看收藏夹任务\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
+	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/saved all</code> 下载本人收藏夹历史消息\n<code>/saved listen</code> 监听本人收藏夹新消息\n<code>/saved stop</code> 停止收藏夹监听\n<code>/saved status</code> 查看收藏夹任务\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
 }
 
 func (s *Service) statusText() string {

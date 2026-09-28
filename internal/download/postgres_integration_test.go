@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/tg"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
@@ -922,6 +923,220 @@ func TestPostgresFilteredJobTotalIsMemoizedPerStatus(t *testing.T) {
 	seedReconcileJob(t, db, "count-d", "channel:count", "failed")
 	if total, err = m.visibleJobTotal("failed"); err != nil || total != 1 {
 		t.Fatalf("visibleJobTotal(failed)=%d,%v; want 1", total, err)
+	}
+}
+
+// A session task's terminal state has to say what actually happened, and it has
+// to avoid concluding while files are merely held by another task.
+//
+//   - Every file failed: "failed". Calling that "partial" claims some of the
+//     task succeeded, which is exactly what a message task refuses to say.
+//   - Some files published: "partial".
+//   - Nothing finished but files are waiting on another task's claim: not
+//     terminal at all. They are promoted once that claim is released, and the
+//     promotion pass only looks at a task that can still run, so concluding here
+//     would strand them permanently.
+func TestPostgresChatStateConcludesOnlyWhenNothingIsLeft(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		id       string
+		statuses []string
+		want     string
+	}{
+		{"state-all-failed", []string{"failed", "failed"}, ChatStatusFailed},
+		{"state-mixed", []string{"completed", "failed"}, ChatStatusPartial},
+		{"state-all-waiting", []string{"waiting", "waiting"}, ChatStatusDownloading},
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, testCase := range cases {
+		if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES (?,'tg://chat','channel',?,1,'test','account','downloading','completed',?,?)`, testCase.id, "channel:"+testCase.id, now, now); err != nil {
+			t.Fatal(err)
+		}
+		for index, status := range testCase.statuses {
+			if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, status, discovered_at) VALUES (?,?,?,'channel',1,?,?)`, testCase.id, "channel:"+testCase.id, index+1, status, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	m.refreshChatStates()
+
+	for _, testCase := range cases {
+		var got string
+		if err := db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = ?`, testCase.id).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != testCase.want {
+			t.Fatalf("%s with items %v: got status %q, want %q", testCase.id, testCase.statuses, got, testCase.want)
+		}
+	}
+}
+
+// Giving up on a listener event used to be permanent: the claim query only ever
+// reads 'pending' rows, so a 'failed' row was unreachable forever and the
+// message it carried was silently dropped. Being told about the same message
+// again reopens it, the way a repeated reaction reopens its own inbox row.
+func TestPostgresChatInboxReopensFailedEventOnRedelivery(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), chatEventWake: make(chan struct{}, 1),
+		chatWatched: make(map[string]map[string]struct{})}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	m.updateDatabaseHealth()
+
+	peer := &tg.InputPeerChannel{ChannelID: 77, AccessHash: 88}
+	_, key, _ := dialogIdentity(peer, "account")
+	// The message is a watched dialog, so admission reaches the insert.
+	m.chatWatched["account"] = map[string]struct{}{key: {}}
+	m.listenerSnapshotReady = true
+	event := telegram.NewMessageEvent{AccountID: "account", DialogID: 77, MessageID: 500, InputPeer: peer}
+
+	if err := m.admitChatMessage(event); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE chat_message_inbox SET status = 'failed', attempts = 5, error = 'boom' WHERE message_id = 500`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.admitChatMessage(event); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var attempts int
+	if err := db.QueryRow(`SELECT status, attempts FROM chat_message_inbox WHERE message_id = 500`).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || attempts != 0 {
+		t.Fatalf("a redelivered message must reopen its failed event, got status=%q attempts=%d", status, attempts)
+	}
+
+	// A finished event must not be resurrected by a duplicate delivery.
+	if _, err := db.Exec(`UPDATE chat_message_inbox SET status = 'done' WHERE message_id = 500`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.admitChatMessage(event); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM chat_message_inbox WHERE message_id = 500`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "done" {
+		t.Fatalf("a completed event must stay completed, got %q", status)
+	}
+}
+
+// nextQueued only selects a queued job that still has a queued item, so a job
+// left queued with every item already terminal is never claimed again: it sits
+// at "排队中" forever with nothing to do. Interrupted-task recovery produces
+// exactly that shape, because it only settles a job whose items all completed.
+func TestPostgresSettleQueuedJobsWithoutPendingWork(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), downloadDir: t.TempDir()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		id       string
+		statuses []string
+		want     string
+	}{
+		{"stranded-failed", []string{"failed", "failed"}, "failed"},
+		{"stranded-partial", []string{"completed", "failed"}, "partial"},
+		// Waiting is work in progress owned by the claim reconciler, and a queued
+		// item means the scheduler will pick the job up by itself.
+		{"stranded-waiting", []string{"waiting"}, "queued"},
+		{"stranded-queued", []string{"queued"}, "queued"},
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, testCase := range cases {
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES (?,'tg://message','channel',?,'test','account','queued',?,?)`, testCase.id, "channel:"+testCase.id, now, now); err != nil {
+			t.Fatal(err)
+		}
+		for index, status := range testCase.statuses {
+			if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES (?,'channel',?,1,?,?,?)`, testCase.id, "channel:"+testCase.id, index+1, "file.bin", status); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Drive the repair loop rather than the helper, so a stranded job is only
+	// settled if the reconciler actually reaches it.
+	m.updateDatabaseHealth()
+	if !m.DatabaseAvailable() {
+		t.Fatal("the repair loop skips its passes while the database is not connected")
+	}
+	// Run the real loop and wait for the observable effect instead of stopping
+	// it up front: the drain pass promotes the waiting case, and a cancelled
+	// context makes the loop return from inside that drain before it ever
+	// reaches the settle pass.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		m.reconcileWorker(ctx)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var settled string
+		if err := db.QueryRow(`SELECT status FROM download_jobs WHERE id = 'stranded-failed'`).Scan(&settled); err == nil && settled != "queued" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the repair loop never settled a queued job with nothing pending")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-stopped
+
+	for _, testCase := range cases {
+		var got string
+		if err := db.QueryRow(`SELECT status FROM download_jobs WHERE id = ?`, testCase.id).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != testCase.want {
+			t.Fatalf("%s with items %v: got status %q, want %q", testCase.id, testCase.statuses, got, testCase.want)
+		}
 	}
 }
 

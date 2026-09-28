@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -70,6 +71,47 @@ func TestDiscussionRootIndexesFallsBackFromLastMessage(t *testing.T) {
 	indexes := discussionRootIndexes(messages, "channel:10", 0)
 	if len(indexes) == 0 || indexes[0] != 1 {
 		t.Fatalf("last returned message must be fallback root, got %v", indexes)
+	}
+}
+
+// A channel post that declares neither comments nor a linked discussion has
+// nothing under it to read, and Telegram states both facts on the post itself.
+// The nil client is the assertion: reaching the network would fault, so a clean
+// return is proof that no request was issued. The listener path opts out of
+// this shortcut and still resolves the thread, which is why learnRoot exists.
+func TestRelatedSourcesSkipsPostThatDeclaresNoComments(t *testing.T) {
+	post := &tg.Message{ID: 100}
+	peer := &tg.InputPeerChannel{ChannelID: 5, AccessHash: 7}
+	items, err := relatedSources(&Manager{}, context.Background(), nil, "acct", peer, "频道", []*tg.Message{post}, 100, 100, false)
+	if err != nil {
+		t.Fatalf("a post with no comment section must resolve without an error: %v", err)
+	}
+	if items != nil {
+		t.Fatalf("a post with no comment section must yield no items: %#v", items)
+	}
+}
+
+// The shortcut above must not swallow a post that declares a linked discussion,
+// even while it has no comments yet: that group is where the first comment will
+// land. It also must not swallow a post that declares a comment count, since
+// that is exactly the inconsistent case the caller reports.
+func TestShouldReadDiscussionOnlySkipsSilentPosts(t *testing.T) {
+	cases := []struct {
+		name        string
+		expectation discussionExpectation
+		learnRoot   bool
+		want        bool
+	}{
+		{"post with no comment section", discussionExpectation{}, false, false},
+		{"post with no comment section, listener", discussionExpectation{}, true, true},
+		{"post with a linked discussion and no comments yet", discussionExpectation{dialogID: 77}, false, true},
+		{"post declaring comments", discussionExpectation{replyCount: 3}, false, true},
+		{"post declaring both", discussionExpectation{dialogID: 77, replyCount: 3}, false, true},
+	}
+	for _, testCase := range cases {
+		if got := shouldReadDiscussion(testCase.expectation, testCase.learnRoot); got != testCase.want {
+			t.Fatalf("%s: got %v, want %v", testCase.name, got, testCase.want)
+		}
 	}
 }
 

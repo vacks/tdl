@@ -1344,6 +1344,50 @@ func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner boo
 	_ = m.setJob(jobID, "failed", "没有可继续下载的文件，请查看各文件的失败原因")
 }
 
+// settleQueuedJobsWithoutPendingWork repairs a task the scheduler can never
+// pick up again. nextQueued only selects a queued job that still has a queued
+// item, so a job left queued with every item already terminal waits at
+// "排队中" forever with nothing to do and no way for the user to tell that it is
+// finished. Interrupted-task recovery causes exactly this: it settles a job
+// whose items are all completed, but a job interrupted after its last item
+// failed is reset to queued with nothing queued behind it.
+//
+// Jobs with waiting items are excluded because reconcileMessageClaims owns
+// them: a waiting item is work, not a terminal outcome, and settling the parent
+// here would fight that pass.
+func (m *Manager) settleQueuedJobsWithoutPendingWork() error {
+	rows, err := m.db.Query(`SELECT j.id FROM download_jobs j
+WHERE j.status = 'queued' AND j.parent_chat_id = ''
+  AND EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = j.id)
+  AND NOT EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = j.id AND i.status IN ('queued', 'waiting'))
+LIMIT ?`, reconcileBatchSize)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, reconcileBatchSize)
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			_ = rows.Close()
+			return scanErr
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	// finishTaskWithoutPendingWork owns the decision, so a stranded task ends up
+	// in exactly the state the normal path would have written.
+	for _, id := range ids {
+		m.finishTaskWithoutPendingWork(id, false)
+	}
+	return nil
+}
+
 func (m *Manager) run(job Job, sources []source) {
 	claim, err := m.db.Exec(`UPDATE download_jobs SET status = 'running', attempts = attempts + 1, error = '', updated_at = ? WHERE id = ? AND status = 'queued'`, time.Now().UTC().Format(time.RFC3339), job.ID)
 	if err != nil {
@@ -2006,6 +2050,12 @@ func (m *Manager) reconcileWorker(ctx context.Context) {
 				case <-time.After(reconcileDrainPause):
 				}
 			}
+			// Claim promotion only covers jobs that still have waiting items.
+			// A job stranded with nothing queued and nothing waiting has no
+			// other pass that will ever look at it.
+			if err := m.settleQueuedJobsWithoutPendingWork(); err != nil {
+				applog.Error("download", "queued_job_settle_failed", "error", err.Error())
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -2291,7 +2341,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 		result = setOrigin(result, peer.VisibleName(), originID, false)
 		result = setSourcePeer(result, peer.InputPeer())
 		if m.settings.Get().Download.IncludeReplies {
-			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID)
+			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID, false)
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					return relatedErr
@@ -2307,13 +2357,16 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 }
 
 func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string) ([]source, error) {
-	return m.resolvePeerWithReplies(ctx, accountID, inputPeer, dialogID, messageID, dialogName, m.settings.Get().Download.IncludeReplies)
+	return m.resolvePeerWithReplies(ctx, accountID, inputPeer, dialogID, messageID, dialogName, m.settings.Get().Download.IncludeReplies, false)
 }
 
 // resolvePeerWithReplies is the shared listener/reaction resolver. Chat
 // download tasks pass their persisted configuration snapshot so later global
 // setting changes cannot alter an already-created task.
-func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies bool) ([]source, error) {
+//
+// learnRoot is set only by the listener path, which resolves a new post even
+// with an empty comment section in order to record its discussion root.
+func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
@@ -2365,7 +2418,7 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		result = setOrigin(result, dialogName, originID, false)
 		result = setSourcePeer(result, inputPeer)
 		if includeReplies {
-			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID)
+			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID, learnRoot)
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					return relatedErr

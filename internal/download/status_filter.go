@@ -16,8 +16,13 @@ func NormalizeTaskStatusFilter(value string) (string, error) {
 		return "", nil
 	case "排队中", "queued":
 		return "queued", nil
-	case "等待中", "waiting":
-		return "waiting", nil
+	// "等待中" is deliberately absent. It used to map to download_jobs.status =
+	// 'waiting', which nothing ever writes: a task waits when the files it wants
+	// are held by another active task, and that is a property of its items, not
+	// of the parent row. The filter could therefore only ever return an empty
+	// page. It is rejected rather than silently treated as "all" so a caller
+	// still sending it is told the filter no longer exists. Per-file "等待中"
+	// remains, and is rendered from the item's own status.
 	case "下载中", "running":
 		return "running", nil
 	case "已暂停", "暂停", "paused":
@@ -35,10 +40,12 @@ func NormalizeTaskStatusFilter(value string) (string, error) {
 	}
 }
 
+// TaskStatusFilterLabel names a task filter for display. It covers only the
+// values NormalizeTaskStatusFilter can return, so "waiting" is absent here for
+// the same reason it is absent there.
 func TaskStatusFilterLabel(status string) string {
 	return map[string]string{
 		"queued":    "排队中",
-		"waiting":   "等待中",
 		"running":   "下载中",
 		"paused":    "已暂停",
 		"completed": "已完成",

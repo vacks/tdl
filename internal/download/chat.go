@@ -883,20 +883,44 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		filtered = append(filtered, item)
 	}
 	batch = filtered
+	// Claiming a file and confirming this task may still run share one critical
+	// section with pause and cancel, and the section deliberately spans the claim
+	// loop rather than starting after it.
+	//
+	// A control action releases every claim the task holds. A claim taken after
+	// that release belongs to a task that will transfer nothing, and nothing else
+	// ever releases it: pause and cancel release only what exists when they run,
+	// and the claim is not failed, cancelled or deleted, so the repair paths that
+	// look for those states skip it. Every other task wanting that media then
+	// waits behind it indefinitely. Checking the state before claiming cannot
+	// close this, because the release can land between the check and the claim;
+	// holding the lock across both is what makes the pair atomic.
+	//
+	// The lock is per chat, so this only delays that task's own control actions
+	// and publishes, and a bounded batch is a short hold.
+	lock := m.chatLock(id)
+	lock.Lock()
+	if !chatRunnable(m.chatStatus(id)) {
+		lock.Unlock()
+		return false, nil
+	}
 	transfer = make([]source, 0, len(batch))
 	for _, item := range batch {
 		claim, path, err := m.claimChatMedia(id, item)
 		if err != nil {
+			lock.Unlock()
 			return false, err
 		}
 		switch claim {
 		case "completed":
 			if err := m.setChatItem(id, item, "completed", path, ""); err != nil {
+				lock.Unlock()
 				return false, err
 			}
 			adopted++
 		case "waiting":
 			if _, err := m.db.Exec(`UPDATE chat_download_items SET status = 'waiting', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
+				lock.Unlock()
 				return false, err
 			}
 		default:
@@ -905,23 +929,19 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	}
 	batch = transfer
 	if len(batch) == 0 {
+		lock.Unlock()
 		return false, nil
 	}
 	for _, item := range batch {
 		if _, err := m.db.Exec(`UPDATE chat_download_items SET attempts = attempts + 1, error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
+			lock.Unlock()
 			return false, err
 		}
 	}
-	// Register this transfer while holding the same lock as pause/cancel. This
-	// closes the small window where a control action could finish before this
-	// batch had published its cancel function, leaving a newly-started upstream
-	// transfer outside that action's reach.
-	lock := m.chatLock(id)
-	lock.Lock()
-	if !chatRunnable(m.chatStatus(id)) {
-		lock.Unlock()
-		return false, nil
-	}
+	// Register this transfer while still holding the same lock as pause/cancel.
+	// This closes the remaining window where a control action could finish before
+	// this batch had published its cancel function, leaving a newly-started
+	// upstream transfer outside that action's reach.
 	ctx, release := m.beginChatExecution(id)
 	lock.Unlock()
 	defer func() { release(); m.progress.ClearJob(id) }()
@@ -1640,7 +1660,10 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			includeReplies = false
 		}
 		if _, done := resolved[includeReplies]; !done && resolvedErr[includeReplies] == nil {
-			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies)
+			// A listener learns the discussion root of a newly received post
+			// even when it has no comments yet, so the first comment can be
+			// attributed without a second lookup.
+			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies, true)
 		}
 		if resolveErr := resolvedErr[includeReplies]; resolveErr != nil {
 			applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", resolveErr.Error())
@@ -1981,7 +2004,7 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 				}
 			}
 			originID := firstMessageID(members, message.ID)
-			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.inputPeer(), target.DialogName, members, message.ID, originID)
+			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.inputPeer(), target.DialogName, members, message.ID, originID, false)
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					// A rate-limited reply lookup must retry this durable history
@@ -2153,9 +2176,16 @@ func (m *Manager) refreshChatStates() {
 	// its parent back to downloading in registerChatMedia.
 	// Query one compact cached summary per active parent. Its trigger-maintained
 	// counters cover all single-item and batch state transitions atomically.
+	// waiting items count as work in progress. They are files this task wants
+	// that another task is holding, and they become downloadable on their own
+	// once that claim is released, so a task whose whole queue is waiting has not
+	// finished — without them here it would be concluded as completed, and the
+	// promotion pass only ever looks at a task that can still run, so its waiting
+	// files would never come back. The message side keeps such a task queued for
+	// the same reason.
 	rows, err := m.db.Query(`SELECT j.id, j.listen_new, j.status,
-	COALESCE(s.queued, 0) + COALESCE(s.running, 0) + COALESCE(s.downloaded, 0),
-	COALESCE(s.failed, 0), COALESCE(s.queued, 0)
+	COALESCE(s.queued, 0) + COALESCE(s.running, 0) + COALESCE(s.downloaded, 0) + COALESCE(s.waiting, 0),
+	COALESCE(s.failed, 0), COALESCE(s.queued, 0), COALESCE(s.completed, 0)
 FROM chat_download_jobs j LEFT JOIN chat_download_stats s ON s.chat_job_id = j.id
 WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanCompleted)
 	if err != nil {
@@ -2165,8 +2195,8 @@ WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanComplet
 	for rows.Next() {
 		var id, status string
 		var listen int
-		var active, failed, pending int
-		if err := rows.Scan(&id, &listen, &status, &active, &failed, &pending); err != nil {
+		var active, failed, pending, completed int
+		if err := rows.Scan(&id, &listen, &status, &active, &failed, &pending, &completed); err != nil {
 			continue
 		}
 		next := ChatStatusCompleted
@@ -2175,7 +2205,15 @@ WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanComplet
 		} else if listen != 0 {
 			next = ChatStatusListening
 		} else if failed > 0 {
+			// "Partial" claims some of the task succeeded, so it is only right
+			// when at least one file actually published. A task whose files all
+			// failed has nothing to be partial about, and reporting it as partly
+			// done hides that every file needs attention. This matches what a
+			// message task reports for the same outcome.
 			next = ChatStatusPartial
+			if completed == 0 {
+				next = ChatStatusFailed
+			}
 		}
 		if next != status {
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id)
@@ -2184,6 +2222,9 @@ WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanComplet
 		}
 		if next == ChatStatusListening && failed > 0 {
 			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("历史下载有 %d 个文件失败，可重新开始失败项", failed), id)
+		}
+		if next == ChatStatusFailed && failed > 0 {
+			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("全部 %d 个文件均下载失败，请查看各文件的失败原因", failed), id)
 		}
 		if pending > 0 {
 			// This runs inside chatWorker, so it must wake only the transfer

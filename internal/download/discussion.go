@@ -41,7 +41,12 @@ func firstMessageID(messages []*tg.Message, fallback int) int {
 // A missing discussion is expected and returns no items. Transport/permission
 // failures are deliberately returned to the caller, which may retain original
 // media and surface a non-fatal warning.
-func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, originName string, originMessages []*tg.Message, rootMessageID, originMessageID int) ([]source, error) {
+//
+// learnRoot keeps the eager lookup for the listener path, which resolves a
+// newly received post even when its comment section is empty so a comment
+// arriving later can be attributed without a second lookup. Every other caller
+// spends a request only when the post says there is something to read.
+func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, originName string, originMessages []*tg.Message, rootMessageID, originMessageID int, learnRoot bool) ([]source, error) {
 	if len(originMessages) == 0 || originPeer == nil || rootMessageID <= 0 || originMessageID <= 0 {
 		return nil, nil
 	}
@@ -51,6 +56,9 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 	expectation := discussionExpectation{}
 	if _, channel := originPeer.(*tg.InputPeerChannel); channel {
 		expectation = channelDiscussionExpectation(originMessages)
+		if !shouldReadDiscussion(expectation, learnRoot) {
+			return nil, nil
+		}
 		resolvedPeer, resolvedRoot, found, err := discussionThread(m, ctx, api, accountID, originPeer, rootMessageID, expectation.dialogID)
 		if err != nil {
 			return nil, err
@@ -203,6 +211,20 @@ func channelDiscussionExpectation(messages []*tg.Message) discussionExpectation 
 		}
 	}
 	return result
+}
+
+// shouldReadDiscussion reports whether a channel post is worth a
+// messages.getDiscussionMessage request. Telegram puts both facts on the post
+// itself, so a post that declares no comments and names no linked discussion
+// has nothing under it and can be answered without a request. The history
+// scanner already decides this from the same metadata, which is what makes the
+// shortcut safe here.
+//
+// learnRoot overrides it for the listener path, which resolves a newly received
+// post even when its comment section is empty so that a comment arriving later
+// can be attributed without a second lookup.
+func shouldReadDiscussion(expectation discussionExpectation, learnRoot bool) bool {
+	return learnRoot || expectation.replyCount > 0 || expectation.dialogID != 0
 }
 
 func replyPageNextOffset(page []tg.MessageClass, previous int) int {

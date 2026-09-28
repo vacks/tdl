@@ -88,7 +88,7 @@ func (m *Manager) admitChatMessage(event telegram.NewMessageEvent) error {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := m.db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, dialog_name, dialog_id, message_id, reply_to_message_id, reply_to_top_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account_id, dialog_key, message_id) DO NOTHING`, event.AccountID, key, event.DialogName, event.DialogID, event.MessageID, event.ReplyToMessageID, event.ReplyToTopID, direct.kind, direct.id, direct.hash, now, now, now)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account_id, dialog_key, message_id) DO UPDATE SET status = 'pending', attempts = 0, error = '', next_attempt_at = EXCLUDED.next_attempt_at, updated_at = EXCLUDED.updated_at WHERE chat_message_inbox.status = 'failed'`, event.AccountID, key, event.DialogName, event.DialogID, event.MessageID, event.ReplyToMessageID, event.ReplyToTopID, direct.kind, direct.id, direct.hash, now, now, now)
 	if err != nil {
 		return err
 	}
@@ -223,6 +223,12 @@ func (m *Manager) completeChatMessageInbox(id int64) error {
 	return err
 }
 
+// retryChatMessageInbox backs an event off after a failure and gives up after
+// five attempts. Giving up is not a permanent loss: the claim query only ever
+// reads 'pending' rows, so the terminal state has to have a way back in. Being
+// told about the same message again is that way in — see the conflict clause in
+// the insert above, which reopens a failed row and starts a fresh attempt set.
+// The reaction inbox has the same rule for the same reason.
 func (m *Manager) retryChatMessageInbox(id int64, attempts int, cause error) error {
 	status := "pending"
 	if attempts >= 5 {
