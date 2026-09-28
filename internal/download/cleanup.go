@@ -16,7 +16,6 @@ type CleanupResult struct {
 	Jobs           int64 `json:"jobs"`
 	ChatJobs       int64 `json:"chatJobs"`
 	Requests       int64 `json:"requests"`
-	Events         int64 `json:"events"`
 	ReactionEvents int64 `json:"reactionEvents"`
 	ChatMessages   int64 `json:"chatMessages"`
 	Resets         int64 `json:"resets"`
@@ -33,7 +32,7 @@ func (m *Manager) cleanupLoop(ctx context.Context) {
 			applog.Error("cleanup", "scheduled_cleanup_failed", "error", err.Error())
 			return
 		}
-		applog.Info("cleanup", "scheduled_cleanup_completed", "retention_days", auxiliaryHistoryRetentionDays, "events", result.Events, "chat_messages", result.ChatMessages)
+		applog.Info("cleanup", "scheduled_cleanup_completed", "retention_days", auxiliaryHistoryRetentionDays, "chat_messages", result.ChatMessages)
 	}
 	run()
 	ticker := time.NewTicker(24 * time.Hour)
@@ -51,16 +50,6 @@ func (m *Manager) cleanupLoop(ctx context.Context) {
 func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339Nano)
 	result := CleanupResult{}
-	for {
-		count, err := m.cleanupPostgresBatch(`DELETE FROM download_events WHERE id IN (SELECT id FROM download_events WHERE created_at < ? ORDER BY id LIMIT ?)`, cutoff)
-		if err != nil {
-			return CleanupResult{}, err
-		}
-		result.Events += count
-		if count == 0 {
-			break
-		}
-	}
 	for {
 		count, err := m.cleanupPostgresBatch(`DELETE FROM download_requests WHERE id IN (SELECT id FROM download_requests WHERE created_at < ? ORDER BY id LIMIT ?)`, cutoff)
 		if err != nil {
@@ -111,7 +100,7 @@ func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, erro
 			break
 		}
 	}
-	if result.Events > 0 || result.Requests > 0 || result.ReactionEvents > 0 || result.ChatMessages > 0 || result.Resets > 0 || result.BotMessages > 0 {
+	if result.Requests > 0 || result.ReactionEvents > 0 || result.ChatMessages > 0 || result.Resets > 0 || result.BotMessages > 0 {
 		m.touch()
 	}
 	return result, nil

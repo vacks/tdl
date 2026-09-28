@@ -115,6 +115,61 @@ func TestShouldReadDiscussionOnlySkipsSilentPosts(t *testing.T) {
 	}
 }
 
+// The gap walk re-reads history from the newest message backwards until it
+// meets the watermark. Only the page that meets it licenses advancing that
+// watermark: a page entirely above it means the walk has not finished, and an
+// interrupted walk that had already advanced would stop on its first page next
+// time and never reach the stretch it exists to recover.
+func TestGapBatchOnlyReturnsMessagesAboveTheWatermark(t *testing.T) {
+	page := func(ids ...int) []tg.MessageClass {
+		result := make([]tg.MessageClass, 0, len(ids))
+		for _, id := range ids {
+			result = append(result, &tg.Message{ID: id})
+		}
+		return result
+	}
+
+	above, oldest, reached := gapBatch(page(120, 115, 110), 100)
+	if len(above) != 3 || oldest != 110 || reached {
+		t.Fatalf("a page entirely above the watermark must not license advancing it: above=%d oldest=%d reached=%v", len(above), oldest, reached)
+	}
+
+	// The page that reaches the watermark still carries the messages just above
+	// it, so those must be returned even though the walk stops here.
+	above, oldest, reached = gapBatch(page(105, 100, 95), 100)
+	if len(above) != 1 || above[0].ID != 105 || oldest != 95 || !reached {
+		t.Fatalf("the straddling page must still yield what is above the watermark: above=%v oldest=%d reached=%v", above, oldest, reached)
+	}
+
+	// Running out of history means the watermark was passed.
+	if above, _, reached = gapBatch(nil, 100); len(above) != 0 || !reached {
+		t.Fatalf("an exhausted history must license advancing the watermark: above=%d reached=%v", len(above), reached)
+	}
+}
+
+// Every listened channel owes a gap walk, not just Saved Messages. A task that
+// does not listen, or has not finished indexing, has no settled watermark to
+// walk back to.
+func TestListensForNewMediaCoversChannelsNotOnlySaved(t *testing.T) {
+	cases := []struct {
+		name string
+		job  ChatJob
+		want bool
+	}{
+		{"listened channel", ChatJob{DialogType: "channel", ListenNew: true, ScanState: chatScanCompleted, Status: ChatStatusListening}, true},
+		{"listened channel still downloading history", ChatJob{DialogType: "channel", ListenNew: true, ScanState: chatScanCompleted, Status: ChatStatusDownloading}, true},
+		{"saved listener", ChatJob{DialogType: "self", ListenNew: true, ScanState: chatScanCompleted, Status: ChatStatusListening}, true},
+		{"not listening", ChatJob{DialogType: "channel", ListenNew: false, ScanState: chatScanCompleted, Status: ChatStatusDownloading}, false},
+		{"still scanning", ChatJob{DialogType: "channel", ListenNew: true, ScanState: chatScanIndexing, Status: ChatStatusScanning}, false},
+		{"finished task", ChatJob{DialogType: "channel", ListenNew: true, ScanState: chatScanCompleted, Status: ChatStatusCompleted}, false},
+	}
+	for _, testCase := range cases {
+		if got := listensForNewMedia(testCase.job); got != testCase.want {
+			t.Fatalf("%s: got %v, want %v", testCase.name, got, testCase.want)
+		}
+	}
+}
+
 func TestNoDiscussionErrorsAreNonFatal(t *testing.T) {
 	if !isNoDiscussionError(assertError("rpc error: MSG_ID_INVALID")) {
 		t.Fatal("expected missing discussion error")

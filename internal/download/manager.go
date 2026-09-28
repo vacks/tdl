@@ -75,6 +75,10 @@ const (
 	// filteredCountTTL bounds how stale a status-filtered task total may be. It
 	// only affects a displayed number, never pagination.
 	filteredCountTTL = 5 * time.Second
+	// summaryCacheTTL bounds how stale the dashboard's seven day failure count
+	// can become on an installation where nothing is happening. The active
+	// count is revision gated and needs no expiry.
+	summaryCacheTTL = time.Minute
 	// queuedCandidateWindow bounds how far the scheduler looks ahead for a task
 	// whose account is not inside a Telegram cooldown. A handful of rows is
 	// enough to step over a blocked account without scanning permanent history.
@@ -342,6 +346,14 @@ type Manager struct {
 	// Lazily initialized so a zero-value Manager stays usable.
 	filteredCountsMu sync.Mutex
 	filteredCounts   map[string]filteredJobCount
+	// summaryMu guards the memoized dashboard figures, which the Web UI asks for
+	// every three seconds.
+	summaryMu       sync.Mutex
+	summaryValid    bool
+	summaryRevision uint64
+	summaryExpires  time.Time
+	summaryActive   int
+	summaryFailed   int
 	// stopCh is closed once by Stop so the worker loops can exit. A nil channel
 	// (a Manager built without New, as tests do) never fires in a select, so the
 	// loops stay correct without a nil guard.
@@ -951,20 +963,37 @@ func decodeJobCursor(cursor string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+// Summary reports the dashboard's two figures. Do not aggregate permanent
+// completed history here: at multi-million scale that would force repeated
+// scans. A chat task owns an indexed file queue rather than child jobs, so
+// include both queue types or the dashboard would incorrectly show zero while a
+// session download is active.
+//
+// The dashboard polls every three seconds, so both figures are answered from
+// one statement and then memoized. The revision gate covers the active count,
+// which only moves when something was written; the expiry covers the failure
+// count, whose seven day window keeps moving even while nothing happens, so a
+// quiet installation still lets old failures age out instead of pinning the
+// figure at whatever it was when the last task ran.
 func (m *Manager) Summary() (active, failedItems int) {
-	// Dashboard refreshes frequently. Do not aggregate permanent completed
-	// history here: at multi-million scale that would force repeated scans. A
-	// chat task owns an indexed file queue rather than child jobs, so include
-	// both queue types or the dashboard would incorrectly show zero while a
-	// session download is active.
+	revision := m.Revision()
+	now := time.Now()
+	m.summaryMu.Lock()
+	defer m.summaryMu.Unlock()
+	if m.summaryValid && now.Before(m.summaryExpires) && m.summaryRevision == revision {
+		return m.summaryActive, m.summaryFailed
+	}
+	sevenDaysAgo := now.UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
 	_ = m.db.QueryRow(`SELECT
  (SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')) +
- (SELECT COALESCE(SUM(queued + waiting + running + downloaded + paused), 0) FROM chat_download_stats)`).Scan(&active)
-	sevenDaysAgo := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
-	_ = m.db.QueryRow(`SELECT
+ (SELECT COALESCE(SUM(queued + waiting + running + downloaded + paused), 0) FROM chat_download_stats),
  (SELECT COUNT(1) FROM download_items WHERE status = 'failed' AND finished_at >= ?) +
- (SELECT COUNT(1) FROM chat_download_items WHERE status = 'failed' AND finished_at >= ?)`, sevenDaysAgo, sevenDaysAgo).Scan(&failedItems)
-	return
+ (SELECT COUNT(1) FROM chat_download_items WHERE status = 'failed' AND finished_at >= ?)`, sevenDaysAgo, sevenDaysAgo).Scan(&active, &failedItems)
+	m.summaryValid = true
+	m.summaryRevision = revision
+	m.summaryExpires = now.Add(summaryCacheTTL)
+	m.summaryActive, m.summaryFailed = active, failedItems
+	return active, failedItems
 }
 
 // ActiveAccountJobs reports every non-terminal message or chat task that would
@@ -2763,15 +2792,23 @@ func (m *Manager) setItem(item source, status, path, message string) error {
 	if status == "completed" || status == "failed" || status == "cancelled" {
 		finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	if _, err := m.db.Exec(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ?`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID); err != nil {
+	// One statement carries the change, names the owning task and the status
+	// that goes with it. The ownership row below needs that task id, which used
+	// to cost a second query on the completion path alone.
+	var jobID string
+	err := m.db.QueryRow(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ? RETURNING job_id`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		applog.Error("download", "item_state_save_failed", "dialog_key", item.DialogKey, "message_id", item.MessageID, "status", status, "error", err.Error())
 		return err
 	}
 	m.touch()
-	m.emitItemChanged(item.Item)
+	if jobID != "" {
+		m.emit(jobID, "", "item_status_changed", status)
+	}
 	if status == "completed" && path != "" {
-		var jobID string
-		_ = m.db.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&jobID)
 		_, _ = m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'message', ?, ?) ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`, item.DialogKey, item.MessageID, path, jobID, time.Now().UTC().Format(time.RFC3339Nano))
 	}
 	return nil
@@ -2780,36 +2817,44 @@ func (m *Manager) beginItemAttempt(item source) error {
 	// A task may be running while this particular file is still waiting for an
 	// upstream worker slot. It becomes "running" only on its first byte-level
 	// progress callback.
-	return m.execItemState("item_attempt_save_failed", item.Item, `UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID)
+	return m.execItemState("item_attempt_save_failed", item.Item, "queued", `UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID)
 }
 func (m *Manager) pauseItem(item source) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	query := m.pauseItemsSQL()
 	query = strings.Replace(query, "WHERE job_id = ? AND status IN ('queued', 'waiting', 'running', 'downloaded')", "WHERE dialog_key = ? AND message_id = ? AND status IN ('queued', 'waiting', 'running')", 1)
-	m.execItemState("item_pause_save_failed", item.Item, query, now, item.DialogKey, item.MessageID)
+	m.execItemState("item_pause_save_failed", item.Item, "paused", query, now, item.DialogKey, item.MessageID)
 }
 func (m *Manager) markItemStarted(item source) error {
-	return m.execItemState("item_start_save_failed", item.Item, `UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
+	return m.execItemState("item_start_save_failed", item.Item, "running", `UPDATE download_items SET status = 'running', started_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'queued' AND started_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
 }
 func (m *Manager) markItemFinished(item source) error {
-	return m.execItemState("item_finish_save_failed", item.Item, `UPDATE download_items SET status = 'downloaded', finished_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'running' AND started_at != '' AND finished_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
+	return m.execItemState("item_finish_save_failed", item.Item, "downloaded", `UPDATE download_items SET status = 'downloaded', finished_at = ? WHERE dialog_key = ? AND message_id = ? AND status = 'running' AND started_at != '' AND finished_at = ''`, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID)
 }
 
-func (m *Manager) execItemState(event string, item Item, query string, args ...any) error {
-	if _, err := m.db.Exec(query, args...); err != nil {
+// execItemState applies one item state change and reports it in a single round
+// trip. RETURNING hands back the owning task, so the change does not need a
+// follow-up query to discover what it belongs to, and the caller passes the
+// status it just wrote rather than reading it back. Without both, every state
+// change cost an extra statement, and a task moves each file through several.
+//
+// A statement that matches no row is not an error: it is the ordinary case of
+// a state that already changed, which the old Exec reported the same way.
+func (m *Manager) execItemState(event string, item Item, status, query string, args ...any) error {
+	var jobID string
+	err := m.db.QueryRow(query+" RETURNING job_id", args...).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		applog.Error("download", event, "error", err.Error())
 		return err
 	}
 	m.touch()
-	m.emitItemChanged(item)
-	return nil
-}
-
-func (m *Manager) emitItemChanged(item Item) {
-	var jobID, status string
-	if err := m.db.QueryRow(`SELECT job_id, status FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&jobID, &status); err == nil && jobID != "" {
+	if jobID != "" {
 		m.emit(jobID, "", "item_status_changed", status)
 	}
+	return nil
 }
 func (m *Manager) fail(id string, sources []source, err error) {
 	for _, item := range sources {

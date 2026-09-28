@@ -27,9 +27,6 @@ func (m *Manager) migratePostgres() error {
 		`CREATE TABLE IF NOT EXISTS download_requests (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source_kind TEXT NOT NULL, account_id TEXT NOT NULL, source_url TEXT NOT NULL DEFAULT '', dialog_key TEXT NOT NULL DEFAULT '', message_id INTEGER NOT NULL DEFAULT 0, trigger_json TEXT NOT NULL DEFAULT '{}', outcome TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES download_jobs(id)
 )`,
-		`CREATE TABLE IF NOT EXISTS download_events (
- id BIGSERIAL PRIMARY KEY, job_id TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES download_jobs(id)
-)`,
 		`CREATE TABLE IF NOT EXISTS reaction_inbox (
  id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, message_id INTEGER NOT NULL, source_url TEXT NOT NULL DEFAULT '', peer_type TEXT NOT NULL, peer_id BIGINT NOT NULL DEFAULT 0, peer_hash BIGINT NOT NULL DEFAULT 0, emoji TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(account_id, dialog_key, message_id, emoji)
 )`,
@@ -64,7 +61,7 @@ func (m *Manager) migratePostgres() error {
 )`,
 		`CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
 		`CREATE INDEX IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
-		`CREATE INDEX IF NOT EXISTS download_items_status ON download_items(status)`,
+		`CREATE INDEX IF NOT EXISTS download_items_active_status ON download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
 		`CREATE INDEX IF NOT EXISTS download_items_waiting_by_id ON download_items(id) WHERE status = 'waiting'`,
 		`CREATE INDEX IF NOT EXISTS download_items_failed_finished_at ON download_items(status, finished_at) WHERE status = 'failed'`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
@@ -74,7 +71,6 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS download_jobs_parent_created_id ON download_jobs(parent_chat_id, created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS download_requests_job_id ON download_requests(job_id)`,
 		`CREATE INDEX IF NOT EXISTS download_requests_created_id ON download_requests(created_at, id)`,
-		`CREATE INDEX IF NOT EXISTS download_events_created_id ON download_events(created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
 		`CREATE INDEX IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
 		`CREATE INDEX IF NOT EXISTS download_resets_created ON download_resets(created_at)`,
@@ -358,6 +354,46 @@ END $$`,
 			`DROP INDEX IF EXISTS chat_download_items_child_job`,
 			`DROP INDEX IF EXISTS chat_download_items_origin`,
 			`DROP INDEX IF EXISTS download_events_job_id`,
+		},
+	},
+	{
+		// v17 removes the download_events audit table. It recorded one row per
+		// task and item state transition, and nothing ever read it: both
+		// consumers subscribe to the in-memory event bus, the table was only
+		// inserted into and trimmed by age, and no query in the repository ever
+		// selected from it. On a task table holding tens of millions of rows
+		// that was a write and an index entry per transition for no reader.
+		//
+		// This drops whatever history has accumulated with it. That is
+		// deliberate and was confirmed: there is no reader to lose it from, and
+		// leaving the table behind would keep the rows with nothing left to
+		// prune them.
+		version: 17,
+		statements: []string{
+			`DROP TABLE IF EXISTS download_events`,
+		},
+	},
+	{
+		// v18 narrows the message item status index to the statuses that are
+		// still in flight.
+		//
+		// The dashboard counts active items every three seconds, and interruption
+		// recovery updates them, and those are the only statements that filter
+		// this table by status without also constraining job_id — every other one
+		// is served by a job_id index or by a partial index of its own (waiting
+		// by id, failed by finished_at). The full index therefore carried one
+		// entry per row, including the completed rows that are the overwhelming
+		// majority and are never looked up this way, and paid for them on every
+		// insert.
+		//
+		// Measured on half a million rows: the active count drops from 12.6ms to
+		// 6.9ms, and both statements keep an index-only scan. The replacement is
+		// created before the old index is dropped so no query is ever left
+		// without one.
+		version: 18,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS download_items_active_status ON download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
+			`DROP INDEX IF EXISTS download_items_status`,
 		},
 	},
 }

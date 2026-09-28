@@ -3,13 +3,12 @@ package download
 import (
 	"sync"
 	"time"
-
-	"github.com/vacks/tdl/internal/applog"
 )
 
-// Event is a lightweight domain notification. Persistent history lives in
-// download_events; subscribers are best-effort and always reload canonical
-// task state from PostgreSQL when necessary.
+// Event is a lightweight domain notification. Delivery is best-effort and
+// in-memory only: subscribers reload canonical task state from PostgreSQL when
+// they need it, so an event that is missed or dropped costs a refresh rather
+// than a lost fact.
 type Event struct {
 	ID        int64     `json:"id"`
 	JobID     string    `json:"jobId"`
@@ -61,16 +60,14 @@ func (b *eventBus) publish(event Event) {
 // observe one task-state stream without depending on worker internals.
 func (m *Manager) SubscribeEvents() (<-chan Event, func()) { return m.events.Subscribe() }
 
+// emit publishes one task-state notification to the in-memory bus.
+//
+// It deliberately writes no row. Every state transition used to append to a
+// download_events table as well, one insert per item transition, and nothing
+// ever read it: both consumers subscribe to this bus, and the table was only
+// ever inserted into and trimmed by age. On the table that holds tens of
+// millions of rows that was one write and one index entry per transition for
+// no reader.
 func (m *Manager) emit(jobID, requestID, kind, status string) {
-	now := time.Now().UTC()
-	event := Event{JobID: jobID, RequestID: requestID, Kind: kind, Status: status, CreatedAt: now}
-	_, err := m.db.Exec(`INSERT INTO download_events(job_id, request_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?)`, jobID, requestID, kind, status, now.Format(time.RFC3339Nano))
-	if err != nil {
-		// Delivery adapters need the state wake-up even if the historical audit
-		// row cannot be written. Canonical state remains in the task tables.
-		applog.Error("download", "event_record_failed", "job_id", jobID, "kind", kind, "error", err.Error())
-		m.events.publish(event)
-		return
-	}
-	m.events.publish(event)
+	m.events.publish(Event{JobID: jobID, RequestID: requestID, Kind: kind, Status: status, CreatedAt: time.Now().UTC()})
 }

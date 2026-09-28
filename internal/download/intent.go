@@ -155,7 +155,9 @@ func (m *Manager) SubmitSaved(ctx context.Context, intent SavedIntent) (ChatJob,
 		m.signalChat()
 		m.markChatListenerDirty()
 		if intent.ListenOnly {
-			go m.reconcileSavedTask(created.ID)
+			// A listener that starts after the fact still owes whatever was
+			// published between its watermark and now.
+			go m.reconcileListenerGap(created.ID)
 		}
 		applog.Info("chat_download", "saved_task_created", "chat_job_id", created.ID, "account_id", intent.AccountID, "telegram_id", intent.TelegramID, "listen_only", intent.ListenOnly)
 	}

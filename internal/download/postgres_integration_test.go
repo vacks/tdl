@@ -19,7 +19,7 @@ func clearPostgresDownloadTestData(db *database) error {
 	for _, statement := range []string{
 		`DELETE FROM chat_download_streams`, `DELETE FROM chat_download_items`, `DELETE FROM chat_download_jobs`,
 		`DELETE FROM downloaded_media`,
-		`DELETE FROM bot_lifecycle_messages`, `DELETE FROM download_requests`, `DELETE FROM download_events`,
+		`DELETE FROM bot_lifecycle_messages`, `DELETE FROM download_requests`,
 		`DELETE FROM reaction_inbox`, `DELETE FROM chat_message_inbox`, `DELETE FROM download_items`, `DELETE FROM download_jobs`,
 		// Account cooldowns are per-process state that a test seeds through the
 		// production path, so leaving them behind would leak into later tests.
@@ -1137,6 +1137,119 @@ func TestPostgresSettleQueuedJobsWithoutPendingWork(t *testing.T) {
 		if got != testCase.want {
 			t.Fatalf("%s with items %v: got status %q, want %q", testCase.id, testCase.statuses, got, testCase.want)
 		}
+	}
+}
+
+// The gap walk has to cover listened channels, not only the listen-only Saved
+// Messages form, and it must leave alone the tasks that have no settled
+// watermark or no responsibility for new media.
+func TestPostgresListenerGapCandidatesCoverChannels(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	cases := []struct {
+		id         string
+		dialogType string
+		start      int
+		listen     int
+		scanState  string
+		status     string
+		want       bool
+	}{
+		{"gap-channel", "channel", 1000, 1, chatScanCompleted, ChatStatusListening, true},
+		{"gap-channel-downloading", "channel", 1000, 1, chatScanCompleted, ChatStatusDownloading, true},
+		{"gap-saved", "self", -1, 1, chatScanCompleted, ChatStatusListening, true},
+		{"gap-channel-not-listening", "channel", 1000, 0, chatScanCompleted, ChatStatusDownloading, false},
+		{"gap-channel-scanning", "channel", 1000, 1, chatScanIndexing, ChatStatusScanning, false},
+		{"gap-channel-completed", "channel", 1000, 1, chatScanCompleted, ChatStatusCompleted, false},
+		{"gap-saved-history-form", "self", 1000, 1, chatScanCompleted, ChatStatusListening, false},
+	}
+	for _, testCase := range cases {
+		if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, listen_new, status, scan_state, created_at, updated_at) VALUES (?,?,?,?,1,'test','account',?,?,?,?,?,?)`, testCase.id, savedSourcePrefix+"account", testCase.dialogType, "channel:"+testCase.id, testCase.start, testCase.listen, testCase.status, testCase.scanState, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ids, err := m.listenerGapCandidateIDs("account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		got[id] = true
+	}
+	for _, testCase := range cases {
+		if got[testCase.id] != testCase.want {
+			t.Fatalf("%s: selected=%v, want %v (selection: %v)", testCase.id, got[testCase.id], testCase.want, ids)
+		}
+	}
+}
+
+// The dashboard figures come from one statement holding four subqueries, two
+// per figure. Column order is the whole contract there, so this pins both
+// numbers against data that reaches them from different tables, and checks that
+// the memoized answer only moves once the revision does.
+func TestPostgresSummaryCountsBothQueuesAndRecentFailures(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seedReconcileJob(t, db, "summary-job", "channel:summary", "running")
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, finished_at) VALUES ('summary-job','channel','channel:summary',1,1,'queued.bin','queued',''), ('summary-job','channel','channel:summary',1,2,'failed.bin','failed',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	// A session task contributes through its trigger-maintained counters rather
+	// than a direct count, which is the branch a column swap would break.
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('summary-chat','tg://chat','channel','channel:summary-chat',1,'test','account','downloading','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, status, discovered_at) VALUES ('summary-chat','channel:summary-chat',1,'channel',1,'queued',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+
+	active, failedItems := m.Summary()
+	if active != 2 || failedItems != 1 {
+		t.Fatalf("Summary() = (%d, %d), want (2, 1)", active, failedItems)
+	}
+
+	// A write that bypasses the manager leaves the revision alone, so the
+	// memoized figures stand.
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('summary-job','channel','channel:summary',1,3,'late.bin','queued')`); err != nil {
+		t.Fatal(err)
+	}
+	if active, failedItems = m.Summary(); active != 2 || failedItems != 1 {
+		t.Fatalf("Summary() before the revision moved = (%d, %d), want the memoized (2, 1)", active, failedItems)
+	}
+	m.touch()
+	if active, failedItems = m.Summary(); active != 3 || failedItems != 1 {
+		t.Fatalf("Summary() after the revision moved = (%d, %d), want (3, 1)", active, failedItems)
 	}
 }
 

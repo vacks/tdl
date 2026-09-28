@@ -1407,11 +1407,11 @@ func (m *Manager) runChatListener(ctx context.Context, accountID string, listene
 	err := m.accounts.ListenNewMessages(ctx, accountID, func(_ context.Context, event telegram.NewMessageEvent) {
 		m.enqueueChatMessage(event)
 	}, func() {
-		// Recover the small interval between the persisted listener watermark and
-		// the shared update connection becoming ready. This is only performed for
-		// Saved Messages; ordinary chat listeners rely on Telegram's update stream
-		// and their existing discussion recovery logic.
-		go m.reconcileSavedListeners(accountID)
+		// Recover the interval between each task's persisted listener watermark
+		// and the shared update connection becoming ready. This applies to every
+		// listened dialog: an update stream that starts after a message was
+		// published never delivers it.
+		go m.reconcileListenerGaps(accountID)
 	})
 	if err != nil && ctx.Err() == nil {
 		applog.Error("chat_download", "new_message_listener_failed", "account_id", accountID, "error", err.Error())
@@ -1423,25 +1423,66 @@ func (m *Manager) runChatListener(ctx context.Context, accountID string, listene
 	m.mu.Unlock()
 }
 
-func (m *Manager) reconcileSavedListeners(accountID string) {
-	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND listen_new = 1 AND start_message_id < 0 AND scan_state = ? AND status IN (?, ?)`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+// listensForNewMedia reports whether a task is responsible for media published
+// after the history it indexed, and is therefore the set the gap walk applies
+// to. A task still scanning has no settled watermark to walk back to, and one
+// that does not listen carries no such responsibility.
+func listensForNewMedia(job ChatJob) bool {
+	return job.ListenNew && job.ScanState == chatScanCompleted &&
+		(job.Status == ChatStatusDownloading || job.Status == ChatStatusListening)
+}
+
+// listenerGapCandidateIDs names the tasks an account's gap walk covers: every
+// listened channel, plus the listen-only Saved Messages form. A listened
+// discussion group is reached through its parent channel task, so matching on
+// dialog_type would only duplicate its work.
+func (m *Manager) listenerGapCandidateIDs(accountID string) ([]string, error) {
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) AND (dialog_type = 'channel' OR (dialog_type = 'self' AND start_message_id < 0))`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 	if err != nil {
-		return
+		return nil, err
 	}
 	defer rows.Close()
-	ids := make([]string, 0, 2)
+	ids := make([]string, 0, 4)
 	for rows.Next() {
 		var id string
 		if rows.Scan(&id) == nil {
 			ids = append(ids, id)
 		}
 	}
+	return ids, rows.Err()
+}
+
+// gapBatch reports which messages of one history page sit above the watermark,
+// the page's oldest message id, and whether the walk has reached media the task
+// already covered. reached is what licenses advancing the watermark, so a page
+// that is entirely above it must report false.
+func gapBatch(page []tg.MessageClass, boundary int) (above []*tg.Message, oldest int, reached bool) {
+	for _, raw := range page {
+		message, ok := raw.(*tg.Message)
+		if !ok {
+			continue
+		}
+		if oldest == 0 || message.ID < oldest {
+			oldest = message.ID
+		}
+		if message.ID > boundary {
+			above = append(above, message)
+		}
+	}
+	return above, oldest, oldest == 0 || oldest <= boundary
+}
+
+func (m *Manager) reconcileListenerGaps(accountID string) {
+	ids, err := m.listenerGapCandidateIDs(accountID)
+	if err != nil {
+		return
+	}
 	for _, id := range ids {
 		for attempt := 0; attempt < 3; attempt++ {
-			if err := m.reconcileSavedTask(id); err == nil {
+			if err := m.reconcileListenerGap(id); err == nil {
 				break
 			} else {
-				applog.Info("chat_download", "saved_listener_reconcile_failed", "chat_job_id", id, "account_id", accountID, "attempt", attempt+1, "error", err.Error())
+				applog.Info("chat_download", "listener_gap_reconcile_failed", "chat_job_id", id, "account_id", accountID, "attempt", attempt+1, "error", err.Error())
 				if attempt == 2 {
 					break
 				}
@@ -1452,61 +1493,74 @@ func (m *Manager) reconcileSavedListeners(accountID string) {
 	}
 }
 
-func (m *Manager) reconcileSavedTask(id string) error {
+// reconcileListenerGap closes the two windows in which media published to a
+// listened dialog is covered by nothing.
+//
+// History scanning is bounded by the task's upper_message_id, which is captured
+// when the task is created, so anything published while the scan runs sits above
+// that bound and is never scanned. The live update stream only covers a dialog
+// once a listener is watching it, which begins after the scan completes, and it
+// covers nothing while that connection is down or still being established.
+//
+// The walk therefore reads from the newest message backwards, hands every
+// message above the watermark to the ordinary live path, and stops as soon as
+// it reaches the watermark. Re-delivery is safe: the inbox is unique per
+// message, and an item the task already has is left alone.
+func (m *Manager) reconcileListenerGap(id string) error {
 	target, err := m.chatTarget(id)
-	if err != nil || !isSavedListen(target.ChatJob) {
+	if err != nil {
 		return err
 	}
+	if !listensForNewMedia(target.ChatJob) {
+		return nil
+	}
+	peer := target.inputPeer()
+	if peer == nil {
+		return nil
+	}
+	// Watching the dialog here means a message arriving while this walk runs is
+	// admitted by the live path too. The overlap costs one duplicate inbox row
+	// at most, because the insert ignores a message it already has.
 	m.addChatWatched(target.AccountID, target.DialogKey)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
-		offset := 0
 		boundary := target.UpperMessageID
 		watermark := boundary
+		offset := 0
+		reachedBoundary := false
 		for {
-			current, currentErr := m.chatTarget(id)
-			if currentErr != nil {
-				return currentErr
-			}
-			if !isSavedListen(current.ChatJob) {
-				return nil
-			}
-			result, err := client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: &tg.InputPeerSelf{}, OffsetID: offset, Limit: 100})
+			result, err := client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peer, OffsetID: offset, Limit: 100})
 			if err != nil {
 				return err
 			}
-			messages := searchMessages(result)
-			if len(messages) == 0 {
-				return nil
-			}
-			oldest := 0
-			for _, raw := range messages {
-				message, ok := raw.(*tg.Message)
-				if !ok {
-					continue
-				}
-				if oldest == 0 || message.ID < oldest {
-					oldest = message.ID
-				}
-				if message.ID <= boundary {
-					continue
-				}
-				m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: target.DialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: &tg.InputPeerSelf{}})
+			above, oldest, reached := gapBatch(searchMessages(result), boundary)
+			// Enqueue before testing termination: the page that finally reaches
+			// the watermark also holds the last stretch above it, so returning
+			// first would drop exactly the messages closest to the boundary.
+			for _, message := range above {
+				m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: target.DialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: peer})
 				if message.ID > watermark {
 					watermark = message.ID
 				}
 			}
-			if watermark > target.UpperMessageID {
-				if _, err := m.db.Exec(`UPDATE chat_download_jobs SET upper_message_id = ?, updated_at = ? WHERE id = ? AND upper_message_id < ?`, watermark, time.Now().UTC().Format(time.RFC3339Nano), id, watermark); err != nil {
-					return err
-				}
-			}
-			if oldest == 0 || oldest <= boundary {
-				return nil
+			if reached {
+				reachedBoundary = true
+				break
 			}
 			offset = oldest
 		}
+		// Advance the watermark only once the walk actually reached the previous
+		// one. Writing it after every page looks harmless because the walk runs
+		// newest to oldest, but it makes an interrupted walk unrecoverable: the
+		// next run would read the already advanced watermark as its boundary and
+		// stop on the first page, leaving everything below it unread for good —
+		// which is exactly the stretch it exists to recover.
+		if !reachedBoundary || watermark <= target.UpperMessageID {
+			return nil
+		}
+		_, err := m.db.Exec(`UPDATE chat_download_jobs SET upper_message_id = ?, updated_at = ? WHERE id = ? AND upper_message_id < ?`, watermark, time.Now().UTC().Format(time.RFC3339Nano), id, watermark)
+		return err
 	})
 }
 
@@ -1805,6 +1859,13 @@ func (m *Manager) scanOneChat() error {
 	if err == nil {
 		m.touch()
 		m.markChatListenerDirty()
+		// The scan just became complete, which is the moment this task's live
+		// coverage begins. Everything published while it scanned sits above the
+		// watermark the scan was bounded by, so walk that stretch now instead of
+		// waiting for a listener restart that may not come for days.
+		if current.ListenNew {
+			go m.reconcileListenerGap(id)
+		}
 	}
 	return err
 }
