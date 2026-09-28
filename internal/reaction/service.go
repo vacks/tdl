@@ -5,6 +5,7 @@ package reaction
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -215,9 +216,17 @@ func (s *Service) enqueueTrigger(worker int, event telegram.ReactionEvent) {
 	for _, emoji := range event.Emojis {
 		canonicalEmoji := settings.CanonicalReactionEmoji(emoji)
 		if _, ok := allowed[canonicalEmoji]; ok {
-			queued, err := s.downloads.QueueReaction(download.DownloadIntent{Source: download.SourceReaction, AccountID: event.AccountID, Message: &download.MessageRef{SourceURL: event.SourceURL, DialogName: event.DialogName, DialogID: event.DialogID, InputPeer: event.InputPeer, MessageID: event.MessageID}, Trigger: map[string]string{"emoji": canonicalEmoji}}, canonicalEmoji)
+			intent := download.DownloadIntent{Source: download.SourceReaction, AccountID: event.AccountID, Message: &download.MessageRef{SourceURL: event.SourceURL, DialogName: event.DialogName, DialogID: event.DialogID, InputPeer: event.InputPeer, MessageID: event.MessageID}, Trigger: map[string]string{"emoji": canonicalEmoji}}
+			queued, err := s.downloads.QueueReaction(intent, canonicalEmoji)
 			if err != nil {
 				applog.Error("reaction", "inbox_enqueue_failed", "worker", worker, "account_id", event.AccountID, "dialog_id", event.DialogID, "message_id", event.MessageID, "emoji", canonicalEmoji, "error", err.Error())
+				// The update dispatcher already told gotd this reaction was handled,
+				// so Telegram will not redeliver it. Retry in memory rather than
+				// losing the trigger outright.
+				s.downloads.ScheduleInboxRetry(fmt.Sprintf("reaction_inbox account=%s message=%d emoji=%s", event.AccountID, event.MessageID, canonicalEmoji), func() error {
+					_, retryErr := s.downloads.QueueReaction(intent, canonicalEmoji)
+					return retryErr
+				})
 			} else if !queued {
 				applog.Info("reaction", "inbox_duplicate_ignored", "account_id", event.AccountID, "dialog_id", event.DialogID, "message_id", event.MessageID, "emoji", canonicalEmoji)
 			} else {

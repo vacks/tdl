@@ -52,7 +52,43 @@ const (
 	// Temporary files are isolated by complete Telegram dialog identity below,
 	// so the message ID is sufficient within each private directory.
 	temporaryFilenameTemplate = "{{ .MessageID }}_{{ filenamify .FileName }}"
+	// Waiting message items are promoted by one dedicated goroutine instead of
+	// by every download worker. It drains in bounded passes, pauses between them
+	// so a saturated database cannot be hammered, and falls back to the idle
+	// interval whenever a pass promotes nothing: that timeout, not the wake
+	// signal, is what guarantees an item is eventually promoted, so a dropped
+	// wake only costs latency.
+	reconcileBatchSize      = 256
+	reconcileIdleInterval   = 3 * time.Second
+	reconcileDrainPause     = 20 * time.Millisecond
+	reconcileMaxDrainPasses = 64
+	// filteredCountTTL bounds how stale a status-filtered task total may be. It
+	// only affects a displayed number, never pagination.
+	filteredCountTTL = 5 * time.Second
+	// queuedCandidateWindow bounds how far the scheduler looks ahead for a task
+	// whose account is not inside a Telegram cooldown. A handful of rows is
+	// enough to step over a blocked account without scanning permanent history.
+	queuedCandidateWindow = 16
+	// Inbox writes are the one place where losing an event is unrecoverable: the
+	// update dispatcher returns nil to gotd, which advances the update state, so
+	// Telegram never redelivers. A failed insert is therefore retried in memory,
+	// bounded so an outage cannot grow the process without limit.
+	inboxRetryQueueSize = 512
+	inboxRetryAttempts  = 5
+	inboxRetryBackoff   = 2 * time.Second
 )
+
+// inboxRetry is one failed inbox write waiting to be re-attempted.
+type inboxRetry struct {
+	describe string
+	run      func() error
+}
+
+// filteredJobCount is one memoized status-filtered task total.
+type filteredJobCount struct {
+	total   int
+	expires time.Time
+}
 
 type Item struct {
 	ID         int64  `json:"id"`
@@ -260,23 +296,43 @@ type Manager struct {
 	listenerDirty         atomic.Bool
 	listenerSnapshotAt    atomic.Int64
 	slotWake              chan struct{}
-	progress              *progressStore
-	events                *eventBus
-	slotMu                sync.Mutex
-	activeJobs            int
-	activeChats           int
-	rpcMu                 sync.Mutex
-	rpcState              map[string]*telegramRPCState
-	jobLocks              [64]sync.Mutex
-	chatLocks             [64]sync.Mutex
-	revision              atomic.Uint64
-	dbHealthMu            sync.RWMutex
-	dbHealth              DatabaseHealth
-	dbMonitorStop         context.CancelFunc
-	cleanupStop           context.CancelFunc
-	dbOutage              atomic.Bool
-	visibleJobs           atomic.Int64
-	visibleChats          atomic.Int64
+	// reconcileWake is deliberately separate from wake. The claim reconciler is
+	// an additional consumer of its own signal, and sharing wake would let it
+	// take the token a download worker needs, delaying a newly queued task by a
+	// full idle interval for no visible reason.
+	reconcileWake chan struct{}
+	progress      *progressStore
+	events        *eventBus
+	slotMu        sync.Mutex
+	activeJobs    int
+	activeChats   int
+	rpcMu         sync.Mutex
+	rpcState      map[string]*telegramRPCState
+	jobLocks      [64]sync.Mutex
+	chatLocks     [64]sync.Mutex
+	revision      atomic.Uint64
+	dbHealthMu    sync.RWMutex
+	dbHealth      DatabaseHealth
+	dbMonitorStop context.CancelFunc
+	cleanupStop   context.CancelFunc
+	reconcileStop context.CancelFunc
+	dbOutage      atomic.Bool
+	visibleJobs   atomic.Int64
+	visibleChats  atomic.Int64
+	// filteredCounts memoizes the per-status task counts the list view asks for.
+	// Lazily initialized so a zero-value Manager stays usable.
+	filteredCountsMu sync.Mutex
+	filteredCounts   map[string]filteredJobCount
+	// stopCh is closed once by Stop so the worker loops can exit. A nil channel
+	// (a Manager built without New, as tests do) never fires in a select, so the
+	// loops stay correct without a nil guard.
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	// lastInboxReap throttles the inbox lease safety net (unix nanoseconds).
+	lastInboxReap atomic.Int64
+	// inboxRetry carries inbox writes that failed, to a single bounded worker.
+	inboxRetry     chan inboxRetry
+	inboxRetryStop context.CancelFunc
 }
 
 type DatabaseHealth struct {
@@ -293,7 +349,7 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), potentialDiscussion: make(map[string]bool), slotWake: make(chan struct{}, 1), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), potentialDiscussion: make(map[string]bool), slotWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1), stopCh: make(chan struct{}), inboxRetry: make(chan inboxRetry, inboxRetryQueueSize), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
 	// The first worker pass constructs the listener snapshot before accepting
 	// updates. Subsequent rebuilds are only needed after state changes.
 	m.listenerDirty.Store(true)
@@ -364,6 +420,20 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
 	m.cleanupStop = cancelCleanup
 	go m.cleanupLoop(cleanupCtx)
+	reconcileCtx, cancelReconcile := context.WithCancel(context.Background())
+	m.reconcileStop = cancelReconcile
+	// Start the lease-reap clock now so boot does not immediately repeat the
+	// inbox reset that startup recovery just performed.
+	m.lastInboxReap.Store(time.Now().UnixNano())
+	inboxRetryCtx, cancelInboxRetry := context.WithCancel(context.Background())
+	m.inboxRetryStop = cancelInboxRetry
+	go m.inboxRetryWorker(inboxRetryCtx)
+	// Waiting items can survive a restart: recoverInterruptedMessageTasks only
+	// returns running and downloaded rows to the queue, so a task whose items
+	// were all waiting is still waiting after boot. The worker loop's first pass
+	// used to promote those; now this goroutine must run immediately rather than
+	// wait out the idle interval.
+	go m.reconcileWorker(reconcileCtx)
 	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 	m.dbMonitorStop = cancelMonitor
 	m.updateDatabaseHealth()
@@ -439,10 +509,21 @@ func (m *Manager) recoverAfterDatabaseOutage() error {
 	if err := m.recoverInterruptedChatTasks(); err != nil {
 		return err
 	}
+	// The two inboxes are durable work queues too, and an outage is exactly when
+	// a worker loses the row it had claimed: the submit failed and the retry
+	// write failed with it. Startup resets these for the same reason (this
+	// process is the only inbox consumer), but startup alone left every row
+	// claimed during an outage stranded until the next restart.
+	if err := m.resetInboxLeases("数据库连接恢复，等待重新处理"); err != nil {
+		return err
+	}
 	m.touch()
 	for worker := 0; worker < workerCount; worker++ {
 		m.signal()
 	}
+	// Recovery restored running rows to the queue, which can release claims that
+	// waiting items were blocked on.
+	m.signalReconcile()
 	return nil
 }
 
@@ -496,6 +577,68 @@ func (m *Manager) recoverInterruptedChatTasks() error {
 	// no historical media left to transfer.
 	m.refreshChatStates()
 	return nil
+}
+
+// resetInboxLeases returns every claimed inbox row to the pending queue. Both
+// inbox tables are durable work queues whose only consumer is this process, so a
+// lease still held after a database outage is known to be orphaned: the submit
+// failed and the retry write failed with it.
+func (m *Manager) resetInboxLeases(reason string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', error = ?, next_attempt_at = ?, updated_at = ? WHERE status = 'processing'`, reason, now, now); err != nil {
+		return fmt.Errorf("释放 reaction_inbox 租约: %w", err)
+	}
+	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'pending', error = ?, next_attempt_at = ?, updated_at = ? WHERE status = 'processing'`, reason, now, now); err != nil {
+		return fmt.Errorf("释放 chat_message_inbox 租约: %w", err)
+	}
+	return nil
+}
+
+// inboxLeaseTimeout bounds how long one worker may hold an inbox row in
+// 'processing'. It is far longer than any single submit, so a healthy worker is
+// never raided; it exists only so a worker that died mid-submit cannot strand
+// its row until the next restart.
+const inboxLeaseTimeout = 10 * time.Minute
+
+// inboxReapInterval throttles the safety-net sweep. It is deliberately much
+// coarser than the maintenance cadence: the database-recovery hook already
+// covers the common case, so this costs two statements per interval at most.
+const inboxReapInterval = time.Minute
+
+// reapStaleInboxLeases returns inbox rows whose lease outlived inboxLeaseTimeout
+// to the pending queue.
+func (m *Manager) reapStaleInboxLeases() error {
+	// Timestamps are TEXT. Comparing them lexicographically would be wrong
+	// whenever two values differ in fractional-second width, because RFC3339Nano
+	// trims trailing zeros, so compare as timestamptz instead. The inbox tables
+	// stay small — retention removes finished rows — so losing index support on
+	// updated_at here is not a concern.
+	cutoff := time.Now().UTC().Add(-inboxLeaseTimeout).Format(time.RFC3339Nano)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing' AND updated_at::timestamptz < ?::timestamptz`, now, now, cutoff); err != nil {
+		return err
+	}
+	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ? WHERE status = 'processing' AND updated_at::timestamptz < ?::timestamptz`, now, now, cutoff); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reapStaleInboxLeasesIfDue runs the sweep at most once per inboxReapInterval,
+// from the existing maintenance goroutine, so the safety net does not add
+// another resident database poller.
+func (m *Manager) reapStaleInboxLeasesIfDue() {
+	now := time.Now().UnixNano()
+	last := m.lastInboxReap.Load()
+	if now-last < int64(inboxReapInterval) {
+		return
+	}
+	if !m.lastInboxReap.CompareAndSwap(last, now) {
+		return
+	}
+	if err := m.reapStaleInboxLeases(); err != nil {
+		applog.Error("download", "inbox_lease_reap_failed", "error", err.Error())
+	}
 }
 
 func (m *Manager) DatabaseHealth() DatabaseHealth {
@@ -704,9 +847,34 @@ func (m *Manager) visibleJobTotal(status string) (int, error) {
 	if status == "" {
 		return m.visibleJobCount(), nil
 	}
+	// This count is an index-only scan whose cost grows with permanent history,
+	// and a filtered list asks for it on every page fetch. Memoizing for a few
+	// seconds collapses a burst of paging into one scan. It is display-only —
+	// pagination uses cursors and never reads this total — so bounded staleness
+	// is safe. Note this reduces how often the scan runs, not its O(history)
+	// cost; a status-filtered count over millions of rows would need a maintained
+	// counter, which is deliberately not done here because task status is also
+	// written by several direct SQL paths that a counter would have to track.
+	now := time.Now()
+	m.filteredCountsMu.Lock()
+	if entry, ok := m.filteredCounts[status]; ok && now.Before(entry.expires) {
+		m.filteredCountsMu.Unlock()
+		return entry.total, nil
+	}
+	m.filteredCountsMu.Unlock()
 	var total int
-	err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = '' AND status = ?`, status).Scan(&total)
-	return total, err
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_jobs WHERE parent_chat_id = '' AND status = ?`, status).Scan(&total); err != nil {
+		return 0, err
+	}
+	m.filteredCountsMu.Lock()
+	if m.filteredCounts == nil {
+		m.filteredCounts = make(map[string]filteredJobCount)
+	}
+	// Keyed by status, and there are only a handful of statuses, so the map needs
+	// no eviction.
+	m.filteredCounts[status] = filteredJobCount{total: total, expires: now.Add(filteredCountTTL)}
+	m.filteredCountsMu.Unlock()
+	return total, nil
 }
 
 func (m *Manager) listSummaries(where, pagination string, args []any, total int) ([]Job, int, error) {
@@ -794,11 +962,24 @@ func (m *Manager) LiveProgress() []FileProgress {
 // It is called before process shutdown so a restart does not depend on a hard
 // kill to recover task state.
 func (m *Manager) Stop() {
+	// Signal the worker loops first. They are not stopped by cancelling a task
+	// context, so without this they keep polling for the whole shutdown window —
+	// and once the database below is closed, every poll is an error against a
+	// closed pool.
+	if m.stopCh != nil {
+		m.stopOnce.Do(func() { close(m.stopCh) })
+	}
 	if m.dbMonitorStop != nil {
 		m.dbMonitorStop()
 	}
 	if m.cleanupStop != nil {
 		m.cleanupStop()
+	}
+	if m.reconcileStop != nil {
+		m.reconcileStop()
+	}
+	if m.inboxRetryStop != nil {
+		m.inboxRetryStop()
 	}
 	m.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(m.cancels))
@@ -1034,12 +1215,13 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 
 func (m *Manager) worker() {
 	for {
-		m.reconcileMessageClaims()
 		job, sources, err := m.nextQueued()
 		if err == nil && job.ID != "" {
 			release, acquired := m.tryAcquireTransfer(transferMessage, false)
 			if !acquired {
 				select {
+				case <-m.stopCh:
+					return
 				case <-m.slotWake:
 				case <-time.After(time.Second):
 				}
@@ -1050,6 +1232,8 @@ func (m *Manager) worker() {
 			continue
 		}
 		select {
+		case <-m.stopCh:
+			return
 		case <-m.wake:
 		case <-time.After(3 * time.Second):
 		}
@@ -1057,16 +1241,76 @@ func (m *Manager) worker() {
 }
 
 func (m *Manager) nextQueued() (Job, []source, error) {
-	var job Job
-	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, attempts, status, error, created_at, updated_at FROM download_jobs WHERE status = 'queued' AND EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = download_jobs.id AND i.status = 'queued') ORDER BY created_at LIMIT 1`).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.DirectPeerType, &job.DirectPeerID, &job.DirectPeerHash, &job.ConfigJSON, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, nil, nil
-	}
+	// Accounts inside a cooldown are excluded by the query, not only by the
+	// in-memory guard below: the candidate window is bounded, so filtering only
+	// in Go would let sixteen blocked tasks at the head of the queue hide every
+	// other account's work behind them. The persisted cooldown is compared as a
+	// timestamptz because the stored text uses RFC3339Nano, whose trailing-zero
+	// trimming makes lexicographic comparison wrong.
+	rows, err := m.db.Query(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, attempts, status, error, created_at, updated_at FROM download_jobs WHERE status = 'queued' AND EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = download_jobs.id AND i.status = 'queued') AND NOT EXISTS (SELECT 1 FROM telegram_rate_limits l WHERE l.account_id = download_jobs.account_id AND l.blocked_until::timestamptz > ?::timestamptz) ORDER BY created_at LIMIT ?`, time.Now().UTC().Format(time.RFC3339Nano), queuedCandidateWindow)
 	if err != nil {
 		return Job{}, nil, err
 	}
+	var job Job
+	found := false
+	for rows.Next() {
+		var candidate Job
+		if err := rows.Scan(&candidate.ID, &candidate.SourceURL, &candidate.DialogType, &candidate.DialogKey, &candidate.DialogName, &candidate.AccountID, &candidate.DirectPeerType, &candidate.DirectPeerID, &candidate.DirectPeerHash, &candidate.ConfigJSON, &candidate.Attempts, &candidate.Status, &candidate.Error, &candidate.CreatedAt, &candidate.UpdatedAt); err != nil {
+			_ = rows.Close()
+			return Job{}, nil, err
+		}
+		// A task whose account is inside a Telegram cooldown is left queued
+		// instead of being claimed and abandoned. Claiming increments attempts,
+		// so claiming during a cooldown would spend the retry budget on a window
+		// where no transfer is allowed to start. Looking a few rows ahead keeps
+		// one blocked account from stalling every other account's tasks.
+		if m.telegramAccountBlocked(candidate.AccountID) {
+			continue
+		}
+		job = candidate
+		found = true
+		break
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return Job{}, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return Job{}, nil, err
+	}
+	if !found {
+		return Job{}, nil, nil
+	}
 	sources, err := m.sources(job.ID)
 	return job, sources, err
+}
+
+// finishTaskWithoutPendingWork settles a task whose item loop selected nothing
+// to transfer. Every outcome has to be written: a task left at 'running' is
+// never claimed again, because the scheduler only picks 'queued' rows, so
+// returning without a terminal or queued state strands it until the user acts.
+//
+// Only the task status is written here. Per-item errors carry the actionable
+// diagnostics (which path is blocked, why a file failed) and must not be
+// overwritten with a generic message.
+func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner bool) {
+	if m.allItemsCompleted(jobID) {
+		_ = m.setJob(jobID, "completed", "")
+		return
+	}
+	if waitingForOwner || m.hasWaitingMessageItems(jobID) {
+		_ = m.setJob(jobID, "queued", "等待其他任务完成同一文件")
+		return
+	}
+	var completed int
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, jobID).Scan(&completed); err != nil {
+		return
+	}
+	if completed > 0 {
+		_ = m.setJob(jobID, "partial", "部分文件未完成，可重试失败文件")
+		return
+	}
+	_ = m.setJob(jobID, "failed", "没有可继续下载的文件，请查看各文件的失败原因")
 }
 
 func (m *Manager) run(job Job, sources []source) {
@@ -1091,6 +1335,11 @@ func (m *Manager) run(job Job, sources []source) {
 	m.mu.Unlock()
 	defer func() { stopTransfer(); cancel(); m.mu.Lock(); delete(m.cancels, job.ID); m.mu.Unlock() }()
 	defer m.progress.ClearJob(job.ID)
+	// Resolved before the item loop and reused below, so the pre-flight check and
+	// the publish path cannot disagree about a file's destination. A snapshot
+	// that fails to parse is left to the existing check further down, which
+	// already reports it.
+	preflightConfig, preflightErr := m.downloadConfigForJob(job.ConfigJSON)
 	pending := make([]source, 0, len(sources))
 	waitingForOwner := false
 	for _, item := range sources {
@@ -1099,6 +1348,22 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 		if item.Status == "completed" || (item.Status == "downloaded" && regularFileExists(item.FinalPath)) {
 			continue
+		}
+		// Publishing never overwrites, so a destination already held by a
+		// non-regular entry can never be published. Fail before the transfer
+		// rather than after a complete re-download, so a retry does not repeat
+		// the whole download only to hit the same refusal, and name the path
+		// that has to be cleared.
+		if preflightErr == nil {
+			if finalPath, destErr := finalDestination(m.downloadDir, preflightConfig.FinalFilenameTemplate, item); destErr == nil {
+				if occupied, regularFile := destinationOccupied(finalPath); occupied && !regularFile {
+					if err := m.setItem(item, "failed", "", blockedDestinationMessage(finalPath)); err != nil {
+						m.fail(job.ID, sources, err)
+						return
+					}
+					continue
+				}
+			}
 		}
 		claim, path, claimErr := m.claimMessageMedia(job.ID, item)
 		if claimErr != nil {
@@ -1127,11 +1392,7 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 	}
 	if len(pending) == 0 {
-		if m.allItemsCompleted(job.ID) {
-			_ = m.setJob(job.ID, "completed", "")
-		} else if waitingForOwner || m.hasWaitingMessageItems(job.ID) {
-			_ = m.setJob(job.ID, "queued", "等待其他任务完成同一文件")
-		}
+		m.finishTaskWithoutPendingWork(job.ID, waitingForOwner)
 		return
 	}
 	if ctx.Err() != nil || m.status(job.ID) != "running" {
@@ -1142,12 +1403,10 @@ func (m *Manager) run(job Job, sources []source) {
 	// fixed wall-clock deadline.
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", job.ID)
 	config := m.settings.Get()
-	if job.ConfigJSON != "" {
-		var snapshot settings.Download
-		if err := json.Unmarshal([]byte(job.ConfigJSON), &snapshot); err != nil {
-			m.fail(job.ID, pending, fmt.Errorf("任务下载配置快照无效: %w", err))
-			return
-		}
+	if snapshot, snapshotErr := m.downloadConfigForJob(job.ConfigJSON); snapshotErr != nil {
+		m.fail(job.ID, pending, snapshotErr)
+		return
+	} else {
 		config.Download = snapshot
 	}
 	watchdog := startTransferWatchdog(transferCtx, upstreamWatchPeriod, upstreamInitialTimeout, upstreamIdleTimeout, stopTransfer, func() bool {
@@ -1303,7 +1562,7 @@ func (m *Manager) run(job Job, sources []source) {
 			return
 		}
 		if m.recordTelegramRPCError(job.AccountID, err) {
-			_ = m.requeueRateLimitedMessage(job.ID)
+			_ = m.requeueRateLimitedMessage(job.ID, pending, err)
 			return
 		}
 		m.fail(job.ID, pending, err)
@@ -1332,15 +1591,28 @@ func (m *Manager) run(job Job, sources []source) {
 	}
 }
 
-func (m *Manager) requeueRateLimitedMessage(id string) error {
+// requeueRateLimitedMessage returns a flood-limited task to the queue. It
+// deliberately does not signal: the account-wide cooldown now keeps the task
+// from being claimed before the window expires, so waking a worker would only
+// have it re-examine a task it must skip.
+//
+// attempts is incremented when a task is claimed, so a task that keeps meeting
+// the same flood is bounded here instead of retrying forever. Every retry also
+// extends blocked_until through recordTelegramRPCError, which deepens the
+// restriction the retries are trying to wait out.
+func (m *Manager) requeueRateLimitedMessage(id string, pending []source, cause error) error {
+	var attempts int
+	if err := m.db.QueryRow(`SELECT attempts FROM download_jobs WHERE id = ?`, id).Scan(&attempts); err != nil {
+		return err
+	}
+	if attempts >= maxStalledAttempts {
+		m.fail(id, pending, fmt.Errorf("Telegram 限流反复出现，已停止自动重试，请稍后手动重试: %w", cause))
+		return nil
+	}
 	if _, err := m.db.Exec(`UPDATE download_items SET status = 'queued', error = 'Telegram 限流中，等待自动恢复', started_at = '', finished_at = '' WHERE job_id = ? AND status = 'running'`, id); err != nil {
 		return err
 	}
-	if err := m.setJob(id, "queued", "Telegram 限流中，等待自动恢复"); err != nil {
-		return err
-	}
-	m.signal()
-	return nil
+	return m.setJob(id, "queued", "Telegram 限流中，等待自动恢复")
 }
 
 // stopForInactiveParent makes a running chat child obey its durable parent
@@ -1382,6 +1654,43 @@ WHERE job_id = ? AND status IN ('queued', 'running')`, now, id)
 func regularFileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+// downloadConfigForJob resolves the download settings a task runs with: the
+// snapshot captured when the task was created, falling back to current settings.
+// Pre-flight checks and the publish path must resolve it identically, or they
+// would disagree about which destination a file is destined for.
+func (m *Manager) downloadConfigForJob(jobConfigJSON string) (settings.Download, error) {
+	config := m.settings.Get().Download
+	if jobConfigJSON != "" {
+		if err := json.Unmarshal([]byte(jobConfigJSON), &config); err != nil {
+			return config, fmt.Errorf("任务下载配置快照无效: %w", err)
+		}
+	}
+	return config, nil
+}
+
+// destinationOccupied reports whether anything already exists at path, and
+// whether that entry is a published regular file. The two answers are used for
+// different decisions and must never be conflated: publishing refuses to
+// overwrite *anything*, while only a regular file is evidence that this media
+// was already downloaded. Treating a directory or a dangling symlink as "already
+// downloaded" skips a file that was never fetched, and treating it as "missing"
+// re-downloads a file that publishing will refuse again — the loop this helper
+// exists to break.
+func destinationOccupied(path string) (occupied bool, publishedFile bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, false
+	}
+	return true, info.Mode().IsRegular()
+}
+
+// blockedDestinationMessage describes a destination that publishing cannot use
+// and that re-downloading cannot clear, so the operator is told exactly what to
+// remove instead of seeing the generic "already exists" text on every retry.
+func blockedDestinationMessage(path string) string {
+	return fmt.Sprintf("目标路径已被占用且不是普通文件，不会覆盖也无法自动重试，请手动处理后重试: %s", path)
 }
 
 func makeDirectPeer(peer tg.InputPeerClass) directPeer {
@@ -1554,64 +1863,231 @@ func (m *Manager) setMessageItemWaiting(jobID string, item source) error {
 	_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status NOT IN ('completed', 'waiting')`, jobID, item.DialogKey, item.MessageID)
 	if err == nil {
 		m.touch()
+		// A new waiting item is only useful once the reconciler looks at it, and
+		// the claim it is waiting on may already be gone.
+		m.signalReconcile()
 	}
 	return err
 }
 
-// reconcileMessageClaims promotes waiting message tasks after a chat task
-// either completes their media or releases the claim. It is intentionally
-// lightweight and bounded, so a large historical chat index cannot create a
-// polling storm.
-func (m *Manager) reconcileMessageClaims() {
-	rows, err := m.db.Query(`SELECT i.job_id, i.dialog_type, i.dialog_key, i.dialog_id, i.message_id, i.grouped_id, i.message_text, i.origin_dialog_name, i.origin_message_id, i.is_comment, i.source_peer_type, i.source_peer_id, i.source_peer_hash, i.original_name, i.size, j.dialog_name, j.status FROM download_items i JOIN download_jobs j ON j.id = i.job_id WHERE i.status = 'waiting' AND j.status IN ('queued', 'partial', 'failed') ORDER BY j.updated_at LIMIT 256`)
-	if err != nil {
+// completedMediaPath reports the final path of a file another task already
+// finished, using a read-only lookup. A task that cannot transfer anything must
+// never acquire a claim, so it needs a way to adopt a finished file without
+// taking ownership of it.
+func (m *Manager) completedMediaPath(item source) (string, bool) {
+	var path string
+	if err := m.db.QueryRow(`SELECT final_path FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'completed'`, item.DialogKey, item.MessageID).Scan(&path); err != nil {
+		return "", false
+	}
+	if path == "" || !regularFileExists(path) {
+		return "", false
+	}
+	return path, true
+}
+
+// ScheduleInboxRetry hands a failed inbox write to the shared bounded retry
+// queue. Adapters that persist their own inbox rows (the reaction service) use
+// it so both queues degrade the same way instead of each inventing a policy.
+func (m *Manager) ScheduleInboxRetry(describe string, run func() error) {
+	m.scheduleInboxRetry(describe, run)
+}
+
+func (m *Manager) scheduleInboxRetry(describe string, run func() error) {
+	if m.inboxRetry == nil {
+		// A Manager assembled without New (tests) has nowhere to queue, so say so
+		// rather than silently discarding the event.
+		applog.Error("download", "inbox_retry_unavailable", "event", describe)
 		return
 	}
+	select {
+	case m.inboxRetry <- inboxRetry{describe: describe, run: run}:
+	default:
+		// Bounded on purpose: during a long outage the alternative is unbounded
+		// memory growth. Dropping loudly keeps the loss visible. Report the
+		// channel's real capacity rather than the default constant, which a
+		// differently sized queue would make a lie.
+		applog.Error("download", "inbox_retry_queue_full", "event", describe, "capacity", cap(m.inboxRetry))
+	}
+}
+
+// inboxRetryWorker drains failed inbox writes. It waits for the database rather
+// than giving up immediately, because these events cannot be recovered from
+// anywhere else.
+func (m *Manager) inboxRetryWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-m.inboxRetry:
+			m.retryInboxWrite(ctx, item)
+		}
+	}
+}
+
+func (m *Manager) retryInboxWrite(ctx context.Context, item inboxRetry) {
+	for attempt := 1; attempt <= inboxRetryAttempts; attempt++ {
+		if m.DatabaseAvailable() {
+			if err := item.run(); err == nil {
+				applog.Info("download", "inbox_write_recovered", "event", item.describe, "attempt", attempt)
+				return
+			}
+		}
+		if attempt == inboxRetryAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(attempt) * inboxRetryBackoff):
+		}
+	}
+	applog.Error("download", "inbox_write_dropped", "event", item.describe, "attempts", inboxRetryAttempts)
+}
+
+// signalReconcile asks the claim reconciler to make a pass. Like signal it is
+// best effort: the reconciler's idle timeout is what guarantees progress, so a
+// dropped token costs latency rather than correctness.
+func (m *Manager) signalReconcile() {
+	select {
+	case m.reconcileWake <- struct{}{}:
+	default:
+	}
+}
+
+// reconcileWorker is the single owner of waiting-item promotion. That sweep used
+// to run inside every download worker, duplicating identical maintenance work
+// sixteen times over and letting it crowd out the transfers those workers exist
+// to perform. It drains in bounded passes and sleeps only once a pass stops
+// making progress, so an idle queue costs one indexed query per interval.
+func (m *Manager) reconcileWorker(ctx context.Context) {
+	cursor := int64(0)
+	for {
+		if m.DatabaseAvailable() {
+			for pass := 0; pass < reconcileMaxDrainPasses; pass++ {
+				promoted, next, err := m.reconcileMessageClaims(cursor)
+				cursor = next
+				if err != nil || promoted == 0 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(reconcileDrainPause):
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.reconcileWake:
+		case <-time.After(reconcileIdleInterval):
+		}
+	}
+}
+
+// reconcileMessageClaims makes one bounded pass over waiting message items. It
+// returns how many it promoted and the cursor the next pass resumes from, so the
+// caller can drain the set without re-examining rows it already found to be
+// legitimately blocked.
+//
+// Ordering by item id instead of the owner's updated_at is what stops a blocked
+// head from starving the rest of the queue. An item whose claim is genuinely
+// held cannot be promoted, so a stable ordering would keep it inside the LIMIT
+// window forever while everything behind it went unexamined.
+func (m *Manager) reconcileMessageClaims(cursor int64) (int, int64, error) {
+	rows, err := m.db.Query(`SELECT i.id, i.job_id, i.dialog_type, i.dialog_key, i.dialog_id, i.message_id, i.grouped_id, i.message_text, i.origin_dialog_name, i.origin_message_id, i.is_comment, i.source_peer_type, i.source_peer_id, i.source_peer_hash, i.original_name, i.size, j.dialog_name, j.status FROM download_items i JOIN download_jobs j ON j.id = i.job_id WHERE i.status = 'waiting' AND j.status IN ('queued', 'partial', 'failed') AND i.id > ? ORDER BY i.id LIMIT ?`, cursor, reconcileBatchSize)
+	if err != nil {
+		return 0, cursor, err
+	}
 	defer rows.Close()
+	promoted, scanned := 0, 0
+	next := cursor
 	for rows.Next() {
+		var itemID int64
 		var jobID, dialogName, jobStatus string
 		var isComment int
 		var item Item
-		if err := rows.Scan(&jobID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginDialogName, &item.OriginMessageID, &isComment, &item.SourcePeerType, &item.SourcePeerID, &item.SourcePeerHash, &item.OriginalName, &item.Size, &dialogName, &jobStatus); err != nil {
+		if err := rows.Scan(&itemID, &jobID, &item.DialogType, &item.DialogKey, &item.DialogID, &item.MessageID, &item.GroupedID, &item.MessageText, &item.OriginDialogName, &item.OriginMessageID, &isComment, &item.SourcePeerType, &item.SourcePeerID, &item.SourcePeerHash, &item.OriginalName, &item.Size, &dialogName, &jobStatus); err != nil {
 			continue
 		}
+		scanned++
+		next = itemID
 		item.IsComment = isComment != 0
 		candidate := source{Item: item, DialogName: dialogName, Direct: directPeer{kind: item.SourcePeerType, id: item.SourcePeerID, hash: item.SourcePeerHash}}
+		// A task that is not queued cannot transfer anything, so it must never
+		// acquire a claim: owning one would block the chat task that can still
+		// finish the file, on behalf of a download this task will never start.
+		// It can still adopt a file that someone else finished.
+		if jobStatus != "queued" {
+			path, ok := m.completedMediaPath(candidate)
+			if ok && m.adoptCompletedMessageItem(jobID, candidate, path) == nil {
+				promoted++
+				if m.allItemsCompleted(jobID) {
+					_ = m.setJob(jobID, "completed", "")
+				}
+			}
+			continue
+		}
 		claim, path, err := m.claimMessageMedia(jobID, candidate)
 		if err != nil || claim == "waiting" {
 			continue
 		}
 		if claim == "completed" {
-			if m.adoptCompletedMessageItem(jobID, candidate, path) == nil && m.allItemsCompleted(jobID) {
-				_ = m.setJob(jobID, "completed", "")
+			if m.adoptCompletedMessageItem(jobID, candidate, path) == nil {
+				promoted++
+				if m.allItemsCompleted(jobID) {
+					_ = m.setJob(jobID, "completed", "")
+				}
 			}
 			continue
 		}
-		if jobStatus != "queued" {
+		result, err := m.db.Exec(`UPDATE download_items SET status = 'queued', error = '' WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, jobID, item.DialogKey, item.MessageID)
+		if err != nil {
 			continue
 		}
-		if _, err := m.db.Exec(`UPDATE download_items SET status = 'queued', error = '' WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, jobID, item.DialogKey, item.MessageID); err == nil {
+		if changed, _ := result.RowsAffected(); changed == 1 {
+			promoted++
 			m.touch()
+			// One wake-up per promoted item, capped by the channel, so several
+			// newly runnable tasks can start in parallel instead of waiting out
+			// the workers' idle poll.
 			m.signal()
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return promoted, next, err
+	}
+	// A short pass means the rotation reached the end of the waiting set.
+	if scanned < reconcileBatchSize {
+		next = 0
+	}
+	return promoted, next, nil
 }
 
 func (m *Manager) releaseFailedMessageClaims(jobID string) {
 	_, _ = m.db.Exec(`DELETE FROM downloaded_media m USING download_items i WHERE m.dialog_key = i.dialog_key AND m.message_id = i.message_id AND m.status = 'claimed' AND m.owner_kind = 'message' AND m.owner_id = ? AND i.job_id = ? AND i.status IN ('failed', 'cancelled', 'deleted')`, jobID, jobID)
 	m.signalChat()
+	m.signalReconcile()
 }
 
 // reconcilePublishedItems completes the narrow crash window between moving a
 // file and persisting its terminal status. A path is trusted only when it is
 // still a regular file; otherwise a normal resumable retry remains possible.
+//
+// It must heal the global ownership record, not just the item row. A waiting
+// task tests the claim rather than the item status, so completing the item while
+// leaving downloaded_media at 'claimed' would publish a file that no other task
+// can ever adopt — and releaseFailedMessageClaims cannot undo it, because the
+// item is no longer failed or cancelled. The chat side's counterpart already
+// does both writes in one transaction for this reason.
 func (m *Manager) reconcilePublishedItems() error {
-	rows, err := m.db.Query(`SELECT dialog_key, message_id, final_path FROM download_items WHERE status = 'downloaded' AND final_path != ''`)
+	rows, err := m.db.Query(`SELECT job_id, dialog_key, message_id, final_path FROM download_items WHERE status = 'downloaded' AND final_path != ''`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	type candidate struct {
+		jobID     string
 		dialogKey string
 		messageID int
 		path      string
@@ -1619,7 +2095,7 @@ func (m *Manager) reconcilePublishedItems() error {
 	items := make([]candidate, 0)
 	for rows.Next() {
 		var item candidate
-		if err := rows.Scan(&item.dialogKey, &item.messageID, &item.path); err != nil {
+		if err := rows.Scan(&item.jobID, &item.dialogKey, &item.messageID, &item.path); err != nil {
 			return err
 		}
 		if info, statErr := os.Stat(item.path); statErr == nil && info.Mode().IsRegular() {
@@ -1630,7 +2106,14 @@ func (m *Manager) reconcilePublishedItems() error {
 		return err
 	}
 	for _, item := range items {
-		if _, err := m.db.Exec(`UPDATE download_items SET status = 'completed', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ? AND status = 'downloaded'`, time.Now().UTC().Format(time.RFC3339Nano), item.dialogKey, item.messageID); err != nil {
+		// Publish, pause and cancel share one linearization point per task, so a
+		// completion callback that started just before a cancellation cannot
+		// recreate a published row after Cancel released the task's claims.
+		lock := m.jobLock(item.jobID)
+		lock.Lock()
+		err := m.publishCompletedItem(item.jobID, item.dialogKey, item.messageID, item.path)
+		lock.Unlock()
+		if err != nil {
 			return err
 		}
 	}
@@ -1638,6 +2121,24 @@ func (m *Manager) reconcilePublishedItems() error {
 		_, err = m.db.Exec(`UPDATE download_jobs SET status = 'completed', error = '', updated_at = ? WHERE status IN ('queued', 'running', 'failed', 'partial') AND NOT EXISTS (SELECT 1 FROM download_items WHERE download_items.job_id = download_jobs.id AND download_items.status != 'completed')`, time.Now().UTC().Format(time.RFC3339Nano))
 	}
 	return err
+}
+
+// publishCompletedItem records an already-moved file as completed together with
+// its global ownership row, in one transaction.
+func (m *Manager) publishCompletedItem(jobID, dialogKey string, messageID int, path string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE download_items SET status = 'completed', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'downloaded'`, now, jobID, dialogKey, messageID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'message', ?, ?) ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`, dialogKey, messageID, path, jobID, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // publishItem moves a file only after upstream tdl has closed and finalized
@@ -1656,8 +2157,11 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 		}
 		return err
 	}
-	if _, statErr := os.Stat(finalPath); statErr == nil {
-		const message = "目标文件已存在，未覆盖"
+	if occupied, regularFile := destinationOccupied(finalPath); occupied {
+		message := "目标文件已存在，未覆盖"
+		if !regularFile {
+			message = blockedDestinationMessage(finalPath)
+		}
 		if err := m.setItem(item, "failed", "", message); err != nil {
 			return err
 		}
@@ -1671,7 +2175,13 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 	}
 	if err := publishNoReplace(path, finalPath); err != nil {
 		if errors.Is(err, unix.EEXIST) {
-			const message = "目标文件已存在，未覆盖"
+			// Something appeared between the check above and the move. Report it
+			// with the same distinction, because the item is now blocked exactly
+			// as it would have been by the earlier check.
+			message := "目标文件已存在，未覆盖"
+			if occupied, regularFile := destinationOccupied(finalPath); occupied && !regularFile {
+				message = blockedDestinationMessage(finalPath)
+			}
 			if saveErr := m.setItem(item, "failed", "", message); saveErr != nil {
 				return saveErr
 			}

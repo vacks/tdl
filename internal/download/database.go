@@ -47,7 +47,10 @@ func openPostgresDatabase(ctx context.Context, url string) (*database, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(24)
+	// Sized above the long-lived consumers — 16 download workers, 1 chat worker,
+	// 3 chat batch workers, 2 chat event workers and the claim reconciler — so
+	// that request-scoped queries are not queued behind resident pollers.
+	db.SetMaxOpenConns(32)
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	db.SetConnMaxLifetime(30 * time.Minute)
@@ -131,8 +134,19 @@ func (tx *databaseTx) Rollback() error { return tx.tx.Rollback() }
 
 func (d *database) bind(query string) string { return bindSQL(query) }
 
-// bindSQL converts question-mark placeholders at the database boundary. SQL
-// literals are preserved, so user-facing messages may safely contain '?'.
+// bindSQL converts question-mark placeholders at the database boundary. Every
+// position PostgreSQL treats as "not code" is skipped, so a '?' inside a literal
+// or a comment can never be renumbered into a parameter marker: that would shift
+// every following argument by one, or fail with "there is no parameter $1".
+//
+// This matters beyond user-visible messages. The schema migrations execute
+// plpgsql trigger definitions through this function, and those bodies are
+// dollar-quoted and contain both string literals and comments.
+//
+// Known limitation: backslash escapes inside E-prefixed strings are not decoded,
+// so a '?' in such a string is treated as still-inside-the-literal. The effect is
+// a PostgreSQL syntax error rather than a silently mis-numbered parameter, and
+// this codebase uses no E-prefixed strings.
 func bindSQL(query string) string {
 	if !strings.Contains(query, "?") {
 		return query
@@ -140,28 +154,125 @@ func bindSQL(query string) string {
 	var out strings.Builder
 	out.Grow(len(query) + 16)
 	argument := 0
-	inQuote := false
-	for index := 0; index < len(query); index++ {
+	for index := 0; index < len(query); {
 		char := query[index]
-		if char == '\'' {
-			out.WriteByte(char)
-			if inQuote && index+1 < len(query) && query[index+1] == '\'' {
-				out.WriteByte(query[index+1])
-				index++
-				continue
+		switch {
+		case char == '\'' || char == '"':
+			end := skipQuoted(query, index, char)
+			out.WriteString(query[index:end])
+			index = end
+		case strings.HasPrefix(query[index:], "--"):
+			end := strings.IndexByte(query[index:], '\n')
+			if end < 0 {
+				out.WriteString(query[index:])
+				index = len(query)
+				break
 			}
-			inQuote = !inQuote
-			continue
-		}
-		if char == '?' && !inQuote {
+			end += index + 1
+			out.WriteString(query[index:end])
+			index = end
+		case strings.HasPrefix(query[index:], "/*"):
+			end := skipBlockComment(query, index)
+			out.WriteString(query[index:end])
+			index = end
+		case char == '$':
+			tag, ok := dollarTag(query, index)
+			if !ok {
+				out.WriteByte(char)
+				index++
+				break
+			}
+			end := skipDollarQuoted(query, index, tag)
+			out.WriteString(query[index:end])
+			index = end
+		case char == '?':
 			argument++
 			out.WriteByte('$')
 			out.WriteString(strconv.Itoa(argument))
-			continue
+			index++
+		default:
+			out.WriteByte(char)
+			index++
 		}
-		out.WriteByte(char)
 	}
 	return out.String()
+}
+
+// skipQuoted returns the index just past a quoted run beginning at start. A
+// doubled quote inside the run is an escaped quote, not a terminator. An
+// unterminated run consumes the rest of the input.
+func skipQuoted(query string, start int, quote byte) int {
+	for index := start + 1; index < len(query); index++ {
+		if query[index] != quote {
+			continue
+		}
+		if index+1 < len(query) && query[index+1] == quote {
+			index++
+			continue
+		}
+		return index + 1
+	}
+	return len(query)
+}
+
+// skipBlockComment returns the index just past a block comment. PostgreSQL
+// block comments nest, so the depth has to be tracked.
+func skipBlockComment(query string, start int) int {
+	depth := 0
+	for index := start; index < len(query); {
+		switch {
+		case strings.HasPrefix(query[index:], "/*"):
+			depth++
+			index += 2
+		case strings.HasPrefix(query[index:], "*/"):
+			depth--
+			index += 2
+			if depth == 0 {
+				return index
+			}
+		default:
+			index++
+		}
+	}
+	return len(query)
+}
+
+// dollarTag reports whether a dollar-quoted string opens at start and returns
+// its full tag, which is "$$" for the anonymous form and "$name$" otherwise. A
+// '$' that does not open a valid tag is an ordinary character, so a positional
+// parameter such as $1 is never mistaken for the start of a quoted body.
+func dollarTag(query string, start int) (string, bool) {
+	for index := start + 1; index < len(query); index++ {
+		char := query[index]
+		if char == '$' {
+			return query[start : index+1], true
+		}
+		if !isDollarTagChar(char, index == start+1) {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func isDollarTagChar(char byte, first bool) bool {
+	switch {
+	case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char == '_':
+		return true
+	case char >= '0' && char <= '9':
+		return !first
+	}
+	return false
+}
+
+// skipDollarQuoted returns the index just past a dollar-quoted body, or the end
+// of the input when the closing tag never appears.
+func skipDollarQuoted(query string, start int, tag string) int {
+	from := start + len(tag)
+	offset := strings.Index(query[from:], tag)
+	if offset < 0 {
+		return len(query)
+	}
+	return from + offset + len(tag)
 }
 
 func isUniqueConstraintError(err error) bool {

@@ -2,5 +2,9 @@
 .upstream
 data
 downloads
+# postgres/ is a live database cluster (credential hashes, task history, PII).
+# The Dockerfile never copies it, so excluding it only keeps it out of the build
+# context and away from remote builders and their caches.
+postgres
 web/node_modules
 web/dist

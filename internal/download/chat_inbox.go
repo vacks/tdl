@@ -1,10 +1,12 @@
 package download
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/telegram"
 )
 
@@ -16,19 +18,43 @@ type chatMessageInboxEvent struct {
 	event    telegram.NewMessageEvent
 }
 
+// errInboxUnavailable reports that an inbox write could not be attempted or did
+// not persist. Callers distinguish it from a filtered event, which is not an
+// error and must never be retried.
+var errInboxUnavailable = errors.New("收件箱暂不可写入")
+
+// enqueueChatMessage admits one new-message trigger. The dispatcher handler that
+// produced this event returns nil to gotd, which advances the update state, so
+// Telegram never redelivers: an event dropped here is dropped for good. Every
+// path that can fail therefore logs and queues a bounded retry instead of
+// returning silently.
 func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
+	if err := m.admitChatMessage(event); err != nil {
+		applog.Error("download", "inbox_enqueue_failed", "account_id", event.AccountID, "dialog_key", event.DialogKey, "message_id", event.MessageID, "error", err.Error())
+		m.scheduleInboxRetry(fmt.Sprintf("chat_message_inbox account=%s dialog=%s message=%d", event.AccountID, event.DialogKey, event.MessageID), func() error {
+			return m.admitChatMessage(event)
+		})
+	}
+}
+
+// admitChatMessage performs the filtered checks and the durable insert. It
+// returns an error only when a valid event could not be admitted, so "nothing to
+// do" and "try again" stay distinguishable.
+func (m *Manager) admitChatMessage(event telegram.NewMessageEvent) error {
 	if event.MessageID <= 0 {
-		return
+		return nil
 	}
 	if !m.DatabaseAvailable() {
-		return
+		// Attempting the insert here would block the update dispatcher for the
+		// full statement timeout while the database is down, so wait outside it.
+		return errInboxUnavailable
 	}
 	key := event.DialogKey
 	if event.InputPeer != nil {
 		_, key, _ = dialogIdentity(event.InputPeer, event.AccountID)
 	}
 	if key == "" {
-		return
+		return nil
 	}
 	if event.InputPeer == nil {
 		// Telegram may omit entities from an update. Resolve the durable peer
@@ -47,23 +73,24 @@ func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
 		// reply-shaped channel events while this account has an eligible channel
 		// listener; the durable worker will then either map it or discard it.
 		if event.InputPeer == nil || (event.ReplyToTopID <= 0 && event.ReplyToMessageID <= 0) || !m.hasPotentialDiscussionListener(event.AccountID, potential, snapshotReady) {
-			return
+			return nil
 		}
 	}
 	if event.InputPeer == nil {
-		return
+		// The peer could not be resolved. That is a database failure rather than a
+		// filtered event, so let the retry queue resolve it once the database is
+		// back instead of discarding a watched message.
+		return errInboxUnavailable
 	}
 	direct := makeDirectPeer(event.InputPeer)
 	if direct.kind != "self" && direct.kind != "chat" && direct.kind != "channel" {
-		return
+		return nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := m.db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, dialog_name, dialog_id, message_id, reply_to_message_id, reply_to_top_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account_id, dialog_key, message_id) DO NOTHING`, event.AccountID, key, event.DialogName, event.DialogID, event.MessageID, event.ReplyToMessageID, event.ReplyToTopID, direct.kind, direct.id, direct.hash, now, now, now)
 	if err != nil {
-		// A transient persistence error is retried only when Telegram redelivers
-		// this update. Once admitted, later processing is fully durable.
-		return
+		return err
 	}
 	if changed, _ := result.RowsAffected(); changed == 1 {
 		select {
@@ -71,6 +98,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account
 		default:
 		}
 	}
+	return nil
 }
 
 func (m *Manager) recoverChatEventPeer(accountID, dialogKey string) tg.InputPeerClass {
@@ -195,7 +223,16 @@ func (m *Manager) retryChatMessageInbox(id int64, attempts int, cause error) err
 	return err
 }
 
-func waitChatEvent(delay time.Duration) bool {
-	time.Sleep(delay)
-	return true
+// waitChatEvent pauses an inbox worker between attempts. It reports false when
+// the manager is stopping, so the loop exits instead of sleeping through the
+// shutdown window and then querying a closed database.
+func (m *Manager) waitChatEvent(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-m.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
 }

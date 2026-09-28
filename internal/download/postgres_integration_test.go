@@ -2,10 +2,16 @@ package download
 
 import (
 	"context"
+	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vacks/tdl/internal/settings"
+	"github.com/vacks/tdl/internal/telegram"
 )
 
 func clearPostgresDownloadTestData(db *database) error {
@@ -13,7 +19,10 @@ func clearPostgresDownloadTestData(db *database) error {
 		`DELETE FROM chat_download_streams`, `DELETE FROM chat_download_items`, `DELETE FROM chat_download_jobs`,
 		`DELETE FROM downloaded_media`,
 		`DELETE FROM bot_lifecycle_messages`, `DELETE FROM download_requests`, `DELETE FROM download_events`,
-		`DELETE FROM reaction_inbox`, `DELETE FROM download_items`, `DELETE FROM download_jobs`,
+		`DELETE FROM reaction_inbox`, `DELETE FROM chat_message_inbox`, `DELETE FROM download_items`, `DELETE FROM download_jobs`,
+		// Account cooldowns are per-process state that a test seeds through the
+		// production path, so leaving them behind would leak into later tests.
+		`DELETE FROM telegram_rate_limits`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			return err
@@ -569,5 +578,955 @@ func TestPostgresSummaryIncludesChatDownloadItems(t *testing.T) {
 	active, failed := m.Summary()
 	if active != 2 || failed != 2 {
 		t.Fatalf("Summary()=%d active, %d failed; want 2, 2", active, failed)
+	}
+}
+
+func wantDownloadItemStatus(t *testing.T, db *database, jobID, want string) {
+	t.Helper()
+	var state string
+	if err := db.QueryRow(`SELECT status FROM download_items WHERE job_id = ?`, jobID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != want {
+		t.Fatalf("download_items status for %s = %q; want %q", jobID, state, want)
+	}
+}
+
+// A paused chat task transfers nothing, so it must not keep owning media in
+// downloaded_media. A message task waits on the claim rather than on the owner's
+// task status, so a claim left behind after pausing would stall the message task
+// until the chat task was resumed. This asserts the claim is released and the
+// message task is promoted by reconciliation alone, with no resume.
+func TestPostgresPausingChatReleasesClaimsSoWaitingMessageTaskProceeds(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('chat-pause','tg://chat','channel','channel:pause',1,'test','account','downloading','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('message-blocked','tg://message','channel','channel:pause','test','account','queued',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('message-blocked','channel','channel:pause',1,9,'pause.bin','queued')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:pause',9,'claimed','chat','chat-pause',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	item := source{Item: Item{DialogKey: "channel:pause", MessageID: 9}}
+	claim, _, err := m.claimMessageMedia("message-blocked", item)
+	if err != nil || claim != "waiting" {
+		t.Fatalf("claimMessageMedia()=%q,%v; want waiting while the chat task owns the media", claim, err)
+	}
+	if err := m.setMessageItemWaiting("message-blocked", item); err != nil {
+		t.Fatal(err)
+	}
+	// While the chat task is active its claim is legitimate, so reconciliation
+	// must leave the waiting item exactly where it is.
+	if promoted, _, err := m.reconcileMessageClaims(0); err != nil || promoted != 0 {
+		t.Fatalf("reconcileMessageClaims()=%d,%v while the chat claim is held; want 0 promotions", promoted, err)
+	}
+	wantDownloadItemStatus(t, db, "message-blocked", "waiting")
+
+	if err := m.PauseChat("chat-pause"); err != nil {
+		t.Fatalf("PauseChat(): %v", err)
+	}
+	var claims int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:pause' AND message_id = 9`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Fatalf("paused chat task still owns %d claim(s) on the waiting media; want 0", claims)
+	}
+	// The released claim must be promoted by reconciliation alone.
+	if promoted, _, err := m.reconcileMessageClaims(0); err != nil || promoted != 1 {
+		t.Fatalf("reconcileMessageClaims()=%d,%v after the claim was released; want 1 promotion", promoted, err)
+	}
+	wantDownloadItemStatus(t, db, "message-blocked", "queued")
+	// Reconciling a released claim also transfers ownership of it, so a resumed
+	// chat task must wait for the message task instead of downloading the same
+	// media a second time. This is what keeps pause safe: releasing the claim
+	// moves the file to whoever is still working, it does not duplicate it.
+	chatClaim, _, err := m.claimChatMedia("chat-pause", item)
+	if err != nil || chatClaim != "waiting" {
+		t.Fatalf("claimChatMedia()=%q,%v after pause and re-claim; want waiting", chatClaim, err)
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+func downloadItemState(db *database, jobID string) string {
+	var state string
+	if err := db.QueryRow(`SELECT status FROM download_items WHERE job_id = ?`, jobID).Scan(&state); err != nil {
+		return ""
+	}
+	return state
+}
+
+// seedWaitingItem inserts one waiting message item owned by jobID, optionally
+// blocked by a claim held by chatOwner.
+func seedWaitingItem(t *testing.T, db *database, jobID, dialogKey string, messageID int, chatOwner string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, error) VALUES (?,'channel',?,1,?,'wait.bin','waiting','等待其他任务完成同一文件')`, jobID, dialogKey, messageID); err != nil {
+		t.Fatal(err)
+	}
+	if chatOwner == "" {
+		return
+	}
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?,?,'claimed','chat',?,?)`, dialogKey, messageID, chatOwner, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedReconcileJob(t *testing.T, db *database, jobID, dialogKey, status string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES (?,'tg://message','channel',?,'test','account',?,?,?)`, jobID, dialogKey, status, now, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Waiting items are promoted by a dedicated goroutine now, not by the download
+// workers. This asserts promotion happens with no worker running at all, and
+// that a wake signal is enough to notice a claim released a moment earlier.
+func TestPostgresReconcileWorkerPromotesWaitingItemWithoutDownloadWorkers(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, workerCount), reconcileWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	m.updateDatabaseHealth()
+	if !m.DatabaseAvailable() {
+		t.Fatal("test requires a reachable database; the reconciler skips its work otherwise")
+	}
+	seedReconcileJob(t, db, "message-reconcile", "channel:reconcile", "queued")
+	seedWaitingItem(t, db, "message-reconcile", "channel:reconcile", 11, "chat-owner")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// The worker must be fully stopped before this test returns: these tests
+	// share one database, and a pass still in flight would mutate rows belonging
+	// to whichever test runs next.
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		m.reconcileWorker(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-stopped
+	}()
+	// While the claim is genuinely held the item must stay waiting.
+	time.Sleep(300 * time.Millisecond)
+	wantDownloadItemStatus(t, db, "message-reconcile", "waiting")
+
+	// The owning chat task finishes or releases the transfer.
+	if _, err := db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = 'channel:reconcile' AND message_id = 11`); err != nil {
+		t.Fatal(err)
+	}
+	m.signalReconcile()
+	// The window must stay below reconcileIdleInterval. With a longer one this
+	// test passes even when the wake path is entirely broken, because the
+	// reconciler's own idle poll would promote the item within the window and the
+	// assertion could not tell the two apart.
+	waitForCondition(t, reconcileIdleInterval/2, "the reconciler to promote the released claim on a wake signal", func() bool {
+		return downloadItemState(db, "message-reconcile") == "queued"
+	})
+}
+
+// A blocked head must not hide a promotable item behind it. The previous query
+// ordered by the owner's updated_at under a fixed LIMIT, so the same blocked
+// rows filled the window on every pass and anything past them was never read.
+func TestPostgresReconcileCursorRotatesPastBlockedItems(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, workerCount)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	seedReconcileJob(t, db, "message-rotate", "channel:rotate", "queued")
+	total := reconcileBatchSize + 4
+	for i := 1; i <= total; i++ {
+		seedWaitingItem(t, db, "message-rotate", "channel:rotate", i, "chat-owner")
+	}
+	// Only the last item, which sits past one full batch, becomes available.
+	if _, err := db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = 'channel:rotate' AND message_id = ?`, total); err != nil {
+		t.Fatal(err)
+	}
+
+	promoted, cursor, err := m.reconcileMessageClaims(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted != 0 {
+		t.Fatalf("first pass promoted %d; want 0 because every item in the batch is still claimed", promoted)
+	}
+	if cursor == 0 {
+		t.Fatal("first pass did not advance the cursor past the blocked batch; a blocked head would be re-examined forever")
+	}
+
+	promoted, _, err = m.reconcileMessageClaims(cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted != 1 {
+		t.Fatalf("second pass from the cursor promoted %d; want 1, the released item behind the blocked batch", promoted)
+	}
+	var state string
+	if err := db.QueryRow(`SELECT status FROM download_items WHERE job_id = 'message-rotate' AND message_id = ?`, total).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "queued" {
+		t.Fatalf("item %d state = %q; want queued", total, state)
+	}
+}
+
+// A task that is not queued can never start a transfer, so taking a claim for it
+// would block the chat task that can still finish the file, on behalf of a
+// download that will never run. It must still adopt a file someone else
+// completed.
+func TestPostgresReconcileNeverClaimsForNonQueuedTaskButStillAdopts(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, workerCount)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	// A job that failed partway: it is not queued, so it cannot consume a claim.
+	seedReconcileJob(t, db, "message-partial", "channel:partial", "partial")
+	seedWaitingItem(t, db, "message-partial", "channel:partial", 21, "")
+
+	promoted, _, err := m.reconcileMessageClaims(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted != 0 {
+		t.Fatalf("promoted %d waiting items for a non-queued job; want 0", promoted)
+	}
+	var claims int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:partial' AND message_id = 21`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Fatalf("a non-queued task acquired %d claim(s) on a file it will never download; want 0", claims)
+	}
+
+	// The same job must still adopt media another task finished.
+	path := t.TempDir() + "/done.bin"
+	if err := os.WriteFile(path, []byte("done"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES ('channel:partial',21,?,'completed','chat','chat-owner',?)`, path, now); err != nil {
+		t.Fatal(err)
+	}
+	promoted, _, err = m.reconcileMessageClaims(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted != 1 {
+		t.Fatalf("adopting a completed file promoted %d items; want 1", promoted)
+	}
+	wantDownloadItemStatus(t, db, "message-partial", "completed")
+}
+
+// A status-filtered total is an index-only count over permanent history that a
+// filtered list asks for on every page. It is memoized briefly and is display
+// only, since pagination uses cursors. This proves the memo is real and keyed
+// per status, so one status can never answer for another.
+func TestPostgresFilteredJobTotalIsMemoizedPerStatus(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	seedReconcileJob(t, db, "count-a", "channel:count", "completed")
+	seedReconcileJob(t, db, "count-b", "channel:count", "completed")
+	total, err := m.visibleJobTotal("completed")
+	if err != nil || total != 2 {
+		t.Fatalf("visibleJobTotal(completed)=%d,%v; want 2", total, err)
+	}
+	// A row inserted inside the memo window must not be counted yet.
+	seedReconcileJob(t, db, "count-c", "channel:count", "completed")
+	if total, err = m.visibleJobTotal("completed"); err != nil || total != 2 {
+		t.Fatalf("visibleJobTotal(completed)=%d,%v inside the memo window; want the cached 2", total, err)
+	}
+	// A different status must be counted independently rather than served from
+	// the memo entry belonging to "completed".
+	seedReconcileJob(t, db, "count-d", "channel:count", "failed")
+	if total, err = m.visibleJobTotal("failed"); err != nil || total != 1 {
+		t.Fatalf("visibleJobTotal(failed)=%d,%v; want 1", total, err)
+	}
+}
+
+// seedQueuedJobForAccount creates one queued message task with a single queued
+// item, for the given account, using an explicit fixed-width timestamp so the
+// scheduler's created_at ordering is deterministic.
+func seedQueuedJobForAccount(t *testing.T, db *database, jobID, dialogKey, accountID, createdAt string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES (?,'tg://message','channel',?,'test',?,'queued',?,?)`, jobID, dialogKey, accountID, createdAt, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES (?,'channel',?,1,1,'cooldown.bin','queued')`, jobID, dialogKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// File transfer used to run with no knowledge of the account-wide Telegram
+// cooldown: recordTelegramRPCError persisted the window, but the scheduler
+// claimed the task again immediately, re-opened a client and hit the same
+// flood. The scheduler must now step over a blocked account — and must not let
+// one blocked account stall every other account's queued work.
+func TestPostgresNextQueuedSkipsAccountsInsideCooldown(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	// rpcState must be initialized: the zero-value map would panic on write.
+	m := &Manager{db: db, events: newEventBus(), rpcState: make(map[string]*telegramRPCState), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM telegram_rate_limits`); err != nil {
+		t.Fatal(err)
+	}
+	seedQueuedJobForAccount(t, db, "cooldown-older", "channel:blocked", "account-blocked", "2026-01-01T00:00:00Z")
+	seedQueuedJobForAccount(t, db, "cooldown-newer", "channel:free", "account-free", "2026-01-01T00:00:01Z")
+
+	// With no cooldown the oldest task wins, which is the normal FIFO order.
+	job, _, err := m.nextQueued()
+	if err != nil || job.ID != "cooldown-older" {
+		t.Fatalf("nextQueued()=%q,%v before any cooldown; want cooldown-older", job.ID, err)
+	}
+
+	// Telegram tells us to wait. The record is account-wide by design and is
+	// persisted, not only kept in memory.
+	if !m.recordTelegramRPCError("account-blocked", errors.New("FLOOD_WAIT_3600")) {
+		t.Fatal("recordTelegramRPCError() did not record the flood window")
+	}
+	job, _, err = m.nextQueued()
+	if err != nil || job.ID != "cooldown-newer" {
+		t.Fatalf("nextQueued()=%q,%v while the older task's account is blocked; want the scheduler to step over it to cooldown-newer", job.ID, err)
+	}
+
+	// The persisted cooldown must exclude the account on its own, without the
+	// in-memory guard: that guard is best effort, and a process restart (or a
+	// different instance) only has the stored row to go on.
+	m.rpcMu.Lock()
+	m.rpcState["account-blocked"].blockedUntil = time.Time{}
+	m.rpcMu.Unlock()
+	job, _, err = m.nextQueued()
+	if err != nil || job.ID != "cooldown-newer" {
+		t.Fatalf("nextQueued()=%q,%v with only the persisted cooldown set; want the stored blocked_until to keep excluding it", job.ID, err)
+	}
+
+	// Once the window is cleared the skipped task is eligible again.
+	if _, err := db.Exec(`DELETE FROM telegram_rate_limits WHERE account_id = 'account-blocked'`); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err = m.nextQueued()
+	if err != nil || job.ID != "cooldown-older" {
+		t.Fatalf("nextQueued()=%q,%v after the cooldown was cleared; want cooldown-older", job.ID, err)
+	}
+}
+
+// Every flood retry also extends the account cooldown it is waiting for, so an
+// uncapped retry loop makes the restriction strictly worse. The retry budget
+// mirrors the stalled-item cap the chat queue already uses.
+func TestPostgresRateLimitedTaskStopsRetryingAtAttemptCap(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), rpcState: make(map[string]*telegramRPCState)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seed := func(jobID string, attempts int) []source {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, attempts, created_at, updated_at) VALUES (?,'tg://message','channel',?,'test','account','running',?,?,?)`, jobID, "channel:"+jobID, attempts, now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES (?,'channel',?,1,1,'flood.bin','running')`, jobID, "channel:"+jobID); err != nil {
+			t.Fatal(err)
+		}
+		return []source{{Item: Item{DialogKey: "channel:" + jobID, MessageID: 1}}}
+	}
+	cause := errors.New("FLOOD_WAIT_3600")
+
+	// Budget remaining: the task goes back to the queue to wait out the window.
+	retrySources := seed("flood-retry", maxStalledAttempts-1)
+	if err := m.requeueRateLimitedMessage("flood-retry", retrySources, cause); err != nil {
+		t.Fatal(err)
+	}
+	if state := m.status("flood-retry"); state != "queued" {
+		t.Fatalf("attempts below the cap left the task in %q; want queued", state)
+	}
+	wantDownloadItemStatus(t, db, "flood-retry", "queued")
+
+	// Budget exhausted: stop retrying instead of extending the cooldown forever.
+	spentSources := seed("flood-spent", maxStalledAttempts)
+	if err := m.requeueRateLimitedMessage("flood-spent", spentSources, cause); err != nil {
+		t.Fatal(err)
+	}
+	if state := m.status("flood-spent"); state != "failed" {
+		t.Fatalf("attempts at the cap left the task in %q; want failed", state)
+	}
+	wantDownloadItemStatus(t, db, "flood-spent", "failed")
+}
+
+func seedProcessingInboxes(t *testing.T, db *database, updatedAt string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO reaction_inbox(account_id, dialog_key, message_id, peer_type, emoji, status, next_attempt_at, created_at, updated_at) VALUES ('account','channel:inbox',1,'channel','👍','processing',?,?,?)`, updatedAt, updatedAt, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, message_id, peer_type, status, next_attempt_at, created_at, updated_at) VALUES ('account','channel:inbox',1,'channel','processing',?,?,?)`, updatedAt, updatedAt, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func inboxStates(t *testing.T, db *database) (reaction, chat string) {
+	t.Helper()
+	if err := db.QueryRow(`SELECT status FROM reaction_inbox LIMIT 1`).Scan(&reaction); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM chat_message_inbox LIMIT 1`).Scan(&chat); err != nil {
+		t.Fatal(err)
+	}
+	return reaction, chat
+}
+
+// A row claimed by a worker that then lost the database stays 'processing'
+// forever: the submit fails and so does the retry write. Startup resets these,
+// but startup alone means a database blip strands every claimed trigger until
+// the next restart, so recovery must reset them too.
+func TestPostgresOutageRecoveryReleasesInboxLeases(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore(), rpcState: make(map[string]*telegramRPCState),
+		wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seedProcessingInboxes(t, db, now)
+
+	if err := m.recoverAfterDatabaseOutage(); err != nil {
+		t.Fatalf("recoverAfterDatabaseOutage(): %v", err)
+	}
+	reaction, chat := inboxStates(t, db)
+	if reaction != "pending" || chat != "pending" {
+		t.Fatalf("after recovery inbox states = reaction:%q chat:%q; want both pending", reaction, chat)
+	}
+}
+
+// A worker that dies mid-submit without a database outage would otherwise strand
+// its row until the next restart. The lease timeout is the safety net for that
+// case, and it must not touch a lease a healthy worker still holds.
+func TestPostgresStaleInboxLeaseIsReapedButFreshLeaseIsKept(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-inboxLeaseTimeout - time.Minute).Format(time.RFC3339Nano)
+	seedProcessingInboxes(t, db, stale)
+	if err := m.reapStaleInboxLeases(); err != nil {
+		t.Fatalf("reapStaleInboxLeases(): %v", err)
+	}
+	reaction, chat := inboxStates(t, db)
+	if reaction != "pending" || chat != "pending" {
+		t.Fatalf("stale lease states = reaction:%q chat:%q; want both reaped to pending", reaction, chat)
+	}
+
+	// A lease inside the timeout belongs to a worker that may still be working.
+	if _, err := db.Exec(`UPDATE reaction_inbox SET status = 'processing', updated_at = ?`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE chat_message_inbox SET status = 'processing', updated_at = ?`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reapStaleInboxLeases(); err != nil {
+		t.Fatalf("reapStaleInboxLeases(): %v", err)
+	}
+	reaction, chat = inboxStates(t, db)
+	if reaction != "processing" || chat != "processing" {
+		t.Fatalf("fresh lease states = reaction:%q chat:%q; want both left processing", reaction, chat)
+	}
+}
+
+// A process that dies between the final file move and the completion write
+// leaves the item at 'downloaded' and the ownership row at 'claimed'. Completing
+// only the item heals the symptom and hides the damage: a waiting task tests the
+// claim, not the item status, so the published file can never be adopted again —
+// and releaseFailedMessageClaims cannot undo it, because the item is no longer
+// failed or cancelled. Recovery must repair the ownership row too.
+func TestPostgresPublishedFileReconcileAlsoHealsOwnershipRow(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	path := t.TempDir() + "/published.bin"
+	if err := os.WriteFile(path, []byte("done"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('crash-msg','tg://m','channel','channel:crash','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, final_path) VALUES ('crash-msg','channel','channel:crash',1,55,'published.bin','downloaded',?)`, path); err != nil {
+		t.Fatal(err)
+	}
+	// The claim the crashed process never promoted.
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES ('channel:crash',55,'','claimed','message','crash-msg',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.reconcilePublishedItems(); err != nil {
+		t.Fatalf("reconcilePublishedItems(): %v", err)
+	}
+
+	wantDownloadItemStatus(t, db, "crash-msg", "completed")
+	var mediaStatus, finalPath string
+	if err := db.QueryRow(`SELECT status, final_path FROM downloaded_media WHERE dialog_key = 'channel:crash' AND message_id = 55`).Scan(&mediaStatus, &finalPath); err != nil {
+		t.Fatal(err)
+	}
+	if mediaStatus != "completed" {
+		t.Fatalf("ownership row status = %q after recovery; want completed so the published file can be adopted", mediaStatus)
+	}
+	if finalPath != path {
+		t.Fatalf("ownership row final_path = %q; want %q", finalPath, path)
+	}
+
+	// The end-to-end consequence: another task must be able to adopt the file
+	// instead of waiting on a claim its owner abandoned.
+	item := source{Item: Item{DialogKey: "channel:crash", MessageID: 55}}
+	claim, adoptedPath, err := m.claimChatMedia("chat-wants", item)
+	if err != nil || claim != "completed" || adoptedPath != path {
+		t.Fatalf("claimChatMedia()=%q,%q,%v; want the published file to be adoptable", claim, adoptedPath, err)
+	}
+}
+
+// "Something exists at the destination" and "this media is already downloaded"
+// are different questions, and conflating them produces a failure no retry can
+// clear: a directory or dangling symlink at the destination is not a published
+// file, yet publishing still refuses to overwrite it, so every retry downloads
+// the whole file again and fails identically. Both outcomes must be
+// distinguishable and must name the path to clear.
+func TestPostgresPublishRefusesNonRegularDestinationWithActionableError(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	root := t.TempDir()
+	m := &Manager{db: db, downloadDir: root, events: newEventBus(), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	const pattern = "{{ .MessageID }}_blocked.bin"
+	config := settings.Defaults()
+	config.Download.FinalFilenameTemplate = pattern
+	item := source{Item: Item{DialogKey: "channel:blocked", MessageID: 7, OriginalName: "blocked.bin"}}
+	finalPath, err := finalDestination(root, pattern, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory occupies the destination without being a published file.
+	if err := os.MkdirAll(finalPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if regularFileExists(finalPath) {
+		t.Fatal("a directory must not count as an already-published file")
+	}
+	tempPath := filepath.Join(root, "incoming.bin")
+	if err := os.WriteFile(tempPath, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('blocked-dest','tg://m','channel','channel:blocked','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('blocked-dest','channel','channel:blocked',1,7,'blocked.bin','queued')`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.publishItem("blocked-dest", tempPath, item, config)
+	if err == nil {
+		t.Fatal("publishItem() succeeded over an occupied destination; want a refusal")
+	}
+	if !strings.Contains(err.Error(), finalPath) {
+		t.Fatalf("publishItem() error %q does not name the blocking path %q, so the operator cannot act on it", err.Error(), finalPath)
+	}
+	wantDownloadItemStatus(t, db, "blocked-dest", "failed")
+	var saved string
+	if err := db.QueryRow(`SELECT error FROM download_items WHERE job_id = 'blocked-dest'`).Scan(&saved); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(saved, "不是普通文件") {
+		t.Fatalf("saved item error = %q; want it to distinguish a non-regular occupant from an existing download", saved)
+	}
+	// The transfer was refused, so the source file must not have been moved.
+	if _, statErr := os.Stat(tempPath); statErr != nil {
+		t.Fatalf("the incoming file was consumed despite the refusal: %v", statErr)
+	}
+}
+
+// Stop has to end the worker loops. They are not driven by a task context, so
+// cancelling transfers leaves them polling — and the poll after Stop closes the
+// database is an error against a closed pool, repeated for the whole shutdown
+// window until the process happens to exit.
+func TestPostgresStopEndsEveryWorkerLoop(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	// chatWorker reaches the settings store for the listener reconcile, so the
+	// manager needs one the way New would provide it.
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{db: db, settings: store, events: newEventBus(), progress: newProgressStore(),
+		stopCh: make(chan struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1),
+		chatEventWake: make(chan struct{}, 1), slotWake: make(chan struct{}, 1),
+		rpcState: make(map[string]*telegramRPCState), chatActive: make(map[string]struct{}),
+		chatCancels: make(map[string]map[uint64]context.CancelFunc), cancels: make(map[string]context.CancelFunc)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	m.updateDatabaseHealth()
+
+	loops := map[string]func(){
+		"worker":             m.worker,
+		"chatWorker":         m.chatWorker,
+		"chatDownloadWorker": m.chatDownloadWorker,
+		"chatEventWorker":    m.chatEventWorker,
+	}
+	done := make(chan string, len(loops))
+	for name, loop := range loops {
+		go func(name string, loop func()) {
+			loop()
+			done <- name
+		}(name, loop)
+	}
+	// Let each loop reach its wait before stopping, so this measures the stop
+	// signal rather than a race with the first iteration.
+	time.Sleep(300 * time.Millisecond)
+	m.Stop()
+
+	exited := make(map[string]bool, len(loops))
+	deadline := time.After(10 * time.Second)
+	for len(exited) < len(loops) {
+		select {
+		case name := <-done:
+			exited[name] = true
+		case <-deadline:
+			missing := make([]string, 0, len(loops))
+			for name := range loops {
+				if !exited[name] {
+					missing = append(missing, name)
+				}
+			}
+			t.Fatalf("these loops kept running after Stop(): %v", missing)
+		}
+	}
+}
+
+// A chat item that exhausts its flood retry budget becomes terminal, and every
+// other chat transition to a terminal state releases the item's global claim.
+// An item that keeps owning media in downloaded_media blocks every other task
+// waiting on that media for good, because a waiter tests the claim rather than
+// the item's status — so the release has to share the transaction that fails it.
+func TestPostgresFloodedChatItemReleasesItsClaimWhenItGivesUp(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore(), reconcileWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('flood-chat','tg://c','channel','channel:flood',1,'test','account','downloading','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// One item has spent its budget, the other still has retries left. Both hold
+	// a claim while running.
+	seed := func(dialogKey string, messageID, attempts int) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, status, attempts, discovered_at) VALUES ('flood-chat',?,?,'f.bin','running',?,?)`, dialogKey, messageID, attempts, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?,?,'claimed','chat','flood-chat',?)`, dialogKey, messageID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("channel:flood", 41, maxStalledAttempts)
+	seed("channel:flood", 42, 1)
+
+	if err := m.requeueFloodedChatItems("flood-chat"); err != nil {
+		t.Fatalf("requeueFloodedChatItems(): %v", err)
+	}
+
+	var spentState, retryState string
+	if err := db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = 'flood-chat' AND message_id = 41`).Scan(&spentState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM chat_download_items WHERE chat_job_id = 'flood-chat' AND message_id = 42`).Scan(&retryState); err != nil {
+		t.Fatal(err)
+	}
+	if spentState != "failed" || retryState != "queued" {
+		t.Fatalf("item states = spent:%q retry:%q; want failed and queued", spentState, retryState)
+	}
+	var spentClaims, retryClaims int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:flood' AND message_id = 41`).Scan(&spentClaims); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:flood' AND message_id = 42`).Scan(&retryClaims); err != nil {
+		t.Fatal(err)
+	}
+	if spentClaims != 0 {
+		t.Fatalf("the given-up item still owns %d claim(s); every other task waiting on that media is now blocked for good", spentClaims)
+	}
+	if retryClaims != 1 {
+		t.Fatalf("the retrying item's claim count = %d; want 1 kept, since it will be retried", retryClaims)
+	}
+}
+
+// A task left at 'running' is never claimed again, because the scheduler only
+// picks 'queued' rows. The pre-flight destination check can fail every item of a
+// task before any transfer starts, so every outcome of "no work selected" has to
+// write a state — including the one where nothing is pending and nothing is
+// waiting on another task.
+func TestPostgresTaskWithNoPendingWorkIsNeverLeftRunning(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(jobID string, itemStates ...string) {
+		t.Helper()
+		if err := clearPostgresDownloadTestData(db); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES (?,'tg://m','channel',?,'test','account','running',?,?)`, jobID, "channel:"+jobID, now, now); err != nil {
+			t.Fatal(err)
+		}
+		for index, state := range itemStates {
+			if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES (?,'channel',?,1,?,'f.bin',?)`, jobID, "channel:"+jobID, index+1, state); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	check := func(jobID string, itemStates []string, waiting bool, want string) {
+		t.Helper()
+		seed(jobID, itemStates...)
+		m.finishTaskWithoutPendingWork(jobID, waiting)
+		if state := m.status(jobID); state != want {
+			t.Fatalf("finishTaskWithoutPendingWork() with items %v waiting=%v left the task %q; want %q", itemStates, waiting, state, want)
+		}
+	}
+
+	// The destination-blocked case: every item failed before any transfer.
+	check("no-work-failed", []string{"failed", "failed"}, false, "failed")
+	// Some files made it before the rest were blocked.
+	check("no-work-partial", []string{"completed", "failed"}, false, "partial")
+	// Everything is waiting on another task's claim.
+	check("no-work-waiting", []string{"waiting"}, false, "queued")
+	// Nothing left to do at all.
+	check("no-work-complete", []string{"completed"}, false, "completed")
+	// The caller's own flag, independent of the items: a task that observed a
+	// wait during this run must return to the queue rather than be failed.
+	check("no-work-flagged", []string{"failed"}, true, "queued")
+}
+
+// Admission must tell "nothing to do" apart from "try again". A filtered event
+// is not an error and must never be retried; an unavailable database is an error
+// the caller has to retry, because Telegram will not redeliver the update.
+func TestPostgresChatInboxAdmissionDistinguishesFailureFromFiltered(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore(), inboxRetry: make(chan inboxRetry, 4)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	// Admission gates on DatabaseAvailable, so its health state has to be real
+	// before either assertion below means anything.
+	m.updateDatabaseHealth()
+	if !m.DatabaseAvailable() {
+		t.Fatal("test requires a reachable database")
+	}
+	event := telegram.NewMessageEvent{AccountID: "account", DialogKey: "channel:admit", MessageID: 3}
+
+	// Database unavailable: the event is recoverable, so it must be reported.
+	m.dbOutage.Store(true)
+	if err := m.admitChatMessage(event); !errors.Is(err, errInboxUnavailable) {
+		t.Fatalf("admitChatMessage()=%v while the database is unavailable; want errInboxUnavailable so the caller retries", err)
+	}
+	m.dbOutage.Store(false)
+
+	// The dialog is not watched, so the event is simply not ours. Reporting it as
+	// a failure would retry it five times and then log a spurious loss.
+	if err := m.admitChatMessage(event); err != nil {
+		t.Fatalf("admitChatMessage()=%v for an unwatched dialog; want nil so it is not retried", err)
 	}
 }

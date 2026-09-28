@@ -65,6 +65,7 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
 		`CREATE INDEX IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
 		`CREATE INDEX IF NOT EXISTS download_items_status ON download_items(status)`,
+		`CREATE INDEX IF NOT EXISTS download_items_waiting_by_id ON download_items(id) WHERE status = 'waiting'`,
 		`CREATE INDEX IF NOT EXISTS download_items_failed_finished_at ON download_items(status, finished_at) WHERE status = 'failed'`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS download_jobs_visible_created_id ON download_jobs(created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
@@ -318,6 +319,16 @@ END $$`,
 		version: 14,
 		statements: []string{
 			`CREATE INDEX IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
+		},
+	},
+	{
+		// v15 keeps the waiting-item rotation an ordered index scan. The reconciler
+		// resumes each pass from an item id cursor, which the plain status index
+		// cannot serve in order; without this every pass would sort all waiting
+		// rows before applying the cursor.
+		version: 15,
+		statements: []string{
+			`CREATE INDEX IF NOT EXISTS download_items_waiting_by_id ON download_items(id) WHERE status = 'waiting'`,
 		},
 	},
 }

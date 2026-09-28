@@ -109,6 +109,21 @@ func minFloat(a, b float64) float64 {
 	return b
 }
 
+// telegramAccountBlocked reports whether Telegram has told us to wait for this
+// account. It reads the same in-memory state awaitTelegramRPC gates on, so the
+// scheduler can never admit a transfer that the metadata gate would refuse, and
+// the file-transfer path finally honours the account-wide window that
+// recordTelegramRPCError exists to enforce.
+func (m *Manager) telegramAccountBlocked(accountID string) bool {
+	if accountID == "" {
+		return false
+	}
+	m.rpcMu.Lock()
+	defer m.rpcMu.Unlock()
+	state := m.rpcState[accountID]
+	return state != nil && state.blockedUntil.After(time.Now())
+}
+
 // recordTelegramRPCError persists a server-mandated wait. It is intentionally
 // account-wide so a reaction, a history scan and a Bot-created task cannot
 // take turns violating the same FLOOD_WAIT window.

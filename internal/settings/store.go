@@ -113,9 +113,14 @@ func Open(dataDir string) (*Store, error) {
 		if _, present := raw.Download["includeReplies"]; !present {
 			s.values.Download.IncludeReplies = true
 		}
-		// Before the allow-list behaviour, an empty fileTypes list meant
-		// unrestricted. Migrate it once to the new safe default. After the
-		// marker is written, an empty list deliberately means download nothing.
+		// The marker lets an empty list mean "download nothing" instead of
+		// "unrestricted". A settings file written before the marker existed
+		// cannot express that distinction, so its selection is replaced with the
+		// default and the marker is written. Note the guard tests the marker's
+		// absence, not the list being empty: such a file is migrated whatever it
+		// contained. Every released build writes the marker, so no installed
+		// version can reach this — it exists only for settings files written by
+		// unreleased builds predating the marker.
 		if _, present := raw.Download["fileTypesInitialized"]; !present {
 			s.values.Download.FileTypes = append([]string(nil), Defaults().Download.FileTypes...)
 			s.values.Download.FileTypesInitialized = true
