@@ -74,7 +74,6 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS download_jobs_parent_created_id ON download_jobs(parent_chat_id, created_at DESC, id DESC)`,
 		`CREATE INDEX IF NOT EXISTS download_requests_job_id ON download_requests(job_id)`,
 		`CREATE INDEX IF NOT EXISTS download_requests_created_id ON download_requests(created_at, id)`,
-		`CREATE INDEX IF NOT EXISTS download_events_job_id ON download_events(job_id, id)`,
 		`CREATE INDEX IF NOT EXISTS download_events_created_id ON download_events(created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
 		`CREATE INDEX IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
@@ -88,8 +87,6 @@ func (m *Manager) migratePostgres() error {
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status)`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_self_created ON chat_download_jobs(account_id, dialog_type, created_at DESC, id DESC) WHERE status != 'deleted'`,
 		`CREATE INDEX IF NOT EXISTS chat_download_jobs_self_listener ON chat_download_jobs(account_id, dialog_type, listen_new, start_message_id, status, updated_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS chat_download_items_job ON chat_download_items(chat_job_id)`,
-		`CREATE INDEX IF NOT EXISTS chat_download_items_child_job ON chat_download_items(child_job_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
 		`CREATE INDEX IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
 		`CREATE INDEX IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
@@ -329,6 +326,38 @@ END $$`,
 		version: 15,
 		statements: []string{
 			`CREATE INDEX IF NOT EXISTS download_items_waiting_by_id ON download_items(id) WHERE status = 'waiting'`,
+		},
+	},
+	{
+		// v16 drops four indexes that no query can choose. Each one is maintained
+		// on every insert and every state change of chat_download_items, the table
+		// expected to hold tens of millions of rows, so their cost is paid on the
+		// hot write path for no read benefit. They were found by reading every
+		// statement that touches these tables, not by index scan counters: this
+		// database is small enough that the planner seq scans most tables, so a
+		// zero counter is not by itself evidence that an index is unused.
+		//   - chat_download_items_job is a strict prefix of the primary key
+		//     (chat_job_id, dialog_key, message_id), so anything it could serve
+		//     the primary key serves as well.
+		//   - chat_download_items_child_job indexes a column the v4 migration
+		//     already severed from the parent/child execution model. No statement
+		//     reads it, and it holds one empty string per row.
+		//   - chat_download_items_origin is only useful for filtering on
+		//     origin_message_id, which appears in select lists and inserts but
+		//     never in a predicate. Reply lookups use chat_reply_roots_lookup.
+		//   - download_events_job_id is never used: the table is appended to and
+		//     trimmed by created_at, and nothing filters it by job_id.
+		//
+		// The create statements for three of them also live in the unversioned
+		// statement list above, which runs on every startup. Dropping them here
+		// without removing those would undo this migration on the next boot, so
+		// both had to change together.
+		version: 16,
+		statements: []string{
+			`DROP INDEX IF EXISTS chat_download_items_job`,
+			`DROP INDEX IF EXISTS chat_download_items_child_job`,
+			`DROP INDEX IF EXISTS chat_download_items_origin`,
+			`DROP INDEX IF EXISTS download_events_job_id`,
 		},
 	},
 }
