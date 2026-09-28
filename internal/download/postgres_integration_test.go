@@ -1253,6 +1253,54 @@ func TestPostgresSummaryCountsBothQueuesAndRecentFailures(t *testing.T) {
 	}
 }
 
+// A chat item waiting on media that no message task owns, under a task that can
+// no longer run, can only ever be re-read and refused. Keeping those rows in the
+// reconcile scan meant a task that ended with many of them held a share of this
+// pass forever and crowded the batch window that movable items need. They are
+// skipped now, which shows up as a pass that never fills.
+func TestPostgresStrandedWaitingItemsDoNotOccupyTheReconcileWindow(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('stranded-chat','tg://chat','channel','channel:stranded',1,'test','account','completed','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// More than one batch, so a scan that still visits them cannot look short.
+	const stranded = chatClaimBatchSize + 44
+	for index := 0; index < stranded; index++ {
+		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, status, discovered_at) VALUES ('stranded-chat','channel:stranded',?,'channel',1,'waiting',?)`, index+1, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if next := m.reconcileChatClaims(chatClaimCursor{}); next != (chatClaimCursor{}) {
+		t.Fatalf("stranded waiting items filled the batch window: cursor = %#v", next)
+	}
+
+	// The item still moves when its task can run, so the skip is not a blanket
+	// exclusion of waiting items.
+	if _, err := db.Exec(`UPDATE chat_download_jobs SET status = 'downloading' WHERE id = 'stranded-chat'`); err != nil {
+		t.Fatal(err)
+	}
+	if next := m.reconcileChatClaims(chatClaimCursor{}); next == (chatClaimCursor{}) {
+		t.Fatal("a runnable task's waiting items must still be examined")
+	}
+}
+
 // seedQueuedJobForAccount creates one queued message task with a single queued
 // item, for the given account, using an explicit fixed-width timestamp so the
 // scheduler's created_at ordering is deterministic.

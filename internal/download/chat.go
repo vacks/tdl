@@ -676,7 +676,18 @@ func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
 	// silently dropped exactly the rows this pass exists to promote — an item
 	// whose blocker has released its claim. An empty status is the "unowned" case
 	// the logic below already handles.
-	rows, err := m.db.Query(`SELECT i.chat_job_id, i.dialog_key, i.message_id, COALESCE(m.status, ''), COALESCE(m.final_path, ''), j.status FROM chat_download_items i LEFT JOIN downloaded_media m ON m.dialog_key = i.dialog_key AND m.message_id = i.message_id JOIN chat_download_jobs j ON j.id = i.chat_job_id WHERE i.status = 'waiting' AND (i.chat_job_id, i.dialog_key, i.message_id) > (?, ?, ?) ORDER BY i.chat_job_id, i.dialog_key, i.message_id LIMIT ?`, cursor.chatJobID, cursor.dialogKey, cursor.messageID, chatClaimBatchSize)
+	// Skip an item whose task cannot run and whose media no message task could
+	// have finished. Such a row can only ever be re-read and refused: promotion
+	// is gated on the task being runnable, and the remaining branch needs a
+	// message task to own the media. A task that ended with many of them kept
+	// them in the scan forever, taking a permanent share of this reconciler and
+	// of the database, and crowding out the batch window that items which can
+	// actually move are waiting on.
+	//
+	// A task that cannot run yet whose media a message task owns is kept,
+	// because there the item is adopted straight to completed rather than
+	// promoted, and that is worth doing whatever the task's own state is.
+	rows, err := m.db.Query(`SELECT i.chat_job_id, i.dialog_key, i.message_id, COALESCE(m.status, ''), COALESCE(m.final_path, ''), j.status FROM chat_download_items i LEFT JOIN downloaded_media m ON m.dialog_key = i.dialog_key AND m.message_id = i.message_id JOIN chat_download_jobs j ON j.id = i.chat_job_id WHERE i.status = 'waiting' AND (j.status IN (?, ?, ?) OR m.owner_kind = 'message') AND (i.chat_job_id, i.dialog_key, i.message_id) > (?, ?, ?) ORDER BY i.chat_job_id, i.dialog_key, i.message_id LIMIT ?`, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, cursor.chatJobID, cursor.dialogKey, cursor.messageID, chatClaimBatchSize)
 	if err != nil {
 		return cursor
 	}
