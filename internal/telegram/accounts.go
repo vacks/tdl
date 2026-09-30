@@ -36,6 +36,15 @@ var (
 const (
 	sessionCheckInitialDelay = 15 * time.Second
 	sessionCheckInterval     = 30 * time.Minute
+	// sessionCheckTimeout bounds one validity probe. It no longer has to cover a
+	// connection handshake: the probe runs on the account's resident session, so
+	// the budget is for a single request plus whatever reconnect the session is
+	// already in the middle of.
+	sessionCheckTimeout = 30 * time.Second
+	// sessionStopTimeout bounds the wait for a connection to finish closing.
+	// Callers that need the wait are HTTP requests removing an account, and a
+	// timeout there only means the session files may be rewritten once more.
+	sessionStopTimeout = 2 * time.Second
 )
 
 type Account struct {
@@ -88,18 +97,163 @@ type loginJob struct {
 	password chan string
 }
 
-// updateHub owns the single long-lived Telegram update connection for one
-// account. Reaction and new-message consumers subscribe to this hub instead
-// of opening competing connections with the same authorization key.
-type updateHub struct {
-	cancel    context.CancelFunc
-	done      chan struct{}
-	proxy     string
-	ready     bool
-	nextID    uint64
+// accountSession is the one long-lived Telegram connection belonging to an
+// account. It carries both the updates every listener subscribes to and the
+// plain requests operations make, so an authorization key is used by exactly
+// one main session for as long as the account is authorized.
+//
+// It exists because every operation used to open a connection of its own.
+// Resolving a link opened one and the download that followed opened another; a
+// listener opened a third for each message it received. Each of those paid a
+// full TCP and MTProto handshake, and none of that cost was related to how much
+// was downloaded - it was a fixed price on every single operation.
+//
+// Keeping one connection also settled a question the lease could not. Validity
+// checks used to take an exclusive account lease so they would not open a
+// second main session beside an active one, but the update listener never took
+// that lease - so the invariant was already untrue - while an account that was
+// downloading or listening never released the lease, so the check those
+// accounts most needed never ran at all. There is nothing left to arbitrate
+// once there is only one connection for the check to use.
+type accountSession struct {
+	accountID string
+	// proxy is what the connection was opened with. A session whose proxy no
+	// longer matches the configured one is replaced rather than reused, because
+	// the upstream client reads the proxy once, when it builds the connection.
+	proxy  string
+	store  *accountStore
+	cancel context.CancelFunc
+	// done closes when the run loop has finished with this session, whether it
+	// ended because the account was removed, because the shutdown cancelled it,
+	// or because the authorization turned out to be unusable.
+	done chan struct{}
+
+	mu      sync.Mutex
+	client  *gotd.Client
+	readyCh chan struct{}
+	ready   bool
+	lastErr error
+	nextID  uint64
+
 	reactions map[uint64]func(context.Context, ReactionEvent)
 	messages  map[uint64]func(context.Context, NewMessageEvent)
 	readies   map[uint64]func()
+}
+
+// waitReady blocks until the connection is authenticated and returns the client
+// to use. A session that has ended reports why, so a caller learns the reason
+// instead of waiting out its own deadline.
+func (s *accountSession) waitReady(ctx context.Context) (*gotd.Client, error) {
+	for {
+		s.mu.Lock()
+		client, readyCh := s.client, s.readyCh
+		s.mu.Unlock()
+		if client != nil {
+			return client, nil
+		}
+		select {
+		case <-readyCh:
+			// The connection can drop between the signal and the read above. The
+			// loop then waits for the next one rather than handing out a client
+			// that is already gone.
+		case <-s.done:
+			return nil, s.terminalError()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// markReady publishes a freshly authenticated connection and returns the
+// listeners that have to be told about it. Both happen under one acquisition of
+// the lock: a listener subscribing while this runs must be told exactly once,
+// either by the snapshot or by its own ready check, and never by both.
+//
+// A reconnect fires them again on purpose. Work that only runs while updates
+// arrive - the listener gap walk - has to be re-armed after every interruption,
+// because whatever was missed while the connection was down is exactly what it
+// exists to recover.
+func (s *accountSession) markReady(client *gotd.Client) []func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.client = client
+	s.ready = true
+	// A successful connection supersedes whatever the last failure was, so a
+	// later terminal error cannot report a cause that has already been outlived.
+	s.lastErr = nil
+	select {
+	case <-s.readyCh:
+	default:
+		close(s.readyCh)
+	}
+	callbacks := make([]func(), 0, len(s.readies))
+	for _, callback := range s.readies {
+		callbacks = append(callbacks, callback)
+	}
+	return callbacks
+}
+
+// markDisconnected records that the current connection is gone and arms a fresh
+// readiness signal, so a caller waiting on it waits for the next connection
+// rather than proceeding with the dead one.
+//
+// The channel being replaced is closed, not discarded. A caller inside waitReady
+// is parked on whichever channel it read, and only a close wakes it; replacing
+// the field leaves that caller waiting on a channel nothing will ever close,
+// while the connection it is waiting for closes a different one. The connection
+// that follows a failed attempt is the ordinary case, not an exotic one, so
+// discarding the channel stranded an operation - and, because that operation
+// holds the account's read lease, it stranded account removal behind it too.
+func (s *accountSession) markDisconnected(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.client = nil
+	s.ready = false
+	select {
+	case <-s.readyCh:
+	default:
+		close(s.readyCh)
+	}
+	s.readyCh = make(chan struct{})
+	if err != nil {
+		s.lastErr = err
+	}
+}
+
+func (s *accountSession) terminalError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastErr != nil {
+		return s.lastErr
+	}
+	return errors.New("Telegram 连接已关闭")
+}
+
+// sessionBuildError marks a failure to construct the connection at all, as
+// opposed to a connection that was built and then dropped.
+//
+// The two need opposite treatment. A dropped connection is worth retrying
+// behind the caller's back, which is what the session loop is for. A connection
+// that cannot be constructed at all is not: building it reads the app
+// configuration and the proxy from the account store, and when either is
+// unusable no amount of waiting changes the answer. Retrying it hides the
+// reason and leaves every caller waiting on a session that will never be ready,
+// which - for the callers that pass a context with no deadline - means forever.
+// The old code returned this error straight to the caller, and so does this.
+type sessionBuildError struct{ err error }
+
+func (e *sessionBuildError) Error() string { return e.err.Error() }
+func (e *sessionBuildError) Unwrap() error { return e.err }
+
+// stop cancels the session and waits, within a bound, for its run loop to
+// finish.
+func (s *accountSession) stop(timeout time.Duration) {
+	s.cancel()
+	select {
+	case <-s.done:
+	case <-time.After(timeout):
+		applog.Error("telegram", "session_stop_timeout", "account_id", s.accountID)
+	}
 }
 
 // Manager owns account metadata and keeps each Telegram session in its own private file.
@@ -117,8 +271,8 @@ type Manager struct {
 	proxyURL   func() string
 	ctx        context.Context
 	cancel     context.CancelFunc
-	updatesMu  sync.Mutex
-	updates    map[string]*updateHub
+	sessionsMu sync.Mutex
+	sessions   map[string]*accountSession
 	// rpcGate paces the metadata requests this manager issues. It is installed
 	// by whoever owns the account-wide rate limit - the download service - and
 	// called before every request in the list below. Held behind a lock rather
@@ -230,7 +384,7 @@ func Open(dataDir string, proxyURL func() string) (*Manager, error) {
 		return nil, fmt.Errorf("create Telegram state directory: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Manager{root: root, path: filepath.Join(root, "accounts.json"), jobs: make(map[string]*loginJob), operations: make(map[string]*sync.RWMutex), stores: make(map[string]*sync.RWMutex), proxyURL: proxyURL, ctx: ctx, cancel: cancel, updates: make(map[string]*updateHub)}
+	m := &Manager{root: root, path: filepath.Join(root, "accounts.json"), jobs: make(map[string]*loginJob), operations: make(map[string]*sync.RWMutex), stores: make(map[string]*sync.RWMutex), proxyURL: proxyURL, ctx: ctx, cancel: cancel, sessions: make(map[string]*accountSession)}
 	if data, err := os.ReadFile(m.path); err == nil {
 		var saved persisted
 		if err := json.Unmarshal(data, &saved); err != nil {
@@ -396,31 +550,14 @@ func (m *Manager) Delete(id string) error {
 	delete(m.stores, id)
 	delete(m.operations, id)
 	m.mu.Unlock()
-	// The update connection belongs to the account, not to whatever subscribed
-	// to it. Removing the account has to close it, and close it before the files
-	// come off disk: the hub holds its own MTProto client and its own
-	// accountStore, and that store writes the session and state files back. A hub
-	// left running recreated the material this method had just removed, and kept
-	// an authenticated connection open for an account that no longer exists.
-	//
-	// The wait is bounded because the caller is an HTTP request: the hub normally
-	// exits as soon as its context is cancelled, and a timeout only means the
-	// files may be rewritten once more, which the cleanup error below still
-	// reports.
-	m.updatesMu.Lock()
-	hub := m.updates[id]
-	if hub != nil {
-		delete(m.updates, id)
-	}
-	m.updatesMu.Unlock()
-	if hub != nil {
-		hub.cancel()
-		select {
-		case <-hub.done:
-		case <-time.After(2 * time.Second):
-			applog.Error("telegram", "update_connection_stop_timeout", "account_id", id)
-		}
-	}
+	// The account's connection belongs to the account, not to whatever was using
+	// it. Removing the account has to close it, and close it before the files
+	// come off disk: the session holds its own MTProto client and its own
+	// accountStore, and that store writes the session and state files back. A
+	// session left running recreated the material this method had just removed,
+	// and kept an authenticated connection open for an account that no longer
+	// exists.
+	m.stopSession(id)
 	// The account metadata is now durably removed. Surface a private-file cleanup
 	// failure to the caller so it can be handled instead of silently leaving an
 	// orphaned Telegram session on disk.
@@ -528,6 +665,117 @@ func (m *Manager) normalizeRawSelfPeer(accountID string, raw tg.PeerClass) tg.In
 	return nil
 }
 
+// acquireSession returns the account's resident connection, opening it if the
+// account has none yet.
+//
+// A session built for a different proxy is replaced rather than reused. The
+// upstream client reads the proxy once, when it builds the connection, so
+// reusing the session would keep talking through a route the operator has
+// already abandoned.
+func (m *Manager) acquireSession(id string) (*accountSession, error) {
+	for {
+		m.mu.RLock()
+		account, ok := m.accountLocked(id)
+		m.mu.RUnlock()
+		if !ok || account.State != "authorized" {
+			return nil, ErrNotAuthorized
+		}
+		proxy := m.proxyURL()
+		m.sessionsMu.Lock()
+		session := m.sessions[id]
+		if session != nil && session.proxy == proxy {
+			m.sessionsMu.Unlock()
+			return session, nil
+		}
+		if session == nil {
+			ctx, cancel := context.WithCancel(m.ctx)
+			session = &accountSession{
+				accountID: id,
+				proxy:     proxy,
+				store:     m.accountStore(id),
+				cancel:    cancel,
+				done:      make(chan struct{}),
+				readyCh:   make(chan struct{}),
+				reactions: make(map[uint64]func(context.Context, ReactionEvent)),
+				messages:  make(map[uint64]func(context.Context, NewMessageEvent)),
+				readies:   make(map[uint64]func()),
+			}
+			m.sessions[id] = session
+			m.sessionsMu.Unlock()
+			// The account may have been removed between the read above and this
+			// registration. Delete detaches whatever is registered when it runs,
+			// so a session registered after that point would survive it - and
+			// this one is permanent, so it would go on holding an authenticated
+			// connection and rewriting the session files Delete just removed.
+			m.mu.RLock()
+			_, stillPresent := m.accountLocked(id)
+			m.mu.RUnlock()
+			if !stillPresent {
+				m.cancelSession(session)
+				return nil, ErrNotAuthorized
+			}
+			go m.runSession(ctx, session)
+			return session, nil
+		}
+		delete(m.sessions, id)
+		m.sessionsMu.Unlock()
+		applog.Info("telegram", "session_proxy_changed", "account_id", id, "proxy_changed", true)
+		session.stop(sessionStopTimeout)
+	}
+}
+
+// detachSession removes an account's session from the registry without stopping
+// it, so the caller decides whether the wait is needed.
+func (m *Manager) detachSession(id string) *accountSession {
+	m.sessionsMu.Lock()
+	defer m.sessionsMu.Unlock()
+	session := m.sessions[id]
+	delete(m.sessions, id)
+	return session
+}
+
+// dropSession cancels an account's connection without waiting for it. It is for
+// the state changes that make the connection unusable - the authorization was
+// rejected, the account is being logged in again - where nothing on disk
+// depends on the wait.
+func (m *Manager) dropSession(id string) {
+	if session := m.detachSession(id); session != nil {
+		session.cancel()
+	}
+}
+
+// stopSession cancels an account's connection and waits for it to finish.
+//
+// Only removal needs the wait. The session holds its own MTProto client and its
+// own accountStore, and that store writes the session and state files back, so
+// taking those files off disk while the session was still running let it
+// recreate them and left an authenticated connection open for an account that
+// no longer exists.
+func (m *Manager) stopSession(id string) {
+	if session := m.detachSession(id); session != nil {
+		session.stop(sessionStopTimeout)
+	}
+}
+
+// forgetSession clears a session the run loop has finished with. It only
+// removes the entry if that entry is still this session, because a replacement
+// may already have taken its place.
+func (m *Manager) forgetSession(session *accountSession) {
+	m.sessionsMu.Lock()
+	if m.sessions[session.accountID] == session {
+		delete(m.sessions, session.accountID)
+	}
+	m.sessionsMu.Unlock()
+}
+
+// cancelSession stops one specific session, detaching it only if it is still the
+// registered one: a session that has already been replaced must not remove its
+// replacement from the registry on its way out.
+func (m *Manager) cancelSession(session *accountSession) {
+	m.forgetSession(session)
+	session.cancel()
+}
+
 // ListenReactions subscribes to the account's shared Telegram update
 // connection and reports only reactions made by that account.
 func (m *Manager) ListenReactions(ctx context.Context, id string, onEvent func(context.Context, ReactionEvent), onReady func()) error {
@@ -541,100 +789,110 @@ func (m *Manager) ListenNewMessages(ctx context.Context, id string, onEvent func
 }
 
 func (m *Manager) listenUpdates(ctx context.Context, id string, onReaction func(context.Context, ReactionEvent), onMessage func(context.Context, NewMessageEvent), onReady func()) error {
-	m.mu.RLock()
-	account, ok := m.accountLocked(id)
-	m.mu.RUnlock()
-	if !ok || account.State != "authorized" {
-		return ErrNotAuthorized
+	session, err := m.acquireSession(id)
+	if err != nil {
+		return err
 	}
 
-	m.updatesMu.Lock()
-	hub := m.updates[id]
-	if hub == nil {
-		hubCtx, cancel := context.WithCancel(m.ctx)
-		hub = &updateHub{cancel: cancel, done: make(chan struct{}), proxy: m.proxyURL(), reactions: make(map[uint64]func(context.Context, ReactionEvent)), messages: make(map[uint64]func(context.Context, NewMessageEvent)), readies: make(map[uint64]func())}
-		m.updates[id] = hub
-		go m.runUpdateHub(hubCtx, id, hub)
-	}
-	hub.nextID++
-	subscriptionID := hub.nextID
+	session.mu.Lock()
+	session.nextID++
+	subscriptionID := session.nextID
 	if onReaction != nil {
-		hub.reactions[subscriptionID] = onReaction
+		session.reactions[subscriptionID] = onReaction
 	}
 	if onMessage != nil {
-		hub.messages[subscriptionID] = onMessage
+		session.messages[subscriptionID] = onMessage
 	}
 	if onReady != nil {
-		hub.readies[subscriptionID] = onReady
-		if hub.ready {
+		session.readies[subscriptionID] = onReady
+		if session.ready {
 			go onReady()
 		}
 	}
-	m.updatesMu.Unlock()
+	session.mu.Unlock()
 
 	<-ctx.Done()
-	m.removeUpdateSubscription(id, hub, subscriptionID)
+	m.removeUpdateSubscription(session, subscriptionID)
 	return ctx.Err()
 }
 
-func (m *Manager) removeUpdateSubscription(id string, hub *updateHub, subscriptionID uint64) {
-	m.updatesMu.Lock()
-	defer m.updatesMu.Unlock()
-	if m.updates[id] != hub {
-		return
-	}
-	delete(hub.reactions, subscriptionID)
-	delete(hub.messages, subscriptionID)
-	delete(hub.readies, subscriptionID)
-	if len(hub.reactions) == 0 && len(hub.messages) == 0 {
-		delete(m.updates, id)
-		hub.cancel()
-	}
+// removeUpdateSubscription retires one listener's callbacks. It deliberately
+// does not close the connection when the last one leaves: the session belongs
+// to the account, not to the listener, and keeping it open is what makes the
+// next incoming message - and the next link, and the next validity probe - cost
+// no handshake.
+func (m *Manager) removeUpdateSubscription(session *accountSession, subscriptionID uint64) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	delete(session.reactions, subscriptionID)
+	delete(session.messages, subscriptionID)
+	delete(session.readies, subscriptionID)
 }
 
-func (m *Manager) runUpdateHub(ctx context.Context, accountID string, hub *updateHub) {
-	defer close(hub.done)
+// runSession owns one account's connection: it opens it, and reopens it after a
+// failure that waiting can outlast.
+//
+// This is the only place that constructs a connection for an account to make
+// requests on. It runs for as long as the account stays authorized, so the
+// handshake it performs is paid once rather than once per operation.
+func (m *Manager) runSession(ctx context.Context, session *accountSession) {
+	defer close(session.done)
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := m.runUpdateConnection(ctx, accountID, hub); err != nil && ctx.Err() == nil {
-			if isTerminalSessionError(err) {
-				// Nothing about waiting makes an unusable authorization usable.
-				// Marking the account expired stops every listener that depends
-				// on it and tells the person to log in again, which is the only
-				// thing that can actually fix this.
-				applog.Error("telegram", "update_listener_session_expired", "account_id", accountID, "error", err.Error())
-				m.markExpired(accountID)
-				// Drop the registration before returning. The hub is finished,
-				// and a subscription arriving after a re-login would otherwise
-				// attach to it and wait for updates that can never arrive.
-				m.updatesMu.Lock()
-				if m.updates[accountID] == hub {
-					delete(m.updates, accountID)
-				}
-				m.updatesMu.Unlock()
-				return
-			}
-			delay := time.Duration(1<<min(attempt, 5)) * time.Second
-			applog.Error("telegram", "update_listener_retry_scheduled", "account_id", accountID, "attempt", attempt+1, "retry_after", delay.String(), "error", err.Error())
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(delay):
-			}
-			continue
+		err := m.runSessionConnection(ctx, session)
+		if ctx.Err() != nil {
+			return
 		}
-		return
+		if err == nil {
+			return
+		}
+		session.markDisconnected(err)
+		// A connection that cannot be built is not improved by another attempt,
+		// so the session ends and the caller is handed the reason instead of
+		// being left to wait out its own deadline. The next operation builds a
+		// fresh session, so a corrected proxy or app configuration takes effect
+		// without the account having to be re-logged-in.
+		var buildErr *sessionBuildError
+		if errors.As(err, &buildErr) {
+			applog.Error("telegram", "session_unbuildable", "account_id", session.accountID, "error", err.Error())
+			m.forgetSession(session)
+			return
+		}
+		if isTerminalSessionError(err) {
+			// Nothing about waiting makes an unusable authorization usable.
+			// Marking the account expired stops every listener that depends on
+			// it and tells the person to log in again, which is the only thing
+			// that can actually fix this.
+			applog.Error("telegram", "session_rejected", "account_id", session.accountID, "error", err.Error())
+			m.markExpired(session.accountID)
+			// Drop the registration before returning. A subscription arriving
+			// after a re-login would otherwise attach to a finished session and
+			// wait for updates that can never arrive.
+			m.forgetSession(session)
+			return
+		}
+		// The retry budget is for answers a later attempt can outlast - a closed
+		// connection, a peer that was briefly unreachable - and every one of the
+		// terminal errors above is deliberately not among them.
+		delay := time.Duration(1<<min(attempt, 5)) * time.Second
+		applog.Error("telegram", "session_retry_scheduled", "account_id", session.accountID, "attempt", attempt+1, "retry_after", delay.String(), "error", err.Error())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
 	}
 }
 
-func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub *updateHub) error {
-	store := m.accountStore(accountID)
+func (m *Manager) runSessionConnection(ctx context.Context, session *accountSession) error {
+	accountID := session.accountID
+	store := session.store
 	dispatcher := tg.NewUpdateDispatcher()
 	var client *gotd.Client
 	dispatchReaction := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass, updateType string) {
-		m.dispatchEditedReaction(updateCtx, accountID, updateType, entities, raw, client, func(_ context.Context, event ReactionEvent) { m.dispatchReaction(accountID, event) })
+		m.dispatchEditedReaction(updateCtx, accountID, updateType, entities, raw, client, func(_ context.Context, event ReactionEvent) { m.dispatchReaction(session, event) })
 	}
 	dispatcher.OnMessageReactions(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateMessageReactions) error {
 		reactions := &update.Reactions
@@ -647,7 +905,7 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			return nil
 		}
 		applog.Info("reaction", "own_reaction_received", "account_id", accountID, "dialog_id", event.DialogID, "message_id", update.MsgID, "emojis", emojis, "summary", reactions.Min)
-		m.dispatchReaction(accountID, event)
+		m.dispatchReaction(session, event)
 		return nil
 	})
 	dispatchMessage := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass) {
@@ -664,7 +922,7 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			// is what left every ordinary message labelled with a placeholder.
 			dialogID := inputPeerID(input)
 			key := newMessageDialogKey(input, accountID)
-			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: inputPeerDisplayName(input, entities), MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+			m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: inputPeerDisplayName(input, entities), MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 			return
 		}
 		// The entity is missing from this update, so only a resolved peer can
@@ -686,17 +944,17 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			// Telegram omits entities, normalize that raw identity as well; using
 			// user:<id> here would never match the durable self:<account> key.
 			if input := m.normalizeRawSelfPeer(accountID, message.PeerID); input != nil {
-				m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: "self:" + accountID, DialogID: 0, DialogName: savedDialogName, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+				m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: "self:" + accountID, DialogID: 0, DialogName: savedDialogName, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 				return
 			}
 			kind, id := peerIdentity(message.PeerID)
 			key := kind + ":" + fmt.Sprint(id)
-			m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+			m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 			return
 		}
 		dialogID := inputPeerID(input)
 		key := newMessageDialogKey(input, accountID)
-		m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+		m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 	}
 	dispatcher.OnNewMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 		dispatchMessage(updateCtx, entities, update.Message)
@@ -731,48 +989,30 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 	// contacts.resolveUsername requests the download path does, against the same
 	// account and the same server-side window, so leaving them unpaced meant the
 	// listener and the transfers were not sharing one budget at all.
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, false, m.rpcGateMiddleware(accountID))
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher}, false, m.rpcGateMiddleware(accountID))
 	if err != nil {
-		return fmt.Errorf("创建 Telegram 更新监听连接: %w", err)
+		return &sessionBuildError{err: fmt.Errorf("创建 Telegram 连接: %w", err)}
 	}
-	applog.Info("telegram", "update_listener_connected", "account_id", accountID)
+	applog.Info("telegram", "session_connected", "account_id", accountID)
 	return client.Run(ctx, func(runCtx context.Context) error {
 		if _, err := client.Self(runCtx); err != nil {
 			return err
 		}
-		m.markUpdateHubReady(accountID, hub)
+		for _, callback := range session.markReady(client) {
+			callback()
+		}
 		<-runCtx.Done()
 		return nil
 	})
 }
 
-func (m *Manager) markUpdateHubReady(accountID string, hub *updateHub) {
-	m.updatesMu.Lock()
-	if m.updates[accountID] != hub {
-		m.updatesMu.Unlock()
-		return
-	}
-	hub.ready = true
-	callbacks := make([]func(), 0, len(hub.readies))
-	for _, callback := range hub.readies {
+func (m *Manager) dispatchReaction(session *accountSession, event ReactionEvent) {
+	session.mu.Lock()
+	callbacks := make([]func(context.Context, ReactionEvent), 0, len(session.reactions))
+	for _, callback := range session.reactions {
 		callbacks = append(callbacks, callback)
 	}
-	m.updatesMu.Unlock()
-	for _, callback := range callbacks {
-		callback()
-	}
-}
-
-func (m *Manager) dispatchReaction(accountID string, event ReactionEvent) {
-	m.updatesMu.Lock()
-	hub := m.updates[accountID]
-	callbacks := make([]func(context.Context, ReactionEvent), 0)
-	if hub != nil {
-		for _, callback := range hub.reactions {
-			callbacks = append(callbacks, callback)
-		}
-	}
-	m.updatesMu.Unlock()
+	session.mu.Unlock()
 	// The manager's own context travels with the event. A fresh background one
 	// discarded cancellation and deadlines, which made the consumers' ctx.Err()
 	// guards unreachable and left nothing able to interrupt a callback already
@@ -782,16 +1022,13 @@ func (m *Manager) dispatchReaction(accountID string, event ReactionEvent) {
 	}
 }
 
-func (m *Manager) dispatchMessage(accountID string, event NewMessageEvent) {
-	m.updatesMu.Lock()
-	hub := m.updates[accountID]
-	callbacks := make([]func(context.Context, NewMessageEvent), 0)
-	if hub != nil {
-		for _, callback := range hub.messages {
-			callbacks = append(callbacks, callback)
-		}
+func (m *Manager) dispatchMessage(session *accountSession, event NewMessageEvent) {
+	session.mu.Lock()
+	callbacks := make([]func(context.Context, NewMessageEvent), 0, len(session.messages))
+	for _, callback := range session.messages {
+		callbacks = append(callbacks, callback)
 	}
-	m.updatesMu.Unlock()
+	session.mu.Unlock()
 	for _, callback := range callbacks {
 		callback(m.ctx, event)
 	}
@@ -1046,28 +1283,44 @@ func (m *Manager) Run(ctx context.Context, id string, fn func(context.Context, *
 
 func (m *Manager) runAccount(ctx context.Context, id string, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
 	operation := m.operation(id)
-	// Telegram authorization is safe to use from several independent client
-	// connections. A shared read lease permits the configured job concurrency;
-	// exclusive leases remain for removal and session validation.
+	// A shared lease, which concurrent operations all take at once. It is no
+	// longer about how many connections an account may have - there is one - but
+	// about ordering against removal: Delete takes the lease exclusively, so the
+	// account's session and state files cannot disappear underneath an operation
+	// that is still using them.
 	operation.RLock()
 	defer operation.RUnlock()
 	return m.runAccountLocked(ctx, id, fn)
 }
 
+// runAccountLocked runs one operation on the account's resident connection.
+//
+// It used to build a client and run it for the duration of the call, which is
+// where every operation's fixed cost came from. It now waits for the account's
+// session instead, and the only thing that opens a connection is runSession.
 func (m *Manager) runAccountLocked(ctx context.Context, id string, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
-	m.mu.RLock()
-	account, ok := m.accountLocked(id)
-	proxyURL := m.proxyURL
-	m.mu.RUnlock()
-	if !ok || account.State != "authorized" {
-		return ErrNotAuthorized
-	}
-	store := m.accountStore(id)
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: proxyURL()}, false, m.rpcGateMiddleware(id))
+	session, err := m.acquireSession(id)
 	if err != nil {
-		return fmt.Errorf("创建 Telegram 客户端失败: %w", err)
+		return err
 	}
-	return client.Run(ctx, func(ctx context.Context) error { return fn(ctx, client, store) })
+	client, err := session.waitReady(ctx)
+	if err != nil {
+		return err
+	}
+	// The operation's context ends when the account's connection does, not only
+	// when its caller gives up. Callers hand this context to a transfer, and a
+	// transfer whose connection is gone has to stop rather than keep waiting for
+	// bytes that can no longer arrive.
+	opCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-session.done:
+			cancel()
+		case <-opCtx.Done():
+		}
+	}()
+	return fn(opCtx, client, session.store)
 }
 
 func (m *Manager) operation(id string) *sync.RWMutex {
@@ -1095,9 +1348,21 @@ func (m *Manager) monitorSessions(ctx context.Context) {
 	}
 }
 
-// checkSessions is intentionally independent of downloads and other business
-// operations. A successful Self request confirms that Telegram still accepts
-// the saved authorization key for that individual account.
+// checkSessions confirms that Telegram still accepts each account's saved
+// authorization key. A successful Self request is the whole test.
+//
+// The probe runs on the account's resident connection, so it opens nothing. It
+// used to take an exclusive lease for the account so that it would not open a
+// second main session beside a download or a listener, which had two outcomes
+// and both were wrong: the listener never took that lease, so the invariant the
+// lease defended was never true, and an account with work in flight never
+// released it, so the check was skipped for exactly the accounts whose sessions
+// are most likely to be noticed as revoked. Riding the one connection removes
+// the question - there is no second session to avoid, and nothing to wait for.
+//
+// The shared lease it does take is the same one every other operation takes,
+// and it is there for removal rather than for connections: Delete waits for
+// in-flight work before it takes the session files off disk.
 func (m *Manager) checkSessions(parent context.Context) {
 	m.mu.RLock()
 	ids := make([]string, 0, len(m.accounts))
@@ -1109,18 +1374,14 @@ func (m *Manager) checkSessions(parent context.Context) {
 	m.mu.RUnlock()
 	for _, id := range ids {
 		operation := m.operation(id)
-		// Do not open a second main MTProto session with the same authorization
-		// key while a download or another account operation is active.
-		if !operation.TryLock() {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(parent, 45*time.Second)
+		operation.RLock()
+		ctx, cancel := context.WithTimeout(parent, sessionCheckTimeout)
 		err := m.runAccountLocked(ctx, id, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
 			_, err := client.Self(ctx)
 			return err
 		})
 		cancel()
-		operation.Unlock()
+		operation.RUnlock()
 		if isTerminalSessionError(err) {
 			m.markExpired(id)
 			continue
@@ -1192,6 +1453,12 @@ func (m *Manager) markChecked(id string) {
 }
 
 func (m *Manager) markExpired(id string) {
+	// The connection is unusable whatever the loop below decides, so it is
+	// dropped either way. This is registered before the lock so that it runs
+	// after the state change has been saved, and it does not wait: the run loop
+	// that reported the failure is usually the one being cancelled, and it has
+	// nothing left to protect on disk.
+	defer m.dropSession(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := range m.accounts {
@@ -1294,8 +1561,15 @@ func (m *Manager) setState(id, state, message string) {
 func (m *Manager) setError(id string, err error) {
 	applog.Error("telegram", "account_error", "account_id", id, "error", err.Error())
 	m.setState(id, "error", err.Error())
+	// The account is no longer authorized, so nothing may still be using its
+	// connection. A later login builds a new one from the new session file.
+	m.dropSession(id)
 }
 func (m *Manager) authorize(id string, user *tg.User) {
+	// A fresh authorization invalidates any connection opened with the material
+	// that preceded it. There is normally none - the account was not authorized
+	// a moment ago - and this is what makes that true even if it was.
+	m.dropSession(id)
 	m.update(id, func(a *Account) {
 		a.TelegramID, a.FirstName, a.LastName, a.Username = user.ID, user.FirstName, user.LastName, user.Username
 		a.State, a.Error, a.QRCode = "authorized", "", ""

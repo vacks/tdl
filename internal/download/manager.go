@@ -1649,8 +1649,14 @@ func (m *Manager) run(job Job, sources []source) {
 	// that fails to parse is left to the existing check further down, which
 	// already reports it.
 	preflightConfig, preflightErr := m.downloadConfigForJob(job.ConfigJSON)
-	pending := make([]source, 0, len(sources))
-	waitingForOwner := false
+	// The destination preflight stays per file: it is local filesystem work, and
+	// it has to happen before the media is claimed. The ownership question it
+	// used to be interleaved with is asked once for the whole set instead. That
+	// loop was a claim transaction per file over a list that has no upper bound
+	// - a task holds a row per media comment - so a large task spent its whole
+	// startup in the database while the worker that could have been transferring
+	// sat idle.
+	candidates := make([]source, 0, len(sources))
 	for _, item := range sources {
 		if ctx.Err() != nil || !m.runningOrUnknown(job.ID) {
 			return
@@ -1674,27 +1680,36 @@ func (m *Manager) run(job Job, sources []source) {
 				}
 			}
 		}
-		claim, path, claimErr := m.claimMessageMedia(job.ID, item)
-		if claimErr != nil {
-			m.fail(job.ID, fmt.Errorf("确认文件归属失败: %w", claimErr))
-			return
-		}
-		switch claim {
+		candidates = append(candidates, item)
+	}
+	claims, claimErr := m.claimMediaBatch("message", job.ID, candidates)
+	if claimErr != nil {
+		m.fail(job.ID, fmt.Errorf("确认文件归属失败: %w", claimErr))
+		return
+	}
+	pending := make([]source, 0, len(candidates))
+	waiting := make([]source, 0)
+	waitingForOwner := false
+	for _, item := range candidates {
+		claim := claims[mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}]
+		switch claim.state {
 		case "completed":
-			if err := m.adoptCompletedMessageItem(job.ID, item, path); err != nil {
+			if err := m.adoptCompletedMessageItem(job.ID, item, claim.path); err != nil {
 				m.fail(job.ID, fmt.Errorf("复用已完成文件失败: %w", err))
 				return
 			}
-			continue
 		case "waiting":
-			if err := m.setMessageItemWaiting(job.ID, item); err != nil {
-				m.fail(job.ID, fmt.Errorf("保存文件等待状态失败: %w", err))
-				return
-			}
-			waitingForOwner = true
-			continue
+			waiting = append(waiting, item)
+		default:
+			pending = append(pending, item)
 		}
-		pending = append(pending, item)
+	}
+	if len(waiting) > 0 {
+		if err := m.setMessageItemsWaiting(job.ID, waiting); err != nil {
+			m.fail(job.ID, fmt.Errorf("保存文件等待状态失败: %w", err))
+			return
+		}
+		waitingForOwner = true
 	}
 	if len(pending) == 0 {
 		m.finishTaskWithoutPendingWork(job.ID, waitingForOwner)
@@ -2220,6 +2235,219 @@ func (m *Manager) claimMedia(ownerKind, ownerID string, item source) (string, st
 	return "", "", errors.New("文件归属竞争过于频繁，请重试")
 }
 
+// mediaClaimKey is one media identity: the pair claimMedia claims on.
+type mediaClaimKey struct {
+	dialogKey string
+	messageID int
+}
+
+// mediaClaim is claimMedia's verdict for one identity, in the same three states
+// it returns: queued (this task may transfer it), waiting (another task holds
+// it) and completed (another task already published it, at path).
+type mediaClaim struct {
+	state string
+	path  string
+}
+
+// mediaClaimChunk bounds one set-based statement. The parameter ceiling is far
+// away; this is sized so a single statement stays a short, predictable unit and
+// so a task holding tens of thousands of files streams through the claim in
+// pieces instead of building one enormous statement.
+const mediaClaimChunk = 256
+
+// tupleInList renders a `(?,?),(?,?),...` row-value predicate for a set of
+// media identities, with the arguments in the order the placeholders appear.
+//
+// The identity is a row value rather than two independent IN lists because the
+// pair is what the tables are keyed by: `(dialog_key, message_id)` is the
+// primary key of downloaded_media and `(chat_job_id, dialog_key, message_id)`
+// that of chat_download_items, so the composite form is answered by an index
+// seek instead of a filter. Message ids are also only unique inside one dialog,
+// so an unpaired list would match unrelated rows.
+//
+// message_id is cast explicitly. A parameter's type is decided by the server
+// before any cast applied to the column it lands in, and an unconstrained one
+// defaults to text; the same list is also used to seed a VALUES list, where
+// there is no column to imply a type from at all. Without the cast the driver
+// is told to encode an integer as text and refuses.
+func tupleInList(keys []mediaClaimKey) (string, []any) {
+	placeholders := make([]string, 0, len(keys))
+	args := make([]any, 0, len(keys)*2)
+	for _, key := range keys {
+		placeholders = append(placeholders, "(?,?::integer)")
+		args = append(args, key.dialogKey, key.messageID)
+	}
+	return strings.Join(placeholders, ","), args
+}
+
+// mediaKeys projects a batch of sources onto the identities a set-based claim
+// statement works in. Order is preserved; duplicates are left alone, because a
+// repeated row value in a predicate is harmless and the callers that would
+// otherwise need deduplication already have it.
+func mediaKeys(items []source) []mediaClaimKey {
+	keys := make([]mediaClaimKey, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID})
+	}
+	return keys
+}
+
+// forEachKeyChunk runs one set-based statement per bounded slice. Every
+// statement this file builds from a caller-supplied set goes through here, so
+// none of them can grow past the parameter limit when a task holds an unbounded
+// number of files.
+func forEachKeyChunk(keys []mediaClaimKey, run func([]mediaClaimKey) error) error {
+	for start := 0; start < len(keys); start += mediaClaimChunk {
+		if err := run(keys[start:min(start+mediaClaimChunk, len(keys))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// claimMediaBatch is the set-based form of claimMedia, for the callers that
+// decide the fate of a whole batch at once.
+//
+// It exists because the per-item form is a transaction per file - BEGIN, read,
+// write, COMMIT - and the two batch call sites ran it in a loop. A 64 file
+// session batch spent roughly 320 round trips answering "who owns this?" one
+// file at a time, all of it while holding that session's own lock, so the
+// task's pause and publish queued behind bookkeeping. A message task was worse:
+// its loop covers every file of the task and has no bound at all.
+//
+// The work is now one set-based statement per chunk, two when part of the set
+// already existed, and at most one per file for the case in step 3:
+//
+//  1. Claim everything nobody owns in one INSERT ... SELECT ... ON CONFLICT DO
+//     NOTHING RETURNING. RETURNING yields only the rows this statement actually
+//     inserted, which is exactly the set this task won. The insert is the whole
+//     claim operation, so the concurrency guarantee is unchanged from the
+//     per-item form: the primary key decides the winner, and a loser sees the
+//     winner on the read below rather than overwriting it. When every identity
+//     was unclaimed this is the only statement the whole batch costs.
+//  2. Read the rows that were not won - the ones that already existed plus any
+//     this task lost to a concurrent claim - and classify them by the same
+//     rules claimMedia applies. This is skipped entirely when nothing was left.
+//  3. Anything that does not classify cleanly is handed to claimMedia itself.
+//     That is the completed-but-the-file-is-gone case, where the state has to
+//     be replaced under a guard that only the per-item transaction provides. It
+//     is rare, and falling back to the proven path for it keeps this function's
+//     fast path free of a second implementation of that guard.
+//
+// The read in step 2 is deliberately advisory. A row can change between the
+// claim and the read, and the two misclassifications that follow are both
+// self-correcting: a "waiting" verdict for media whose owner has just released
+// it is what reconcileChatClaims and reconcileMessageClaims exist to promote,
+// and a "queued" verdict for media the owner still holds is caught by the
+// guard on the next state write for that row.
+func (m *Manager) claimMediaBatch(ownerKind, ownerID string, items []source) (map[mediaClaimKey]mediaClaim, error) {
+	seen := make(map[mediaClaimKey]struct{}, len(items))
+	keys := make([]mediaClaimKey, 0, len(items))
+	for _, item := range items {
+		key := mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	results := make(map[mediaClaimKey]mediaClaim, len(keys))
+	if err := forEachKeyChunk(keys, func(chunk []mediaClaimKey) error {
+		return m.claimMediaChunk(ownerKind, ownerID, chunk, results)
+	}); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (m *Manager) claimMediaChunk(ownerKind, ownerID string, keys []mediaClaimKey, results map[mediaClaimKey]mediaClaim) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	list, pairs := tupleInList(keys)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// The select list is written before the VALUES list, so its three parameters
+	// are bound first.
+	claimArgs := append([]any{ownerKind, ownerID, now}, pairs...)
+	rows, err := m.db.Query(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) SELECT v.dialog_key, v.message_id, 'claimed', ?, ?, ? FROM (VALUES `+list+`) AS v(dialog_key, message_id) ON CONFLICT(dialog_key, message_id) DO NOTHING RETURNING dialog_key, message_id`, claimArgs...)
+	if err != nil {
+		return err
+	}
+	won := make(map[mediaClaimKey]struct{}, len(keys))
+	for rows.Next() {
+		var key mediaClaimKey
+		if err := rows.Scan(&key.dialogKey, &key.messageID); err != nil {
+			rows.Close()
+			return err
+		}
+		won[key] = struct{}{}
+		results[key] = mediaClaim{state: "queued"}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	losers := make([]mediaClaimKey, 0, len(keys)-len(won))
+	for _, key := range keys {
+		if _, ok := won[key]; !ok {
+			losers = append(losers, key)
+		}
+	}
+	if len(losers) == 0 {
+		return nil
+	}
+	lost, lostArgs := tupleInList(losers)
+	existing, err := m.db.Query(`SELECT dialog_key, message_id, status, final_path, owner_kind, owner_id FROM downloaded_media WHERE (dialog_key, message_id) IN (`+lost+`)`, lostArgs...)
+	if err != nil {
+		return err
+	}
+	type ownerRow struct {
+		status, path, kind, id string
+	}
+	observed := make(map[mediaClaimKey]ownerRow, len(losers))
+	for existing.Next() {
+		var key mediaClaimKey
+		var row ownerRow
+		if err := existing.Scan(&key.dialogKey, &key.messageID, &row.status, &row.path, &row.kind, &row.id); err != nil {
+			existing.Close()
+			return err
+		}
+		observed[key] = row
+	}
+	if err := existing.Close(); err != nil {
+		return err
+	}
+	// replace collects the rows the bulk read could not classify. A loser with
+	// no row at all belongs here too: its owner released the claim by deleting
+	// the row between the two statements, so it is unowned again and the
+	// per-item path will simply claim it.
+	var replace []mediaClaimKey
+	for _, key := range losers {
+		row, ok := observed[key]
+		if !ok {
+			replace = append(replace, key)
+			continue
+		}
+		switch {
+		case row.status == "completed" && row.path != "" && regularFileExists(row.path):
+			results[key] = mediaClaim{state: "completed", path: row.path}
+		case row.status == "claimed" && row.kind == ownerKind && row.id == ownerID:
+			results[key] = mediaClaim{state: "queued"}
+		case row.status == "claimed":
+			results[key] = mediaClaim{state: "waiting"}
+		default:
+			replace = append(replace, key)
+		}
+	}
+	for _, key := range replace {
+		state, path, err := m.claimMedia(ownerKind, ownerID, source{Item: Item{DialogKey: key.dialogKey, MessageID: key.messageID}})
+		if err != nil {
+			return err
+		}
+		results[key] = mediaClaim{state: state, path: path}
+	}
+	return nil
+}
+
 func (m *Manager) adoptCompletedMessageItem(jobID string, item source, path string) error {
 	_, err := m.db.Exec(`UPDATE download_items SET status = 'completed', final_path = ?, error = '', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status != 'completed'`, path, time.Now().UTC().Format(time.RFC3339Nano), jobID, item.DialogKey, item.MessageID)
 	if err == nil {
@@ -2229,7 +2457,19 @@ func (m *Manager) adoptCompletedMessageItem(jobID string, item source, path stri
 }
 
 func (m *Manager) setMessageItemWaiting(jobID string, item source) error {
-	_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status NOT IN ('completed', 'waiting')`, jobID, item.DialogKey, item.MessageID)
+	return m.setMessageItemsWaiting(jobID, []source{item})
+}
+
+// setMessageItemsWaiting parks a whole set of files whose media another task
+// owns. One statement per chunk rather than one per file: a task whose media is
+// held by a running session task can be waiting on many files at once, and the
+// per-file form spent a round trip on each of them before the transfer began.
+func (m *Manager) setMessageItemsWaiting(jobID string, items []source) error {
+	err := forEachKeyChunk(mediaKeys(items), func(chunk []mediaClaimKey) error {
+		list, args := tupleInList(chunk)
+		_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND status NOT IN ('completed', 'waiting') AND (dialog_key, message_id) IN (`+list+`)`, append([]any{jobID}, args...)...)
+		return err
+	})
 	if err == nil {
 		m.touch()
 		// A new waiting item is only useful once the reconciler looks at it, and

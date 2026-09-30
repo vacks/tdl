@@ -821,6 +821,29 @@ func (m *Manager) claimChatMedia(chatID string, item source) (string, string, er
 	return m.claimMedia("chat", chatID, item)
 }
 
+// markChatItemsWaiting parks a whole claim window whose media another task
+// owns, in one statement. The rows all belong to this session task, so the
+// composite primary key answers the row-value lookup.
+func (m *Manager) markChatItemsWaiting(chatID string, items []source) error {
+	return forEachKeyChunk(mediaKeys(items), func(chunk []mediaClaimKey) error {
+		list, args := tupleInList(chunk)
+		_, err := m.db.Exec(`UPDATE chat_download_items SET status = 'waiting', error = '' WHERE chat_job_id = ? AND status = 'queued' AND (dialog_key, message_id) IN (`+list+`)`, append([]any{chatID}, args...)...)
+		return err
+	})
+}
+
+// beginChatItemAttempts records one transfer attempt for a whole window, in one
+// statement. The status guard carries the same meaning it does in
+// beginItemAttempts: a pause or cancel that landed while the window was being
+// assembled must not be undone by attempt bookkeeping.
+func (m *Manager) beginChatItemAttempts(chatID string, items []source) error {
+	return forEachKeyChunk(mediaKeys(items), func(chunk []mediaClaimKey) error {
+		list, args := tupleInList(chunk)
+		_, err := m.db.Exec(`UPDATE chat_download_items SET attempts = attempts + 1, error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND status = 'queued' AND (dialog_key, message_id) IN (`+list+`)`, append([]any{chatID}, args...)...)
+		return err
+	})
+}
+
 // runOneChatBatch claims only a bounded slice of the media index. New media
 // is made eligible as soon as it is indexed; within that visible queue, newer
 // message IDs always take precedence. There is no per-media download task:
@@ -963,34 +986,43 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	// holding the lock across both is what makes the pair atomic.
 	//
 	// The lock is per chat, so this only delays that task's own control actions
-	// and publishes, and a bounded batch is a short hold.
+	// and publishes. "A bounded batch is a short hold" used to be the argument
+	// for that, and it was not true: the window was bounded in files but each
+	// file cost its own transaction, so a full batch held the lock across
+	// hundreds of round trips and the task's own pause queued behind them. The
+	// three set-based statements below are what makes the bound mean something.
 	lock := m.chatLock(id)
 	lock.Lock()
 	if !chatRunnable(m.chatStatus(id)) {
 		lock.Unlock()
 		return false, nil
 	}
+	claims, err := m.claimMediaBatch("chat", id, batch)
+	if err != nil {
+		lock.Unlock()
+		return false, err
+	}
 	transfer = make([]source, 0, len(batch))
+	waiting := make([]source, 0, len(batch))
 	for _, item := range batch {
-		claim, path, err := m.claimChatMedia(id, item)
-		if err != nil {
-			lock.Unlock()
-			return false, err
-		}
-		switch claim {
+		claim := claims[mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}]
+		switch claim.state {
 		case "completed":
-			if err := m.setChatItem(id, item, "completed", path, ""); err != nil {
+			if err := m.setChatItem(id, item, "completed", claim.path, ""); err != nil {
 				lock.Unlock()
 				return false, err
 			}
 			adopted++
 		case "waiting":
-			if _, err := m.db.Exec(`UPDATE chat_download_items SET status = 'waiting', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
-				lock.Unlock()
-				return false, err
-			}
+			waiting = append(waiting, item)
 		default:
 			transfer = append(transfer, item)
+		}
+	}
+	if len(waiting) > 0 {
+		if err := m.markChatItemsWaiting(id, waiting); err != nil {
+			lock.Unlock()
+			return false, err
 		}
 	}
 	batch = transfer
@@ -998,11 +1030,9 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		lock.Unlock()
 		return false, nil
 	}
-	for _, item := range batch {
-		if _, err := m.db.Exec(`UPDATE chat_download_items SET attempts = attempts + 1, error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'queued'`, id, item.DialogKey, item.MessageID); err != nil {
-			lock.Unlock()
-			return false, err
-		}
+	if err := m.beginChatItemAttempts(id, batch); err != nil {
+		lock.Unlock()
+		return false, err
 	}
 	// Register this transfer while still holding the same lock as pause/cancel.
 	// This closes the remaining window where a control action could finish before

@@ -3005,3 +3005,158 @@ func TestPostgresClearStoppedEventsRemovesOnlyFailedRows(t *testing.T) {
 		t.Fatalf("StoppedEventCounts() still reports %d stopped events after a clear", stopped)
 	}
 }
+
+// claimMediaBatch is the set-based form of claimMedia, and both batch call
+// sites depend on the two answering identically. Every fixture below seeds two
+// media in the same state - one claimed per item, one through the batch - and
+// the verdicts are compared, so the fast path cannot drift away from the
+// guarded per-item path it replaced.
+func TestPostgresBatchClaimMatchesPerItemClaim(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatalf("migratePostgres(): %v", err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// A completed row only counts as published while the bytes are still on
+	// disk, so the adoptable case needs a real file and the stale case needs a
+	// path that no longer resolves.
+	dir := t.TempDir()
+	published := filepath.Join(dir, "published.bin")
+	if err := os.WriteFile(published, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	vanished := filepath.Join(dir, "vanished.bin")
+	claimRow := func(status, path, kind, id string) func(*testing.T, mediaClaimKey) {
+		return func(t *testing.T, key mediaClaimKey) {
+			t.Helper()
+			if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, key.dialogKey, key.messageID, path, status, kind, id, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	noRow := func(*testing.T, mediaClaimKey) {}
+
+	for _, tc := range []struct {
+		name      string
+		seed      func(*testing.T, mediaClaimKey)
+		wantState string
+		wantPath  string
+		// wantOwner is the ownership row after the call. A "waiting" verdict
+		// must leave another task's ownership exactly as it found it: taking it
+		// would be the double download the claim exists to prevent.
+		wantOwner string
+	}{
+		{"unowned", noRow, "queued", "", "chat/batch-chat"},
+		{"owned by this task", claimRow("claimed", "", "chat", "batch-chat"), "queued", "", "chat/batch-chat"},
+		{"owned by another chat task", claimRow("claimed", "", "chat", "other-chat"), "waiting", "", "chat/other-chat"},
+		{"owned by a message task", claimRow("claimed", "", "message", "other-message"), "waiting", "", "message/other-message"},
+		{"published", claimRow("completed", published, "chat", "other-chat"), "completed", published, "chat/other-chat"},
+		{"published file removed", claimRow("completed", vanished, "chat", "other-chat"), "queued", "", "chat/batch-chat"},
+		{"published without a path", claimRow("completed", "", "chat", "other-chat"), "queued", "", "chat/batch-chat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Two identities in the same state, so neither call can observe or
+			// disturb the other's row.
+			itemKey := mediaClaimKey{dialogKey: "channel:" + tc.name, messageID: 1}
+			batchKey := mediaClaimKey{dialogKey: "channel:" + tc.name, messageID: 2}
+			tc.seed(t, itemKey)
+			tc.seed(t, batchKey)
+
+			itemState, itemPath, err := m.claimMedia("chat", "batch-chat", source{Item: Item{DialogKey: itemKey.dialogKey, MessageID: itemKey.messageID}})
+			if err != nil {
+				t.Fatalf("claimMedia(): %v", err)
+			}
+			claims, err := m.claimMediaBatch("chat", "batch-chat", []source{{Item: Item{DialogKey: batchKey.dialogKey, MessageID: batchKey.messageID}}})
+			if err != nil {
+				t.Fatalf("claimMediaBatch(): %v", err)
+			}
+			batched, ok := claims[batchKey]
+			if !ok {
+				t.Fatalf("claimMediaBatch() returned no verdict for %+v", batchKey)
+			}
+			if batched.state != tc.wantState || batched.path != tc.wantPath {
+				t.Fatalf("claimMediaBatch()=%q,%q; want %q,%q", batched.state, batched.path, tc.wantState, tc.wantPath)
+			}
+			if batched.state != itemState || batched.path != itemPath {
+				t.Fatalf("claimMediaBatch()=%q,%q disagrees with claimMedia()=%q,%q on the same fixture", batched.state, batched.path, itemState, itemPath)
+			}
+			var kind, id string
+			if err := db.QueryRow(`SELECT owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, batchKey.dialogKey, batchKey.messageID).Scan(&kind, &id); err != nil {
+				t.Fatalf("read the batched row back: %v", err)
+			}
+			if got := kind + "/" + id; got != tc.wantOwner {
+				t.Fatalf("owner after the batch claim = %s, want %s", got, tc.wantOwner)
+			}
+		})
+	}
+}
+
+// A task holds a row per media comment, so the set handed to the batch claim is
+// not bounded by the batch window. Chunking has to be invisible: one call
+// returns a verdict for every identity it was given, and the pass after it -
+// the resumed case - reports this task's own claims as its own rather than as
+// someone else's.
+func TestPostgresBatchClaimSpansMoreThanOneChunk(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatalf("migratePostgres(): %v", err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	total := mediaClaimChunk*2 + 7
+	items := make([]source, 0, total)
+	for index := 0; index < total; index++ {
+		items = append(items, source{Item: Item{DialogKey: "channel:wide", MessageID: index + 1}})
+	}
+	claims, err := m.claimMediaBatch("chat", "wide-chat", items)
+	if err != nil {
+		t.Fatalf("claimMediaBatch(): %v", err)
+	}
+	if len(claims) != total {
+		t.Fatalf("verdicts=%d, want %d", len(claims), total)
+	}
+	var owned int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_id = 'wide-chat'`).Scan(&owned); err != nil || owned != total {
+		t.Fatalf("owned rows=%d err=%v, want %d", owned, err, total)
+	}
+	again, err := m.claimMediaBatch("chat", "wide-chat", items)
+	if err != nil {
+		t.Fatalf("claimMediaBatch() resumed: %v", err)
+	}
+	for key, claim := range again {
+		if claim.state != "queued" {
+			t.Fatalf("resumed verdict for %+v = %q, want queued", key, claim.state)
+		}
+	}
+	// Repeating an identity inside one call is the same claim, not a second one.
+	repeated := append(append([]source(nil), items...), items...)
+	deduped, err := m.claimMediaBatch("chat", "wide-chat", repeated)
+	if err != nil {
+		t.Fatalf("claimMediaBatch() with repeats: %v", err)
+	}
+	if len(deduped) != total {
+		t.Fatalf("verdicts with repeats=%d, want %d", len(deduped), total)
+	}
+}

@@ -5,10 +5,15 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/iyear/tdl/core/storage"
 )
 
 // A listener-named dialog must read its display name from the same entity map
@@ -173,5 +178,270 @@ func TestOwnReactionEmojisOnlyReturnsCurrentAccountStandardEmoji(t *testing.T) {
 	got := ownReactionEmojis(reactions)
 	if len(got) != 2 || got[0] != "👍" || got[1] != "❤️" {
 		t.Fatalf("ownReactionEmojis() = %#v, want [👍 ❤️]", got)
+	}
+}
+
+// openSessionTestManager builds a manager holding one authorized account.
+//
+// The account is written before Open reads it, so the manager reaches the same
+// state a real one would after a login. The proxy decides which way the
+// connection fails - see brokenProxy and unreachableProxy - and in both cases
+// it fails locally, so these tests never depend on the network or on a Telegram
+// account being available.
+func openSessionTestManager(t *testing.T, proxy func() string) (*Manager, string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "telegram"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const accountID = "session-test-account"
+	payload := `{"accounts":[{"id":"` + accountID + `","telegramId":1,"state":"authorized","createdAt":"2026-01-01T00:00:00Z"}],"currentId":"` + accountID + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "telegram", "accounts.json"), []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Open(dir, proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	return m, accountID
+}
+
+// brokenProxy cannot even be parsed back into a dialer, so the connection
+// cannot be constructed at all. It is the configuration-error case.
+func brokenProxy() string { return "://not-a-proxy" }
+
+// unreachableProxy parses, so the connection is constructed - but nothing is
+// listening, so it never becomes ready. The session survives that and keeps
+// retrying, which is the state the registry tests need to observe. The address
+// is a closed port on the loopback interface, so no packet leaves the machine.
+func unreachableProxy() string { return "socks5://127.0.0.1:1" }
+
+// Every operation on an account used to build its own client, so two calls
+// never shared a connection. The registry is what makes them share one, and
+// this is the assertion that the sharing actually happens.
+func TestAcquireSessionReusesOneConnectionPerAccount(t *testing.T) {
+	m, accountID := openSessionTestManager(t, unreachableProxy)
+
+	first, err := m.acquireSession(accountID)
+	if err != nil {
+		t.Fatalf("acquireSession(): %v", err)
+	}
+	second, err := m.acquireSession(accountID)
+	if err != nil {
+		t.Fatalf("acquireSession() second call: %v", err)
+	}
+	if first != second {
+		t.Fatal("a second operation opened a second connection for the same account")
+	}
+	m.sessionsMu.Lock()
+	live := len(m.sessions)
+	m.sessionsMu.Unlock()
+	if live != 1 {
+		t.Fatalf("registered sessions=%d, want 1", live)
+	}
+	select {
+	case <-first.done:
+		t.Fatal("the session ended while it should still be reconnecting")
+	default:
+	}
+}
+
+// The upstream client reads the proxy once, when it builds the connection, so a
+// session opened through the old route cannot be reused after the operator
+// changes it.
+func TestAcquireSessionReplacesConnectionWhenTheProxyChanges(t *testing.T) {
+	var mu sync.Mutex
+	proxy := unreachableProxy()
+	m, accountID := openSessionTestManager(t, func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return proxy
+	})
+
+	first, err := m.acquireSession(accountID)
+	if err != nil {
+		t.Fatalf("acquireSession(): %v", err)
+	}
+	mu.Lock()
+	proxy = "socks5://127.0.0.1:2"
+	mu.Unlock()
+
+	second, err := m.acquireSession(accountID)
+	if err != nil {
+		t.Fatalf("acquireSession() after a proxy change: %v", err)
+	}
+	if second == first {
+		t.Fatal("the session survived a proxy change and would keep using the old route")
+	}
+	select {
+	case <-first.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the replaced session was never stopped")
+	}
+}
+
+// Removal has to be able to wait for the connection, because the session writes
+// the session and state files back through its own store and Delete removes
+// those files immediately afterwards.
+func TestStopSessionEndsTheConnectionAndClearsTheRegistry(t *testing.T) {
+	m, accountID := openSessionTestManager(t, unreachableProxy)
+
+	session, err := m.acquireSession(accountID)
+	if err != nil {
+		t.Fatalf("acquireSession(): %v", err)
+	}
+	m.stopSession(accountID)
+	select {
+	case <-session.done:
+	default:
+		t.Fatal("stopSession returned with the connection still running")
+	}
+	m.sessionsMu.Lock()
+	live := len(m.sessions)
+	m.sessionsMu.Unlock()
+	if live != 0 {
+		t.Fatalf("registered sessions=%d after stop, want 0", live)
+	}
+}
+
+// A connection that cannot be constructed has to reach the caller as an error
+// rather than become a wait.
+//
+// Retrying it behind the caller's back is the failure mode this guards: the
+// session loop never gives up, so a caller would wait for a session that can
+// never become ready - and several call sites pass a context with no deadline,
+// for which that wait is forever. The context here is deliberately unbounded
+// for that reason.
+func TestRunReportsAnUnbuildableConnectionInsteadOfWaitingForever(t *testing.T) {
+	m, accountID := openSessionTestManager(t, brokenProxy)
+
+	called := false
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(context.Background(), accountID, func(context.Context, *gotd.Client, storage.Storage) error {
+			called = true
+			return nil
+		})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Run() succeeded without a connection")
+		}
+		if !strings.Contains(err.Error(), "创建 Telegram 连接") {
+			t.Fatalf("Run() = %v; want the failure to name the connection it could not build", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run() never returned for a connection that cannot be built")
+	}
+	if called {
+		t.Fatal("the operation ran against a connection that was never established")
+	}
+}
+
+// The validity probe rides the account's own connection, so an account with
+// work in flight is no longer excluded from being checked.
+//
+// The read lease held here is the one a running download holds for its whole
+// duration. Under the exclusive lease the probe used to take, TryLock could not
+// succeed while any operation was running, so the check was skipped for exactly
+// the accounts whose sessions are most likely to have been revoked. The
+// observable is the connection appearing in the registry: the probe has to have
+// reached the account to put it there.
+func TestCheckSessionsProbesWhileAnOperationHoldsTheReadLease(t *testing.T) {
+	m, accountID := openSessionTestManager(t, unreachableProxy)
+
+	operation := m.operation(accountID)
+	operation.RLock()
+	defer operation.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.checkSessions(ctx)
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		m.sessionsMu.Lock()
+		live := len(m.sessions)
+		m.sessionsMu.Unlock()
+		if live == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("checkSessions never reached the account's connection while a read lease was held")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkSessions did not return after its context was cancelled")
+	}
+}
+
+// A caller waiting for the connection is woken by exactly one thing: a close on
+// the channel it read. So the channel that is replaced when the connection
+// drops has to be closed, not discarded.
+//
+// Discarding it strands the caller on a channel nothing will ever close, while
+// the reconnection it is waiting for closes the new one. The sequence that
+// produces it is ordinary - an attempt fails, the next one succeeds - and the
+// consequence is not confined to the caller: it waits while holding the
+// account's read lease, so account removal queues behind it too. This pins the
+// contract directly rather than trying to win a race against the scheduler.
+func TestMarkDisconnectedClosesTheChannelAWaiterHolds(t *testing.T) {
+	session := &accountSession{done: make(chan struct{}), readyCh: make(chan struct{})}
+	held := session.readyCh
+	session.markDisconnected(errors.New("connection reset by peer"))
+
+	select {
+	case <-held:
+	default:
+		t.Fatal("markDisconnected replaced the readiness channel without closing it; a caller already waiting on it is never woken by the next connection")
+	}
+	if session.readyCh == held {
+		t.Fatal("the replaced channel is still the current one, so no new readiness signal was armed")
+	}
+}
+
+// The same contract in the shape it actually occurs: a caller parked before a
+// failed attempt has to be woken by the connection that follows it.
+func TestWaitReadyIsWokenByTheReconnectionAfterAFailedAttempt(t *testing.T) {
+	session := &accountSession{done: make(chan struct{}), readyCh: make(chan struct{})}
+	client := gotd.NewClient(1, "0123456789abcdef0123456789abcdef", gotd.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	woke := make(chan *gotd.Client, 1)
+	go func() {
+		ready, err := session.waitReady(ctx)
+		if err != nil {
+			woke <- nil
+			return
+		}
+		woke <- ready
+	}()
+
+	// Long enough that the caller above has read its state and is parked. A
+	// caller that had not yet done so would read the re-armed channel and pass
+	// either way, which is the case this delay rules out.
+	time.Sleep(50 * time.Millisecond)
+	session.markDisconnected(errors.New("connection reset by peer"))
+	session.markReady(client)
+
+	select {
+	case ready := <-woke:
+		if ready != client {
+			t.Fatal("waitReady() returned without the reconnected client")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitReady() was never woken by the connection that replaced the failed one")
 	}
 }
