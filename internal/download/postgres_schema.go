@@ -143,12 +143,42 @@ var postgresIndexStatements = []string{
 	`CREATE INDEX IF NOT EXISTS download_jobs_visible_created_id ON download_jobs(created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
 	`CREATE INDEX IF NOT EXISTS download_jobs_visible_status_created_id ON download_jobs(status, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
 	`CREATE INDEX IF NOT EXISTS download_jobs_status_updated_id ON download_jobs(status, updated_at, id)`,
+	// The scheduler's ready-work probe, and the only index whose column order
+	// matches it: nextQueued reads the oldest queued task, ascending, and asks
+	// nothing about parent_chat_id, so neither half of the set above can serve
+	// it. download_jobs_created_id sorts the wrong way and carries every status;
+	// the visible_* indexes are partial on parent_chat_id = '', which every
+	// child task of a session download fails.
+	//
+	// Without this index the planner has two bad choices once the queued set
+	// grows: sort every queued row, or walk the created_at index backwards and
+	// filter the whole permanent history. Measured on two million tasks with
+	// fifty thousand queued, it picked the second - 456 ms and forty thousand
+	// buffers to return sixteen rows, on a query sixteen workers run. The
+	// partial index turns the same query into an index seek: 0.15 ms, five
+	// buffers. The queued set is not naturally small - one session scan queues a
+	// child task per media message - so this is a load-bearing index, not an
+	// optimisation for an unlikely shape.
+	`CREATE INDEX IF NOT EXISTS download_jobs_queued_created_id ON download_jobs(created_at, id) WHERE status = 'queued'`,
 	`CREATE INDEX IF NOT EXISTS download_jobs_account_visible_created_id ON download_jobs(account_id, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
 
 	// ---- auxiliary history ----
 	`CREATE INDEX IF NOT EXISTS download_requests_created_id ON download_requests(created_at, id)`,
 	`CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
 	`CREATE INDEX IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
+	// The event list reads the open queue newest first, and the count above it
+	// asks the same question. Narrowed to the open statuses so the index holds
+	// only events someone can still act on: a settled row is the permanent
+	// majority of the table, and indexing those would make the index grow with
+	// the whole history and every page a scan across it.
+	//
+	// The predicate is openEventStatuses, the same string the two reads use.
+	// A partial index only serves a seek when the planner can prove the query's
+	// WHERE implies the index's, so writing the two separately is how the list
+	// quietly loses its seek and falls back to filtering - or, as happened
+	// here, how a new terminal status keeps being listed as waiting work by a
+	// predicate that was written as a negation.
+	`CREATE INDEX IF NOT EXISTS reaction_inbox_open_created_id ON reaction_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
 	`CREATE INDEX IF NOT EXISTS download_resets_created ON download_resets(created_at)`,
 
 	// ---- chat_download_jobs: one row per stream task ----
@@ -183,6 +213,9 @@ var postgresIndexStatements = []string{
 
 	`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
 	`CREATE INDEX IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
+	// Counterpart of reaction_inbox_open_created_id: the message arm of the
+	// event list, restricted to the queue the list is allowed to show.
+	`CREATE INDEX IF NOT EXISTS chat_message_inbox_open_created_id ON chat_message_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
 	`CREATE INDEX IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
 	`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
 	`CREATE INDEX IF NOT EXISTS telegram_rate_limits_blocked_until ON telegram_rate_limits(blocked_until)`,
@@ -654,6 +687,36 @@ END $$`,
         FROM chat_reply_roots WHERE discussion_dialog_key <> ''
         ORDER BY chat_job_id, (discussion_peer_type <> '') DESC) s
  WHERE s.chat_job_id = j.id AND j.discussion_dialog_key = ''`,
+		},
+	},
+	{
+		// v21 gives the listener queues a second terminal status, 'skipped', and
+		// the event list two indexes whose predicate names the open statuses
+		// instead of negating one of the settled ones.
+		//
+		// The drop is the load bearing part. Both indexes keep their names,
+		// because nothing about what they serve changed - so their new
+		// definition is invisible to CREATE INDEX IF NOT EXISTS, which sees the
+		// name already present and does nothing. Without this, every database
+		// that ran the previous build keeps an index whose predicate is
+		// "status <> 'done'", while the list query now asks for the open
+		// statuses. The planner cannot prove that query implies that predicate,
+		// so the index stops serving the read as a seek: it still gets used,
+		// but as a filter that walks every settled entry above the page.
+		// Measured on a scratch table, the same page went from an index only
+		// scan at cost 2.36 to a filtered scan at 21.38, and the gap grows with
+		// the settled rows a cursor has to step over.
+		//
+		// Dropping normally is deliberate. These are queue tables with a
+		// retention sweep, not the permanent history, so the rebuild is short;
+		// and the replacement is built immediately afterwards by
+		// ensurePostgresIndexes, which runs after this migration and uses the
+		// concurrent channel. On a database that never ran the previous build
+		// the names do not exist and both statements are no-ops.
+		version: 21,
+		statements: []string{
+			`DROP INDEX IF EXISTS reaction_inbox_open_created_id`,
+			`DROP INDEX IF EXISTS chat_message_inbox_open_created_id`,
 		},
 	},
 }

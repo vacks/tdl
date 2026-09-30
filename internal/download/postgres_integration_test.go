@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2026,7 +2027,17 @@ func TestPostgresStopEndsEveryWorkerLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{db: db, settings: store, events: newEventBus(), progress: newProgressStore(),
+	// The chat worker reconciles listeners, which needs to know which accounts
+	// can hold a connection, so this Manager needs the account store the way
+	// New would provide it. Leaving it out made the loop panic rather than
+	// exercise the stop signal this test is about.
+	accounts, err := telegram.Open(t.TempDir(), func() string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(accounts.Stop)
+	m := &Manager{db: db, settings: store, accounts: accounts, events: newEventBus(), progress: newProgressStore(),
+		chatWatched: make(map[string]map[string]struct{}), chatListeners: make(map[string]*chatListener),
 		stopCh: make(chan struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1),
 		chatDownloadWake: []chan struct{}{make(chan struct{}, 1)},
 		chatEventWake:    make(chan struct{}, 1), slotWake: make(chan struct{}, 1),
@@ -2793,5 +2804,204 @@ func TestPostgresListenerInboxCountsSeparateWaitingFromStopped(t *testing.T) {
 	}
 	if processing != 1 || waiting != 2 || stopped != 1 {
 		t.Fatalf("counts=%d processing/%d waiting/%d stopped, want 1/2/1", processing, waiting, stopped)
+	}
+}
+
+// TestPostgresListenerEventPagesWalkBothInboxesExactlyOnce seeds more open
+// events than one page holds, across both inboxes, and walks the whole list.
+// The properties it checks are the ones a merged keyset page can break
+// silently: a completed row leaking into a list that is not supposed to show
+// it, a row shown twice or skipped when a page boundary falls inside a tie, and
+// one of the two inboxes being lost by the merge.
+func TestPostgresListenerEventPagesWalkBothInboxesExactlyOnce(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	const openMessages, openReactions, completed = 25, 12, 20
+	// Both arms use the same clock so the two share a created_at on most of
+	// their rows: the merge then has to order them by something other than the
+	// timestamp, which is exactly where a cursor can skip or repeat a row.
+	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < openMessages; i++ {
+		stamp := base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339Nano)
+		status := "pending"
+		if i%5 == 0 {
+			status = "processing"
+		}
+		if _, err := db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, dialog_name, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',?,?,'channel',100,1,?,?,?,?,?)`,
+			fmt.Sprintf("会话 %d", i), 1000+i, status, i%3, stamp, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < openReactions; i++ {
+		stamp := base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339Nano)
+		if _, err := db.Exec(`INSERT INTO reaction_inbox(account_id, dialog_key, dialog_name, message_id, peer_type, peer_id, peer_hash, emoji, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',?,?,'channel',100,1,'👍','failed',20,?,?,?)`,
+			fmt.Sprintf("反应会话 %d", i), 2000+i, stamp, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Completed rows are stamped newer than every open one, so a list that
+	// forgot to exclude them would put them on the first page rather than
+	// merely at the end.
+	for i := 0; i < completed; i++ {
+		stamp := base.Add(time.Duration(1000+i) * time.Minute).Format(time.RFC3339Nano)
+		if _, err := db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, dialog_name, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',?,?,'channel',100,1,'done',0,?,?,?)`,
+			fmt.Sprintf("已完成 %d", i), 3000+i, stamp, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO reaction_inbox(account_id, dialog_key, dialog_name, message_id, peer_type, peer_id, peer_hash, emoji, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',?,?,'channel',100,1,'👍','done',0,?,?,?)`,
+			fmt.Sprintf("已完成反应 %d", i), 4000+i, stamp, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	total := openMessages + openReactions
+	seen := map[string]bool{}
+	walked := make([]ListenerEvent, 0, total)
+	cursor, pages := "", 0
+	for {
+		pages++
+		if pages > 20 {
+			t.Fatal("pagination did not terminate")
+		}
+		events, reported, next, err := m.ListListenerEvents(cursor, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reported != total {
+			t.Fatalf("page %d reports %d open events, want %d", pages, reported, total)
+		}
+		if len(events) == 0 {
+			t.Fatalf("page %d is empty before the list ended (cursor %q)", pages, cursor)
+		}
+		if len(events) > 10 {
+			t.Fatalf("page %d holds %d events, want at most 10", pages, len(events))
+		}
+		for _, event := range events {
+			key := eventKey(event)
+			if seen[key] {
+				t.Fatalf("event %s appeared on more than one page", key)
+			}
+			seen[key] = true
+			if event.Status == "done" {
+				t.Fatalf("event %s is completed and must not be listed", key)
+			}
+			if len(walked) > 0 && walked[len(walked)-1].CreatedAt < event.CreatedAt {
+				t.Fatalf("page order is not newest first: %s came after %s", event.CreatedAt, walked[len(walked)-1].CreatedAt)
+			}
+			walked = append(walked, event)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(walked) != total {
+		t.Fatalf("walking the pages yielded %d events, want %d", len(walked), total)
+	}
+	bySource := map[string]int{}
+	for _, event := range walked {
+		bySource[event.Source]++
+	}
+	if bySource["message"] != openMessages || bySource["reaction"] != openReactions {
+		t.Fatalf("walked %d message and %d reaction events, want %d and %d", bySource["message"], bySource["reaction"], openMessages, openReactions)
+	}
+	if pages != 4 {
+		t.Fatalf("walked %d pages, want 4 for %d events at 10 per page", pages, total)
+	}
+}
+
+// TestPostgresClearStoppedEventsRemovesOnlyFailedRows checks the boundary of
+// the only operation that destroys listener events: it must take exactly the
+// rows /status counts as stopped, and leave queued, in-flight and completed
+// work alone.
+func TestPostgresClearStoppedEventsRemovesOnlyFailedRows(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	// The message inbox gets a failed row below the attempt limit as well as
+	// one at it: /status counts both as stopped, so the clear has to take both.
+	if _, err := db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at) VALUES
+ ('account','channel:100',1,'channel',100,1,'failed',20,?,?,?),
+ ('account','channel:100',2,'channel',100,1,'failed',6,?,?,?),
+ ('account','channel:100',3,'channel',100,1,'pending',0,?,?,?),
+ ('account','channel:100',4,'channel',100,1,'processing',1,?,?,?),
+ ('account','channel:100',5,'channel',100,1,'done',0,?,?,?)`,
+		stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO reaction_inbox(account_id, dialog_key, message_id, peer_type, emoji, status, attempts, next_attempt_at, created_at, updated_at) VALUES
+ ('account','channel:100',6,'channel','👍','failed',20,?,?,?),
+ ('account','channel:100',7,'channel','👍','pending',0,?,?,?),
+ ('account','channel:100',8,'channel','👍','done',0,?,?,?)`,
+		stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	stopped, revivable, err := m.StoppedEventCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped != 3 || revivable != 1 {
+		t.Fatalf("StoppedEventCounts() = %d stopped/%d revivable, want 3/1", stopped, revivable)
+	}
+	messages, reactions, err := m.ClearStoppedEvents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messages != 2 || reactions != 1 {
+		t.Fatalf("ClearStoppedEvents() removed %d message and %d reaction events, want 2 and 1", messages, reactions)
+	}
+	for _, check := range []struct {
+		table  string
+		status string
+		want   int
+	}{
+		{"chat_message_inbox", "failed", 0},
+		{"chat_message_inbox", "pending", 1},
+		{"chat_message_inbox", "processing", 1},
+		{"chat_message_inbox", "done", 1},
+		{"reaction_inbox", "failed", 0},
+		{"reaction_inbox", "pending", 1},
+		{"reaction_inbox", "done", 1},
+	} {
+		var rows int
+		if err := db.QueryRow(`SELECT COUNT(1) FROM `+check.table+` WHERE status = ?`, check.status).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != check.want {
+			t.Fatalf("%s has %d %s rows, want %d", check.table, rows, check.status, check.want)
+		}
+	}
+	if stopped, _, err := m.StoppedEventCounts(); err != nil {
+		t.Fatal(err)
+	} else if stopped != 0 {
+		t.Fatalf("StoppedEventCounts() still reports %d stopped events after a clear", stopped)
 	}
 }

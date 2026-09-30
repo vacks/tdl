@@ -55,6 +55,24 @@ func TestPermanentInboxErrorClassifiesRejections(t *testing.T) {
 		{"not a Telegram error", errors.New("connection reset by peer"), false},
 		{"database failure", errInboxUnavailable, false},
 		{"server error", tgerr.New(500, "INTERNAL_SERVER_ERROR"), false},
+		// A 401 or a 403 is a statement about the session, not about when the
+		// request was made. Only logging in again, or being given access again,
+		// can change any of these, so they stop on the first attempt exactly as
+		// a 400 rejection does. Recognizing only 400 left a session revoked
+		// from another device reconnecting and re-asking until the whole
+		// attempt budget was spent.
+		{"session revoked", tgerr.New(401, "SESSION_REVOKED"), true},
+		{"session expired", tgerr.New(401, "SESSION_EXPIRED"), true},
+		{"key no longer registered", tgerr.New(401, "AUTH_KEY_UNREGISTERED"), true},
+		{"account banned", tgerr.New(401, "USER_DEACTIVATED_BAN"), true},
+		{"dialog not readable", tgerr.New(403, "CHAT_WRITE_FORBIDDEN"), true},
+		{"wrapped 403", fmt.Errorf("读取讨论根消息: %w", tgerr.New(403, "CHANNEL_PRIVATE")), true},
+		// An application level fault that no later attempt can clear is marked
+		// at its source rather than inferred from its text.
+		{"marked permanent", permanentFailure(errors.New("会话下载配置快照无效")), true},
+		// Being answered is not being rejected, and it must not be classified
+		// as a rejection: the two settle in different states.
+		{"answered with nothing to do", nothingToDo(ErrNoEligibleMedia), false},
 	}
 	for _, testCase := range cases {
 		if got := permanentInboxError(testCase.err); got != testCase.want {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,7 +314,14 @@ type Manager struct {
 	chatLinkWake       chan struct{}
 	listenerDirty      atomic.Bool
 	listenerSnapshotAt atomic.Int64
-	slotWake           chan struct{}
+	// listenerAccounts is the set of authorized accounts the listener snapshot
+	// was last built with. It is read and written only by the single chat
+	// worker goroutine, inside reconcileChatListeners, which is the only place
+	// that starts a listener - so it needs no lock of its own. Comparing it is
+	// how a sign-in or an expiry is noticed promptly rather than at the next
+	// five minute refresh.
+	listenerAccounts map[string]struct{}
+	slotWake         chan struct{}
 	// reconcileWake is deliberately separate from wake. The claim reconciler is
 	// an additional consumer of its own signal, and sharing wake would let it
 	// take the token a download worker needs, delaying a newly queued task by a
@@ -351,6 +359,12 @@ type Manager struct {
 	// lastJobLeaseSweep throttles recovery of tasks stranded in 'running'
 	// (unix nanoseconds).
 	lastJobLeaseSweep atomic.Int64
+	// reconcilePublishedCursor rotates the published-file sweep across passes.
+	// The sweep exists for a narrow crash window, so its set is normally empty
+	// and reading all of it costs nothing - but a database outage that leaves
+	// many rows mid-publish makes the same full pass expensive, and it ran every
+	// minute. A cursor keeps one pass bounded and lets the next resume.
+	reconcilePublishedCursor atomic.Int64
 	// inboxRetry carries inbox writes that failed, to a single bounded worker.
 	inboxRetry     chan inboxRetry
 	inboxRetryStop context.CancelFunc
@@ -432,6 +446,11 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 		_ = db.Close()
 		return nil, fmt.Errorf("recover chat message inbox: %w", err)
 	}
+	// The account gate is installed before any worker starts, so the first
+	// request an account makes is already paced. The download service owns the
+	// budget because the limit is per Telegram account and the accounts are
+	// shared with the reaction and listener features.
+	accounts.SetRPCGate(m.awaitTelegramRPC)
 	for worker := 0; worker < workerCount; worker++ {
 		go m.worker()
 	}
@@ -690,7 +709,18 @@ func (m *Manager) recoverStrandedRunningJobs() error {
 	}
 	m.mu.Unlock()
 	now := time.Now().UTC()
-	rows, err := m.db.Query(`SELECT id, updated_at FROM download_jobs WHERE status = 'running'`)
+	// Only rows already past the lease are read, and only the oldest of those.
+	// Reading every running row to compare timestamps in Go made one pass
+	// proportional to however many tasks a crash or an outage left behind, which
+	// is exactly when the table is at its largest. Ordering oldest-first means
+	// the rows most likely to be genuinely stranded are the ones inside the
+	// window; a live task's row is refreshed as it works, so it sorts last.
+	//
+	// The stored text is RFC3339Nano, whose trailing-zero trimming makes
+	// lexicographic comparison wrong, so the comparison is done as timestamptz
+	// rather than as text.
+	cutoff := now.Add(-jobLeaseTimeout).Format(time.RFC3339Nano)
+	rows, err := m.db.Query(`SELECT id, updated_at FROM download_jobs WHERE status = 'running' AND updated_at::timestamptz <= ?::timestamptz ORDER BY updated_at, id LIMIT ?`, cutoff, reconcileBatchSize)
 	if err != nil {
 		return err
 	}
@@ -704,8 +734,9 @@ func (m *Manager) recoverStrandedRunningJobs() error {
 		if _, live := active[candidate.id]; live {
 			continue
 		}
-		// Timestamps are TEXT holding RFC3339Nano, whose trailing-zero trimming
-		// makes lexicographic comparison wrong, so parse rather than compare.
+		// The comparison in the query is the same one, kept here as the
+		// authority: parse rather than compare, and never requeue a task whose
+		// timestamp cannot be read.
 		updated, parseErr := time.Parse(time.RFC3339Nano, candidate.updatedAt)
 		if parseErr != nil {
 			continue
@@ -1264,7 +1295,12 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 		}
 		if jobID != "" {
 			if existingID != "" && existingID != jobID {
-				return Submission{}, false, errors.New("消息组中的文件已关联到不同下载任务，无法安全合并")
+				// Two different tasks already own files of this group. That is a
+				// property of the stored rows, not of when this request was made,
+				// so no later attempt can merge them - the inbox must stop on the
+				// first one and show it rather than retrying a decision that has
+				// already been made.
+				return Submission{}, false, permanentFailure(errors.New("消息组中的文件已关联到不同下载任务，无法安全合并"))
 			}
 			existingID = jobID
 		}
@@ -1520,37 +1556,49 @@ func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner boo
 // Jobs with waiting items are excluded because reconcileMessageClaims owns
 // them: a waiting item is work, not a terminal outcome, and settling the parent
 // here would fight that pass.
-func (m *Manager) settleQueuedJobsWithoutPendingWork() error {
+// It walks its set in id order from a cursor rather than re-reading the same
+// bounded prefix every few seconds. The predicate it tests is expensive to
+// disprove - two index probes per queued task - so a fixed head made the cost of
+// one pass grow with the queue behind it while never reaching the rest.
+func (m *Manager) settleQueuedJobsWithoutPendingWork(cursor string) (string, error) {
 	rows, err := m.db.Query(`SELECT j.id FROM download_jobs j
-WHERE j.status = 'queued' AND j.parent_chat_id = ''
+WHERE j.status = 'queued' AND j.parent_chat_id = '' AND j.id > ?
   AND EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = j.id)
   AND NOT EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = j.id AND i.status IN ('queued', 'waiting'))
-LIMIT ?`, reconcileBatchSize)
+ORDER BY j.id LIMIT ?`, cursor, reconcileBatchSize)
 	if err != nil {
-		return err
+		return cursor, err
 	}
 	ids := make([]string, 0, reconcileBatchSize)
 	for rows.Next() {
 		var id string
 		if scanErr := rows.Scan(&id); scanErr != nil {
 			_ = rows.Close()
-			return scanErr
+			return cursor, scanErr
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return err
+		return cursor, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return cursor, err
 	}
 	// finishTaskWithoutPendingWork owns the decision, so a stranded task ends up
 	// in exactly the state the normal path would have written.
 	for _, id := range ids {
 		m.finishTaskWithoutPendingWork(id, false)
 	}
-	return nil
+	// A short page means this rotation reached the end of the set.
+	next := cursor
+	if len(ids) > 0 {
+		next = ids[len(ids)-1]
+	}
+	if len(ids) < reconcileBatchSize {
+		next = ""
+	}
+	return next, nil
 }
 
 func (m *Manager) run(job Job, sources []source) {
@@ -1598,7 +1646,7 @@ func (m *Manager) run(job Job, sources []source) {
 			if finalPath, destErr := finalDestination(m.downloadDir, preflightConfig.FinalFilenameTemplate, item); destErr == nil {
 				if occupied, regularFile := destinationOccupied(finalPath); occupied && !regularFile {
 					if err := m.setItem(item, "failed", "", blockedDestinationMessage(finalPath)); err != nil {
-						m.fail(job.ID, sources, err)
+						m.fail(job.ID, err)
 						return
 					}
 					continue
@@ -1607,32 +1655,37 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 		claim, path, claimErr := m.claimMessageMedia(job.ID, item)
 		if claimErr != nil {
-			m.fail(job.ID, sources, fmt.Errorf("确认文件归属失败: %w", claimErr))
+			m.fail(job.ID, fmt.Errorf("确认文件归属失败: %w", claimErr))
 			return
 		}
 		switch claim {
 		case "completed":
 			if err := m.adoptCompletedMessageItem(job.ID, item, path); err != nil {
-				m.fail(job.ID, sources, fmt.Errorf("复用已完成文件失败: %w", err))
+				m.fail(job.ID, fmt.Errorf("复用已完成文件失败: %w", err))
 				return
 			}
 			continue
 		case "waiting":
 			if err := m.setMessageItemWaiting(job.ID, item); err != nil {
-				m.fail(job.ID, sources, fmt.Errorf("保存文件等待状态失败: %w", err))
+				m.fail(job.ID, fmt.Errorf("保存文件等待状态失败: %w", err))
 				return
 			}
 			waitingForOwner = true
 			continue
 		}
 		pending = append(pending, item)
-		if err := m.beginItemAttempt(item); err != nil {
-			m.fail(job.ID, sources, fmt.Errorf("记录文件下载尝试失败: %w", err))
-			return
-		}
 	}
 	if len(pending) == 0 {
 		m.finishTaskWithoutPendingWork(job.ID, waitingForOwner)
+		return
+	}
+	// Recorded for the whole pending set at once. The per-file shape wrote one
+	// rounded trip per file, serially, before the first byte of the transfer
+	// started, so a task holding a media comment per row - the default for a
+	// channel post - spent its entire startup in the database while the worker
+	// that could have been transferring sat idle.
+	if err := m.beginItemAttempts(pending); err != nil {
+		m.fail(job.ID, fmt.Errorf("记录文件下载尝试失败: %w", err))
 		return
 	}
 	if ctx.Err() != nil || !m.runningOrUnknown(job.ID) {
@@ -1644,7 +1697,7 @@ func (m *Manager) run(job Job, sources []source) {
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", job.ID)
 	config := m.settings.Get()
 	if snapshot, snapshotErr := m.downloadConfigForJob(job.ConfigJSON); snapshotErr != nil {
-		m.fail(job.ID, pending, snapshotErr)
+		m.fail(job.ID, snapshotErr)
 		return
 	} else {
 		config.Download = snapshot
@@ -1767,12 +1820,12 @@ func (m *Manager) run(job Job, sources []source) {
 	persistErr := stateErr
 	stateMu.Unlock()
 	if persistErr != nil {
-		m.fail(job.ID, pending, fmt.Errorf("保存下载状态失败: %w", persistErr))
+		m.fail(job.ID, fmt.Errorf("保存下载状态失败: %w", persistErr))
 		return
 	}
 	if watchdog.Stalled() && m.status(job.ID) == "running" {
 		if err := m.requeueStalledJob(job.ID); err != nil {
-			m.fail(job.ID, pending, fmt.Errorf("无进度下载自动恢复失败: %w", err))
+			m.fail(job.ID, fmt.Errorf("无进度下载自动恢复失败: %w", err))
 			return
 		}
 		applog.Info("download", "task_requeued_after_no_progress", "job_id", job.ID)
@@ -1807,7 +1860,7 @@ func (m *Manager) run(job Job, sources []source) {
 			_ = m.requeueRateLimitedMessage(job.ID, pending, err)
 			return
 		}
-		m.fail(job.ID, pending, err)
+		m.fail(job.ID, err)
 		return
 	}
 	// A cancellation can race with the upstream call finishing. Never publish a
@@ -1828,7 +1881,7 @@ func (m *Manager) run(job Job, sources []source) {
 			_ = m.setJob(job.ID, "queued", "等待其他任务完成同一文件")
 			return
 		}
-		m.fail(job.ID, pending, errors.New("部分文件未收到收尾完成回调或移动失败"))
+		m.fail(job.ID, errors.New("部分文件未收到收尾完成回调或移动失败"))
 	} else {
 		_ = m.setJob(job.ID, "completed", "")
 		_ = os.RemoveAll(tmpRoot)
@@ -1850,7 +1903,7 @@ func (m *Manager) requeueRateLimitedMessage(id string, pending []source, cause e
 		return err
 	}
 	if attempts >= maxStalledAttempts {
-		m.fail(id, pending, fmt.Errorf("Telegram 限流反复出现，已停止自动重试，请稍后手动重试: %w", cause))
+		m.fail(id, fmt.Errorf("Telegram 限流反复出现，已停止自动重试，请稍后手动重试: %w", cause))
 		return nil
 	}
 	if _, err := m.db.Exec(`UPDATE download_items SET status = 'queued', error = 'Telegram 限流中，等待自动恢复', started_at = '', finished_at = '' WHERE job_id = ? AND status = 'running'`, id); err != nil {
@@ -2216,6 +2269,9 @@ func (m *Manager) signalReconcile() {
 // making progress, so an idle queue costs one indexed query per interval.
 func (m *Manager) reconcileWorker(ctx context.Context) {
 	cursor := int64(0)
+	// settleCursor is the settle pass's own rotation position, kept here because
+	// this loop is its only caller.
+	settleCursor := ""
 	for {
 		if m.DatabaseAvailable() {
 			for pass := 0; pass < reconcileMaxDrainPasses; pass++ {
@@ -2233,7 +2289,9 @@ func (m *Manager) reconcileWorker(ctx context.Context) {
 			// Claim promotion only covers jobs that still have waiting items.
 			// A job stranded with nothing queued and nothing waiting has no
 			// other pass that will ever look at it.
-			if err := m.settleQueuedJobsWithoutPendingWork(); err != nil {
+			next, err := m.settleQueuedJobsWithoutPendingWork(settleCursor)
+			settleCursor = next
+			if err != nil {
 				applog.Error("download", "queued_job_settle_failed", "error", err.Error())
 			}
 			// A task stranded in 'running' is the mirror image of that one: it
@@ -2366,23 +2424,33 @@ func (m *Manager) releaseMessageClaims(jobID string) {
 // item is no longer failed or cancelled. The chat side's counterpart already
 // does both writes in one transaction for this reason.
 func (m *Manager) reconcilePublishedItems() error {
-	rows, err := m.db.Query(`SELECT job_id, dialog_key, message_id, final_path FROM download_items WHERE status = 'downloaded' AND final_path != ''`)
+	// One bounded page per pass, rotated by item id. A row that cannot be
+	// published stays in the set, so without a cursor a single bad row at the
+	// head would be re-read by every pass forever, and a large backlog - what a
+	// database outage leaves behind - would be read in full every minute.
+	cursor := m.reconcilePublishedCursor.Load()
+	rows, err := m.db.Query(`SELECT id, job_id, dialog_key, message_id, final_path FROM download_items WHERE status = 'downloaded' AND final_path != '' AND id > ? ORDER BY id LIMIT ?`, cursor, reconcileBatchSize)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	type candidate struct {
+		itemID    int64
 		jobID     string
 		dialogKey string
 		messageID int
 		path      string
 	}
 	items := make([]candidate, 0)
+	scanned := 0
+	next := cursor
 	for rows.Next() {
 		var item candidate
-		if err := rows.Scan(&item.jobID, &item.dialogKey, &item.messageID, &item.path); err != nil {
+		if err := rows.Scan(&item.itemID, &item.jobID, &item.dialogKey, &item.messageID, &item.path); err != nil {
 			return err
 		}
+		scanned++
+		next = item.itemID
 		if info, statErr := os.Stat(item.path); statErr == nil && info.Mode().IsRegular() {
 			items = append(items, item)
 		}
@@ -2390,6 +2458,14 @@ func (m *Manager) reconcilePublishedItems() error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	// A short page means this rotation reached the end of the set, so the next
+	// pass starts over. Recording it before any publish is deliberate: a pass
+	// that returns early on a publish error has still examined these rows, and
+	// leaving the cursor behind them would re-read them immediately.
+	if scanned < reconcileBatchSize {
+		next = 0
+	}
+	m.reconcilePublishedCursor.Store(next)
 	for _, item := range items {
 		// Publish, pause and cancel share one linearization point per task, so a
 		// completion callback that started just before a cancellation cannot
@@ -2506,14 +2582,8 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
-		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-			return err
-		}
 		peer, messageID, err := tutil.ParseMessageLink(ctx, manager, sourceURL)
 		if err != nil {
-			return err
-		}
-		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
 			return err
 		}
 		message, err := tutil.GetSingleMessage(ctx, client.API(), peer.InputPeer(), messageID)
@@ -2525,13 +2595,21 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 		groupedID := int64(0)
 		if group, ok := message.GetGroupedID(); ok {
 			groupedID = group
-			if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-				return err
-			}
-			messages, err = tutil.GetGroupedMessages(ctx, client.API(), peer.InputPeer(), message)
-			if err != nil {
-				m.recordTelegramRPCError(accountID, err)
-				return err
+			// ?single asks for the one message the link points at rather than the
+			// album it belongs to. Telegram's own clients put the marker on a link
+			// copied from a single member, and the upstream link parser reads
+			// every query parameter except ?comment as noise, so without this the
+			// download did not match the link that was copied into the box.
+			//
+			// Only the expansion is skipped: the real grouped id is still recorded
+			// on the item, because a naming template may legitimately use it, and
+			// it is the album's identity rather than a property of this one file.
+			if !linkAsksForSingleMessage(sourceURL) {
+				messages, err = tutil.GetGroupedMessages(ctx, client.API(), peer.InputPeer(), message)
+				if err != nil {
+					m.recordTelegramRPCError(accountID, err)
+					return err
+				}
 			}
 		}
 		messageText := groupDisplayText(messages)
@@ -2559,7 +2637,28 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 		}
 		return nil
 	})
+	// A successful read that produced nothing is an answer, not an empty result
+	// the caller has to interpret: the message held no downloadable file. Left as
+	// an empty slice it reached the caller's filter check, which reported it with
+	// the file-filter wording and sent the reader to settings that were never
+	// involved.
+	if len(result) == 0 && err == nil {
+		err = nothingToDo(ErrNoMedia)
+	}
 	return result, err
+}
+
+// linkAsksForSingleMessage reports whether a message link carries Telegram's
+// ?single marker. The marker has no value in links copied from clients, but a
+// valued form is accepted too, so only the key is tested. A URL that will not
+// parse is not a request for one file: link parsing reports that separately.
+func linkAsksForSingleMessage(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	_, present := parsed.Query()["single"]
+	return present
 }
 
 func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string) ([]source, error) {
@@ -2579,9 +2678,6 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool, chatJobID string) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-			return err
-		}
 		message, err := tutil.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
 		if err != nil {
 			m.recordTelegramRPCError(accountID, err)
@@ -2591,9 +2687,6 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		groupedID := int64(0)
 		if group, ok := message.GetGroupedID(); ok {
 			groupedID = group
-			if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-				return err
-			}
 			messages, err = tutil.GetGroupedMessages(ctx, client.API(), inputPeer, message)
 			if err != nil {
 				m.recordTelegramRPCError(accountID, err)
@@ -2779,12 +2872,6 @@ func (m *Manager) runningOrUnknown(id string) bool {
 	status, ok := m.jobStatus(id)
 	return !ok || status == "running"
 }
-func (m *Manager) itemStatus(dialogKey string, messageID int) string {
-	var status string
-	_ = m.db.QueryRow(`SELECT status FROM download_items WHERE dialog_key = ? AND message_id = ?`, dialogKey, messageID).Scan(&status)
-	return status
-}
-
 func (m *Manager) Pause(id string) error {
 	lock := m.jobLock(id)
 	lock.Lock()
@@ -3014,6 +3101,44 @@ func (m *Manager) setItem(item source, status, path, message string) error {
 	if status == "completed" || status == "failed" || status == "cancelled" {
 		finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	// Completion writes two rows that must agree: the item's terminal state and
+	// the global ownership record every other task consults before deciding
+	// whether this media still has to be downloaded. They travel in one
+	// statement, so a failure leaves neither written rather than an item that
+	// claims to be finished while nothing owns the file.
+	//
+	// Writing them separately was wrong in both directions. The ownership write
+	// was issued after the item update and its error discarded, so a transient
+	// failure produced exactly the state above and the task still reported
+	// success; and a second round trip on the completion path of every file is
+	// the one write amplification this path can least afford.
+	//
+	// A statement matching no row is the ordinary case of a state that already
+	// changed, not an error. RETURNING owner_id carries the owning task id back
+	// so the caller does not need a follow-up query to learn what it belongs to;
+	// on the conflict branch it is EXCLUDED.owner_id, which is the same task.
+	if status == "completed" && path != "" {
+		var jobID string
+		err := m.db.QueryRow(`WITH updated AS (
+ UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ? RETURNING job_id
+)
+INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
+ SELECT ?, ?, ?, 'completed', 'message', job_id, ? FROM updated
+ ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at
+RETURNING owner_id`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID, item.DialogKey, item.MessageID, path, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			applog.Error("download", "item_state_save_failed", "dialog_key", item.DialogKey, "message_id", item.MessageID, "status", status, "error", err.Error())
+			return err
+		}
+		m.touch()
+		if jobID != "" {
+			m.emit(jobID, "", "item_status_changed", status)
+		}
+		return nil
+	}
 	// One statement carries the change, names the owning task and the status
 	// that goes with it. The ownership row below needs that task id, which used
 	// to cost a second query on the completion path alone.
@@ -3030,16 +3155,44 @@ func (m *Manager) setItem(item source, status, path, message string) error {
 	if jobID != "" {
 		m.emit(jobID, "", "item_status_changed", status)
 	}
-	if status == "completed" && path != "" {
-		_, _ = m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'message', ?, ?) ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`, item.DialogKey, item.MessageID, path, jobID, time.Now().UTC().Format(time.RFC3339Nano))
-	}
 	return nil
 }
-func (m *Manager) beginItemAttempt(item source) error {
-	// A task may be running while this particular file is still waiting for an
-	// upstream worker slot. It becomes "running" only on its first byte-level
-	// progress callback.
-	return m.execItemState("item_attempt_save_failed", item.Item, "queued", `UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID)
+
+// beginItemAttempts records one transfer attempt for every pending file, in one
+// statement per dialog.
+//
+// The status list is a guard, not a filter for its own sake. A pause or cancel
+// that lands while the pending set is being assembled must not be undone by the
+// attempt bookkeeping: without it this statement flipped a paused file back to
+// queued, which left the task's own control action partly reverted. The states
+// listed are exactly the ones a task about to transfer can legitimately find its
+// files in, so a file that reached a terminal or user-driven state in the
+// meantime keeps it.
+//
+// Grouping by dialog is what keeps the statement bounded: message ids are only
+// unique inside one dialog, so the id list has to carry the dialog it belongs to.
+func (m *Manager) beginItemAttempts(items []source) error {
+	byDialog := make(map[string][]int, 2)
+	for _, item := range items {
+		byDialog[item.DialogKey] = append(byDialog[item.DialogKey], item.MessageID)
+	}
+	for dialogKey, messageIDs := range byDialog {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(messageIDs)), ",")
+		args := make([]any, 0, len(messageIDs)+1)
+		args = append(args, dialogKey)
+		for _, messageID := range messageIDs {
+			args = append(args, messageID)
+		}
+		// A task may be running while a particular file is still waiting for an
+		// upstream worker slot. It becomes "running" only on its first byte-level
+		// progress callback.
+		if _, err := m.db.Exec(`UPDATE download_items SET attempts = attempts + 1, status = 'queued', error = '', started_at = '', finished_at = '' WHERE dialog_key = ? AND message_id IN (`+placeholders+`) AND status IN ('queued', 'failed', 'downloaded', 'running')`, args...); err != nil {
+			applog.Error("download", "item_attempt_save_failed", "dialog_key", dialogKey, "error", err.Error())
+			return err
+		}
+	}
+	m.touch()
+	return nil
 }
 func (m *Manager) pauseItem(item source) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -3078,12 +3231,21 @@ func (m *Manager) execItemState(event string, item Item, status, query string, a
 	}
 	return nil
 }
-func (m *Manager) fail(id string, sources []source, err error) {
-	for _, item := range sources {
-		if status := m.itemStatus(item.DialogKey, item.MessageID); status == "completed" || status == "downloaded" || status == "waiting" {
-			continue
-		}
-		_ = m.setItem(item, "failed", "", err.Error())
+
+// fail marks every file of a task that still needs attention as failed.
+//
+// The callers pass the task's items, but the statement is scoped by task id
+// instead of by that list. Every row in the list belongs to this task - media
+// identity is unique across the table, so each item has exactly one owning row -
+// and the caller's list is itself derived from those rows, so the two select the
+// same set. The difference is cost: the per-item shape was a status probe and an
+// update for every file, on the failure path of a task that may hold a row per
+// media comment.
+func (m *Manager) fail(id string, err error) {
+	if _, execErr := m.db.Exec(`UPDATE download_items SET status = 'failed', error = ?, finished_at = ? WHERE job_id = ? AND status NOT IN ('completed', 'downloaded', 'waiting')`, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id); execErr != nil {
+		applog.Error("download", "task_fail_items_save_failed", "job_id", id, "error", execErr.Error())
+	} else {
+		m.touch()
 	}
 	var completed int
 	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, id).Scan(&completed)
@@ -3096,6 +3258,61 @@ func (m *Manager) fail(id string, sources []source, err error) {
 	m.releaseFailedMessageClaims(id)
 }
 
+// filenameDialogComponent renders one dialog name for the filename template,
+// falling back to a stable identity when Telegram supplied no visible name.
+//
+// An empty name is not cosmetic. The default template leads with the dialog
+// name as a path segment, and normalizeRelativePath rejects an empty one, so a
+// peer whose name could not be resolved - a deleted account, or a reaction or
+// listener event whose peer lookup failed - made every file of the task fail at
+// publish time. The failure arrived after the bytes had been downloaded, and its
+// message pointed at the template rather than at the missing name.
+//
+// The fallback is derived from the identity the media itself is keyed by, so it
+// is stable across retries and cannot make two dialogs share a directory.
+func filenameDialogComponent(name string, dialogID int64, dialogKey string) string {
+	if component := sanitizeComponent(name); component != "" {
+		return component
+	}
+	if dialogID != 0 {
+		return fmt.Sprintf("dialog_%d", dialogID)
+	}
+	if component := sanitizeComponent(dialogKey); component != "" {
+		return component
+	}
+	return "dialog"
+}
+
+// filenameTemplates caches parsed naming templates by pattern text.
+//
+// The pattern changes only when the operator edits it, but rendering runs once
+// per file - and again once per step of each shrinking search when a name is too
+// long. Parsing a template that had not changed since the previous file was
+// therefore among the more repeated pieces of work on the publish path. A parsed
+// template is safe for concurrent use.
+//
+// The map is never evicted. Its size is the number of distinct templates this
+// process has been asked to render - the current setting plus whatever an
+// operator typed through the settings page - so it is bounded by human edits,
+// not by download traffic.
+var filenameTemplates sync.Map
+
+func filenameTemplate(pattern string) (*template.Template, error) {
+	if cached, ok := filenameTemplates.Load(pattern); ok {
+		return cached.(*template.Template), nil
+	}
+	tpl, err := template.New("filename").Funcs(template.FuncMap{
+		"formatDate": func(timestamp int64, layout string) string {
+			return time.Unix(timestamp, 0).Format(layout)
+		},
+	}).Parse(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("解析文件命名模板: %w", err)
+	}
+	filenameTemplates.Store(pattern, tpl)
+	return tpl, nil
+}
+
 func renderName(pattern string, item source) (string, error) {
 	data := struct {
 		DialogID, GroupedID                       int64
@@ -3104,14 +3321,10 @@ func renderName(pattern string, item source) (string, error) {
 		IsComment                                 bool
 		FileName, FileExt                         string
 		DownloadDate                              int64
-	}{item.DialogID, item.GroupedID, item.MessageID, item.OriginMessageID, sanitizeComponent(item.DialogName), sanitizeComponent(item.OriginDialogName), sanitizeComponent(item.MessageText), item.IsComment, sanitizeComponent(item.OriginalName), sanitizeComponent(filepath.Ext(item.OriginalName)), time.Now().Unix()}
-	tpl, err := template.New("filename").Funcs(template.FuncMap{
-		"formatDate": func(timestamp int64, layout string) string {
-			return time.Unix(timestamp, 0).Format(layout)
-		},
-	}).Parse(pattern)
+	}{item.DialogID, item.GroupedID, item.MessageID, item.OriginMessageID, filenameDialogComponent(item.DialogName, item.DialogID, item.DialogKey), filenameDialogComponent(item.OriginDialogName, item.DialogID, item.DialogKey), sanitizeComponent(item.MessageText), item.IsComment, sanitizeComponent(item.OriginalName), sanitizeComponent(filepath.Ext(item.OriginalName)), time.Now().Unix()}
+	tpl, err := filenameTemplate(pattern)
 	if err != nil {
-		return "", fmt.Errorf("解析文件命名模板: %w", err)
+		return "", err
 	}
 	var out bytes.Buffer
 	if err = tpl.Execute(&out, data); err != nil {
@@ -3125,89 +3338,121 @@ func renderName(pattern string, item source) (string, error) {
 // error is recoverable by regenerating a shorter name; a missing directory or
 // unsafe template must remain visible to the administrator.
 func finalDestination(root, pattern string, item source) (string, error) {
-	path, err := fitMessageText(root, pattern, item)
-	if err == nil {
-		return path, nil
-	}
-	if !errors.Is(err, errFinalNameTooLong) {
-		return "", err
-	}
-
-	// A long upstream filename can still overflow after MessageText has been
-	// removed. Shorten it while retaining its extension, then use as much of
-	// MessageText as the complete final path permits.
-	originalName := item.OriginalName
-	low, high := 0, len([]byte(originalName))
-	var shortened source
-	found := false
-	for low <= high {
-		budget := low + (high-low)/2
-		candidate := item
-		candidate.MessageText = ""
-		candidate.OriginalName = ellipsizeFileName(originalName, budget)
-		_, checkErr := checkedFinalPath(root, pattern, candidate)
-		if checkErr == nil {
-			shortened, found = candidate, true
-			low = budget + 1
-			continue
+	fitted, err := fitMessageText(root, pattern, item)
+	if err != nil {
+		if !errors.Is(err, errFinalNameTooLong) {
+			return "", err
 		}
-		if !errors.Is(checkErr, errFinalNameTooLong) {
-			return "", checkErr
+		// A long upstream filename can still overflow after MessageText has been
+		// removed. Shorten it while retaining its extension, then use as much of
+		// MessageText as the complete final path permits.
+		originalName := item.OriginalName
+		low, high := 0, len([]byte(originalName))
+		var shortened source
+		found := false
+		for low <= high {
+			budget := low + (high-low)/2
+			candidate := item
+			candidate.MessageText = ""
+			candidate.OriginalName = ellipsizeFileName(originalName, budget)
+			if candidate.OriginalName == "" {
+				// Same reasoning as the caption search: an empty name is a
+				// missing path segment, not a shorter one.
+				high = budget - 1
+				continue
+			}
+			if _, _, checkErr := measureFinalPath(root, pattern, candidate); checkErr == nil {
+				shortened, found = candidate, true
+				low = budget + 1
+				continue
+			} else if !errors.Is(checkErr, errFinalNameTooLong) {
+				return "", checkErr
+			}
+			high = budget - 1
 		}
-		high = budget - 1
+		if !found {
+			return "", err
+		}
+		if fitted, err = fitMessageText(root, pattern, shortened); err != nil {
+			return "", err
+		}
 	}
-	if !found {
-		return "", err
-	}
-	return fitMessageText(root, pattern, shortened)
+	// The directory is prepared here, once, for the candidate that was actually
+	// chosen. Both searches above evaluate many names and discard all but one,
+	// and creating a directory tree for each discarded candidate meant the
+	// operator was left with empty directories for names that were never used.
+	return checkedFinalPath(root, pattern, fitted)
 }
 
 // fitMessageText keeps as much client-visible message text as possible. When
 // it must shrink, the middle is replaced by a single ellipsis, retaining both
 // the beginning and end of the original caption.
-func fitMessageText(root, pattern string, item source) (string, error) {
-	path, err := checkedFinalPath(root, pattern, item)
+//
+// It returns the file description to use rather than a path, so the caller
+// finalizes the destination exactly once.
+func fitMessageText(root, pattern string, item source) (source, error) {
+	_, _, err := measureFinalPath(root, pattern, item)
 	if err == nil || !errors.Is(err, errFinalNameTooLong) || item.MessageText == "" {
-		return path, err
+		return item, err
 	}
 
 	original := item.MessageText
 	low, high := 0, len([]byte(original))
-	best := ""
+	var best source
+	found := false
 	for low <= high {
 		budget := low + (high-low)/2
 		candidate := item
 		candidate.MessageText = ellipsizeMiddle(original, budget)
-		path, checkErr := checkedFinalPath(root, pattern, candidate)
-		if checkErr == nil {
-			best = path
-			low = budget + 1
+		if candidate.MessageText == "" {
+			// A zero-length caption is not a shorter name, it is a missing path
+			// segment: a template that uses the caption as a directory cannot
+			// render this candidate at all. Reporting the resulting "unsafe path
+			// segment" as fatal would abort the search on the smallest budget
+			// instead of walking down to the largest one that still renders, so
+			// this budget is simply recorded as not fitting.
+			high = budget - 1
 			continue
 		}
-		if !errors.Is(checkErr, errFinalNameTooLong) {
-			return "", checkErr
+		if _, _, checkErr := measureFinalPath(root, pattern, candidate); checkErr == nil {
+			best, found = candidate, true
+			low = budget + 1
+			continue
+		} else if !errors.Is(checkErr, errFinalNameTooLong) {
+			return item, checkErr
 		}
 		high = budget - 1
 	}
-	if best == "" {
-		return "", err
+	if !found {
+		return item, err
 	}
 	return best, nil
 }
 
-func checkedFinalPath(root, pattern string, item source) (string, error) {
-	relative, err := renderName(pattern, item)
+// measureFinalPath renders one candidate destination and validates its length.
+// It deliberately touches nothing on disk: see finalDestination for why the
+// side effect belongs to the chosen candidate alone.
+func measureFinalPath(root, pattern string, item source) (relative, finalPath string, err error) {
+	relative, err = renderName(pattern, item)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	for _, component := range strings.Split(relative, string(filepath.Separator)) {
 		if len([]byte(component)) > linuxNameMaxBytes {
-			return "", fmt.Errorf("%w：单个路径段最多 %d 字节", errFinalNameTooLong, linuxNameMaxBytes)
+			return "", "", fmt.Errorf("%w：单个路径段最多 %d 字节", errFinalNameTooLong, linuxNameMaxBytes)
 		}
 	}
-	finalPath := filepath.Join(root, relative)
+	finalPath = filepath.Join(root, relative)
 	if len([]byte(finalPath)) >= linuxPathMaxBytes {
-		return "", fmt.Errorf("%w：完整路径最多 %d 字节", errFinalNameTooLong, linuxPathMaxBytes-1)
+		return "", "", fmt.Errorf("%w：完整路径最多 %d 字节", errFinalNameTooLong, linuxPathMaxBytes-1)
+	}
+	return relative, finalPath, nil
+}
+
+func checkedFinalPath(root, pattern string, item source) (string, error) {
+	relative, finalPath, err := measureFinalPath(root, pattern, item)
+	if err != nil {
+		return "", err
 	}
 	if err := ensureFinalDirectory(root, relative); err != nil {
 		return "", err

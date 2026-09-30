@@ -153,7 +153,13 @@ func chatDownloadConfig(target storedChatTarget) (settings.Download, error) {
 		return config, nil
 	}
 	if err := json.Unmarshal([]byte(target.configJSON), &config); err != nil {
-		return settings.Download{}, fmt.Errorf("会话下载配置快照无效: %w", err)
+		// The snapshot a task was created with is read on every pass and never
+		// rewritten, so a snapshot that does not parse will not parse on the
+		// next attempt either. Marked permanent so the listener inbox stops on
+		// the first one: a task in this state used to fail every single new
+		// message of its dialog five times fast and then hourly to twenty, each
+		// pass a Telegram lookup, and each message its own failed event.
+		return settings.Download{}, permanentFailure(fmt.Errorf("会话下载配置快照无效: %w", err))
 	}
 	return config, nil
 }
@@ -408,12 +414,19 @@ func (m *Manager) cancelChatExecutions(id string) {
 	}
 }
 
+// errChatTaskGone reports that a session task row is no longer there.
+var errChatTaskGone = errors.New("会话下载任务不存在")
+
 func (m *Manager) chatTarget(id string) (storedChatTarget, error) {
 	var target storedChatTarget
 	var listen int
 	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, listen_new, status, scan_state, error, created_at, updated_at, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, discussion_dialog_key, discussion_peer_type, discussion_peer_id, discussion_peer_hash FROM chat_download_jobs WHERE id = ?`, id).Scan(&target.ID, &target.SourceURL, &target.DialogType, &target.DialogKey, &target.DialogID, &target.DialogName, &target.AccountID, &target.StartMessageID, &target.UpperMessageID, &listen, &target.Status, &target.ScanState, &target.Error, &target.CreatedAt, &target.UpdatedAt, &target.direct.kind, &target.direct.id, &target.direct.hash, &target.configJSON, &target.discussionKey, &target.discussion.kind, &target.discussion.id, &target.discussion.hash)
 	if errors.Is(err, sql.ErrNoRows) {
-		return storedChatTarget{}, errors.New("会话下载任务不存在")
+		// The task this work belonged to was deleted between being admitted and
+		// being handled. That is an answer, not a fault - there is nothing left
+		// to download - so a listener event that lands here settles as skipped
+		// instead of being retried against a row that is not coming back.
+		return storedChatTarget{}, nothingToDo(errChatTaskGone)
 	}
 	if err != nil {
 		return storedChatTarget{}, err
@@ -741,9 +754,26 @@ func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
 					}
 				}
 			}
-			// A queued/running/paused regular task remains the owner. A terminal
-			// failure or cancellation releases the media to this chat task.
-			if messageStatus != "failed" && messageStatus != "cancelled" && messageStatus != "deleted" {
+			// Only a message task that is still working on this file keeps it.
+			// Its own status is the question here, and the states listed are the
+			// ones that mean work is in progress or already finished.
+			//
+			// Paused is deliberately not among them. A paused task has already
+			// released its claim in downloaded_media for exactly this reason, so
+			// refusing to take the file over left the session task waiting on a
+			// task that transfers nothing: this pass is the only thing that can
+			// return a waiting item to the queue, and the message-side promotion
+			// pass cannot help either, because the claim it would test is gone.
+			// The observable result was a session task pinned at "downloading"
+			// for as long as the message task stayed paused, with no error and
+			// nothing for the user to act on.
+			//
+			// Taking the file over cannot download it twice. Whoever reaches the
+			// transfer first holds the claim; the other side sees it and waits, or
+			// - if the transfer already finished - adopts the published file
+			// instead of fetching it again. A resumed message task therefore still
+			// completes, it just finds the file already done.
+			if messageStatus == "queued" || messageStatus == "running" || messageStatus == "downloaded" || messageStatus == "completed" {
 				continue
 			}
 		}
@@ -866,7 +896,9 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	}
 	defer releaseTransfer()
 	if target.inputPeer() == nil {
-		return false, errors.New("会话下载任务缺少 Telegram 会话引用")
+		reason := "会话下载任务缺少 Telegram 会话引用"
+		m.failChatTransfer(id, reason)
+		return false, errors.New(reason)
 	}
 	rows, err = m.db.Query(`SELECT dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size FROM chat_download_items WHERE chat_job_id = ? AND status = 'queued' ORDER BY message_id DESC LIMIT ?`, id, chatBatchSize)
 	if err != nil {
@@ -978,7 +1010,9 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	config := m.settings.Get()
 	if target.configJSON != "" {
 		if err := json.Unmarshal([]byte(target.configJSON), &config.Download); err != nil {
-			return false, fmt.Errorf("会话下载配置快照无效: %w", err)
+			reason := fmt.Sprintf("会话下载配置快照无效: %v", err)
+			m.failChatTransfer(id, reason)
+			return false, errors.New(reason)
 		}
 	}
 	byMessage := make(map[int]source, len(batch))
@@ -997,7 +1031,15 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
 	tmpDir, err := temporaryDialogDirectory(tmpRoot, batch[0].DialogKey)
 	if err != nil {
-		return false, fmt.Errorf("创建会话临时目录: %w", err)
+		// A filesystem that refuses the task's working directory is an
+		// environment fault, and it is terminal here for the same reason as the
+		// two above: the retry is uncapped, so leaving it to the worker meant
+		// the task held its claims and its 下载中 label forever while nothing
+		// was ever attempted. Failing it names the problem, and the task can be
+		// started again once the environment is fixed.
+		reason := fmt.Sprintf("创建会话临时目录: %v", err)
+		m.failChatTransfer(id, reason)
+		return false, errors.New(reason)
 	}
 	watchdog := startTransferWatchdog(transferCtx, upstreamWatchPeriod, upstreamInitialTimeout, upstreamIdleTimeout, stopTransfer, func() bool {
 		status := m.chatStatus(id)
@@ -1433,11 +1475,56 @@ func (m *Manager) watchedDialogKeys() (wanted map[string]struct{}, watched map[s
 	return wanted, watched, nil
 }
 
+// authorizedChatAccounts names the accounts that can hold an update connection
+// at all. It is the same predicate ListenNewMessages tests before it connects,
+// so starting a listener for anything outside this set can only produce an
+// immediate ErrNotAuthorized.
+func authorizedChatAccounts(accounts []telegram.Account) map[string]struct{} {
+	authorized := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		if account.State == "authorized" {
+			authorized[account.ID] = struct{}{}
+		}
+	}
+	return authorized
+}
+
+// chatListenerAccountsChanged reports whether the set of authorized accounts
+// differs from the one a previous pass used. Signing in, signing out and a
+// session expiring all change it, and each of them changes which listeners
+// should exist.
+func chatListenerAccountsChanged(previous, current map[string]struct{}) bool {
+	if len(previous) != len(current) {
+		return true
+	}
+	for id := range current {
+		if _, ok := previous[id]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) reconcileChatListeners() {
 	const listenerSafetyRefresh = 5 * time.Minute
+	accounts, _ := m.accounts.List()
+	authorized := authorizedChatAccounts(accounts)
 	now := time.Now()
 	due := m.listenerSnapshotAt.Load() == 0 || now.UnixNano()-m.listenerSnapshotAt.Load() >= listenerSafetyRefresh.Nanoseconds()
-	if !due && !m.listenerDirty.Load() {
+	// The authorized set is compared on every pass, not only when something
+	// marked the snapshot dirty. Nothing marks it when an account is signed in
+	// or expires - those transitions happen inside the Telegram manager, which
+	// does not know this snapshot exists - so without this an account that was
+	// signed in again would wait for the five minute refresh before its
+	// listener came back. The comparison is over a handful of in-memory
+	// records, which is what makes it cheap enough to run here every three
+	// seconds.
+	//
+	// The five minute refresh below remains the guarantee, not this comparison:
+	// even if the set never changed, a rebuild happens at least that often, so
+	// a listener can be late but never permanently absent. Only pass 0 and a
+	// dirty flag skip their rebuild.
+	if !due && !m.listenerDirty.Load() && !chatListenerAccountsChanged(m.listenerAccounts, authorized) {
 		return
 	}
 	// Clear before querying. A concurrent state change sets it again, ensuring
@@ -1451,8 +1538,19 @@ func (m *Manager) reconcileChatListeners() {
 	}
 	proxyURL := m.settings.ProxyURL()
 	m.mu.Lock()
+	// The admission set keeps the entries of accounts that cannot currently
+	// listen. A listener for such an account is not running, so the entries are
+	// inert, and keeping them means a listener that comes back needs no second
+	// pass to be correct again.
 	m.chatWatched = watched
 	for accountID := range wanted {
+		if _, canListen := authorized[accountID]; !canListen {
+			// Starting one would open a connection only to be told the account
+			// is not signed in. That is what this used to do every five
+			// minutes, for every listening task of every account that had been
+			// signed out, and each attempt logged a failure.
+			continue
+		}
 		if current, exists := m.chatListeners[accountID]; exists && current.proxy == proxyURL {
 			continue
 		} else if exists {
@@ -1466,12 +1564,15 @@ func (m *Manager) reconcileChatListeners() {
 		go m.runChatListener(ctx, accountID, listener)
 	}
 	for accountID, listener := range m.chatListeners {
-		if _, keep := wanted[accountID]; !keep {
+		_, wantedNow := wanted[accountID]
+		_, canListen := authorized[accountID]
+		if !wantedNow || !canListen {
 			listener.cancel()
 			delete(m.chatListeners, accountID)
 		}
 	}
 	m.mu.Unlock()
+	m.listenerAccounts = authorized
 	m.listenerSnapshotAt.Store(now.UnixNano())
 	// The gap walk's only other trigger is a listener becoming ready, and that
 	// does not happen again while the listener stays up. A walk that was cut off
@@ -1482,6 +1583,14 @@ func (m *Manager) reconcileChatListeners() {
 	// interval. On a task that is already up to date the walk costs a single
 	// history page before it recognises the watermark.
 	for accountID := range wanted {
+		if _, canListen := authorized[accountID]; !canListen {
+			// Walking a gap means reading history, which the same account state
+			// gates. Running it anyway spends three attempts and two sleeps per
+			// candidate task to collect an ErrNotAuthorized each time, and the
+			// walk has nothing to do until the account is usable again - at
+			// which point the changed set rebuilds this snapshot and walks.
+			continue
+		}
 		go m.reconcileListenerGaps(accountID)
 	}
 	// A listening task that has no linked group yet is a task whose comments
@@ -1516,16 +1625,28 @@ func (m *Manager) markChatListenerDirty() {
 // and the next periodic listener reconciliation. The account listener is
 // already running for the parent channel, so only its in-memory filter needs
 // updating.
-func (m *Manager) addChatWatched(accountID, dialogKey string) {
+// It reports whether the key was new. The caller needs that to know whether the
+// snapshot has to be rebuilt, because a rebuild replaces the whole map: a key
+// added while one is being built - after watchedDialogKeys has read the table
+// and before its result is assigned - is otherwise removed again a moment after
+// it was learned, and the discussion group's comments are covered by nothing
+// else. That window is milliseconds, but the task then runs without the group
+// until the five minute safety refresh restores it, and the dispatcher's
+// acknowledgement means any comment arriving in between is lost for good.
+func (m *Manager) addChatWatched(accountID, dialogKey string) bool {
 	if accountID == "" || dialogKey == "" {
-		return
+		return false
 	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.chatWatched[accountID] == nil {
 		m.chatWatched[accountID] = make(map[string]struct{})
 	}
+	if _, exists := m.chatWatched[accountID][dialogKey]; exists {
+		return false
+	}
 	m.chatWatched[accountID][dialogKey] = struct{}{}
-	m.mu.Unlock()
+	return true
 }
 
 // rememberDiscussionLink records which discussion group belongs to a listening
@@ -1565,7 +1686,14 @@ func (m *Manager) rememberDiscussionLink(chatJobID, accountID, dialogKey string,
 	if err != nil {
 		return err
 	}
-	m.addChatWatched(accountID, dialogKey)
+	if m.addChatWatched(accountID, dialogKey) {
+		// The key is new, so a snapshot that is being built right now may not
+		// contain it. Asking for another build is what makes the persisted link
+		// and the in-memory admission set agree again; a key that was already
+		// present needs nothing, which is the common case and the reason this
+		// does not fire once per post on a busy channel.
+		m.markChatListenerDirty()
+	}
 	return nil
 }
 
@@ -1711,8 +1839,20 @@ func (m *Manager) refreshChatDiscussionLinks() error {
 		return err
 	}
 	now := time.Now().UTC()
+	accounts, _ := m.accounts.List()
+	authorized := authorizedChatAccounts(accounts)
 	for _, target := range targets {
 		if !targetIncludesReplies(target) {
+			continue
+		}
+		if _, canProbe := authorized[target.AccountID]; !canProbe {
+			// The probe is a Telegram request, and the account state gates it
+			// before any connection is opened. Trying anyway records a failure
+			// per listening task and, because a failure deliberately leaves the
+			// probe timestamp untouched, does it again on every wake - which
+			// is the rebuild. Skipping is not a loss: a probe is retried on the
+			// interval regardless, and a sign-in changes the account set, which
+			// rebuilds the snapshot and wakes this worker.
 			continue
 		}
 		// An unparseable timestamp is treated as stale: asking once more is
@@ -1761,9 +1901,6 @@ func (m *Manager) resolveChatDiscussionLink(ctx context.Context, target storedCh
 		return true, "", nil, nil
 	}
 	runErr := m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		if rpcErr := m.awaitTelegramRPC(ctx, target.AccountID); rpcErr != nil {
-			return rpcErr
-		}
 		result, rpcErr := client.API().ChannelsGetFullChannel(ctx, &tg.InputChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash})
 		if rpcErr != nil {
 			m.recordTelegramRPCError(target.AccountID, rpcErr)
@@ -1945,6 +2082,14 @@ func (m *Manager) reconcileListenerGap(id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), listenerGapBudget)
 	defer cancel()
 	return m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+		// The linked discussion group is a different dialog with its own
+		// history, so the walk below - which reads this task's own dialog -
+		// cannot reach the comments left in it. Its failure is reported and
+		// swallowed: the two walks keep independent cursors, and one dialog
+		// being unreadable must not cost the other its recovery.
+		if err := m.reconcileDiscussionGap(ctx, target, client); err != nil {
+			applog.Error("chat_download", "listener_gap_discussion_failed", "chat_job_id", target.ID, "account_id", target.AccountID, "error", err.Error())
+		}
 		boundary := target.UpperMessageID
 		watermark := boundary
 		offset := m.listenerGapOffset(id)
@@ -1956,9 +2101,6 @@ func (m *Manager) reconcileListenerGap(id string) error {
 			// restart, with every listened dialog walking at once - the moment the
 			// account was most likely to be put into a flood wait, and a flood
 			// wait recorded nowhere, so the scheduler kept feeding it.
-			if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
-				return err
-			}
 			pageCtx, cancelPage := context.WithTimeout(ctx, listenerGapPageTimeout)
 			result, err := client.API().MessagesGetHistory(pageCtx, &tg.MessagesGetHistoryRequest{Peer: peer, OffsetID: offset, Limit: 100})
 			cancelPage()
@@ -1971,7 +2113,16 @@ func (m *Manager) reconcileListenerGap(id string) error {
 			// the watermark also holds the last stretch above it, so returning
 			// first would drop exactly the messages closest to the boundary.
 			for _, message := range above {
-				m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: target.DialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: peer})
+				if !m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: target.DialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: peer}) {
+					// The row was not written, so this message exists only in the
+					// retry queue. Stop the walk where it is: the watermark is not
+					// advanced, the page cursor is not moved, and the next walk
+					// re-offers this whole stretch. Re-offering is free - the inbox
+					// is unique per message - while advancing would make the one
+					// recovery path for this message skip it for good, since the
+					// dispatcher has already acknowledged the update to Telegram.
+					return nil
+				}
 				if message.ID > watermark {
 					watermark = message.ID
 				}
@@ -2010,16 +2161,126 @@ func (m *Manager) reconcileListenerGap(id string) error {
 // starts from the newest message.
 const listenerGapStream = "listener_gap"
 
+// listenerGapDiscussionStream is the same position for the linked discussion
+// group's own history. It is a separate stream because the two walks cover
+// different dialogs whose message ids are unrelated: sharing one cursor would
+// let the channel's position decide how far back the group is read.
+const listenerGapDiscussionStream = "listener_gap_discussion"
+
 func (m *Manager) listenerGapOffset(id string) int {
+	return m.gapStreamOffset(id, listenerGapStream)
+}
+
+func (m *Manager) setListenerGapOffset(id string, offset int) {
+	m.setGapStreamOffset(id, listenerGapStream, offset)
+}
+
+func (m *Manager) gapStreamOffset(id, streamKind string) int {
 	var offset int
-	if err := m.db.QueryRow(`SELECT offset_message_id FROM chat_download_streams WHERE chat_job_id = ? AND stream_kind = ?`, id, listenerGapStream).Scan(&offset); err != nil {
+	if err := m.db.QueryRow(`SELECT offset_message_id FROM chat_download_streams WHERE chat_job_id = ? AND stream_kind = ?`, id, streamKind).Scan(&offset); err != nil {
 		return 0
 	}
 	return offset
 }
 
-func (m *Manager) setListenerGapOffset(id string, offset int) {
-	_, _ = m.db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind, offset_message_id) VALUES (?, ?, ?) ON CONFLICT(chat_job_id, stream_kind) DO UPDATE SET offset_message_id = EXCLUDED.offset_message_id`, id, listenerGapStream, offset)
+func (m *Manager) setGapStreamOffset(id, streamKind string, offset int) {
+	_, _ = m.db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind, offset_message_id) VALUES (?, ?, ?) ON CONFLICT(chat_job_id, stream_kind) DO UPDATE SET offset_message_id = EXCLUDED.offset_message_id`, id, streamKind, offset)
+}
+
+// discussionGapPageCap bounds one discussion walk. A backlog larger than this
+// keeps its persisted cursor and is continued by the next walk, so the cap costs
+// latency rather than coverage.
+const discussionGapPageCap = 20
+
+// reconcileDiscussionGap admits the comments published into a listening
+// channel's linked discussion group while the update connection was down.
+//
+// The walk in reconcileListenerGap cannot cover them, and this is the gap it
+// leaves: it reads the channel's history, and a comment is a message in the
+// discussion group, so a comment left under an older post while the listener was
+// disconnected was never offered again - the dispatcher had already acknowledged
+// the update to Telegram, and the periodic probe only re-establishes the link.
+// The task went on showing 监听中 and the file was simply gone.
+//
+// The watermark is derived rather than stored. The highest message id this
+// account has ever admitted from that dialog is exactly what the inbox table
+// already records, and it is the right boundary: everything above it is new.
+// Re-reading below it costs nothing but requests, because the inbox insert
+// ignores a message it already has, so a row aged out by retention makes the
+// walk go further back rather than create a duplicate download.
+//
+// Nothing here decides what a comment means: every message above the boundary is
+// offered through the same admission path a live update takes, so a comment
+// recovered here is resolved, attributed and filtered exactly as it would have
+// been had the connection stayed up.
+func (m *Manager) reconcileDiscussionGap(ctx context.Context, target storedChatTarget, client *gotd.Client) error {
+	peer := target.discussion.inputPeer()
+	if peer == nil {
+		// The group is either not linked or its peer has not been learned yet.
+		return nil
+	}
+	// Derived from the peer rather than read from the task, so the key this walk
+	// filters by is the same key the admission path will compute for the event.
+	_, dialogKey, _ := dialogIdentity(peer, target.AccountID)
+	if dialogKey == "" {
+		return nil
+	}
+	var boundary int
+	if err := m.db.QueryRow(`SELECT COALESCE(MAX(message_id), 0) FROM chat_message_inbox WHERE account_id = ? AND dialog_key = ?`, target.AccountID, dialogKey).Scan(&boundary); err != nil {
+		return err
+	}
+	// A group with nothing admitted yet has no boundary to walk back to. The
+	// task only knows this dialog because it read one of the channel's posts, so
+	// anything older than the newest message is history this task never covered
+	// and is not what a reconnect owes.
+	if boundary == 0 {
+		return nil
+	}
+	// Admission is gated on the watched set, and the live path is what normally
+	// populates it for this dialog. A walk that ran before the first comment ever
+	// arrived would otherwise be filtered away silently.
+	m.addChatWatched(target.AccountID, dialogKey)
+	offset := m.gapStreamOffset(target.ID, listenerGapDiscussionStream)
+	for page := 0; page < discussionGapPageCap; page++ {
+		pageCtx, cancelPage := context.WithTimeout(ctx, listenerGapPageTimeout)
+		result, err := client.API().MessagesGetHistory(pageCtx, &tg.MessagesGetHistoryRequest{Peer: peer, OffsetID: offset, Limit: 100})
+		cancelPage()
+		if err != nil {
+			m.recordTelegramRPCError(target.AccountID, err)
+			return err
+		}
+		messages := searchMessages(result)
+		if len(messages) == 0 {
+			break
+		}
+		oldest := 0
+		reached := false
+		for _, raw := range messages {
+			message, ok := raw.(*tg.Message)
+			if !ok {
+				continue
+			}
+			if oldest == 0 || message.ID < oldest {
+				oldest = message.ID
+			}
+			if message.ID <= boundary {
+				reached = true
+				continue
+			}
+			if !m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: dialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: peer}) {
+				// Only in the retry queue, so stop and keep the cursor: the next
+				// walk re-reads this stretch instead of skipping it.
+				return nil
+			}
+		}
+		if reached || oldest == 0 || oldest == offset {
+			break
+		}
+		offset = oldest
+		m.setGapStreamOffset(target.ID, listenerGapDiscussionStream, offset)
+	}
+	m.setGapStreamOffset(target.ID, listenerGapDiscussionStream, 0)
+	return nil
 }
 
 func (m *Manager) chatEventWorker() {
@@ -2194,8 +2455,34 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies, true, id)
 		}
 		if resolveErr := resolvedErr[includeReplies]; resolveErr != nil {
-			applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", resolveErr.Error())
-			continue
+			// A resolution that did not complete is not the same answer as "this
+			// message holds nothing to download". Treating the two alike used to
+			// discard the update for good: the dispatcher has already
+			// acknowledged it to Telegram, so it is never redelivered; the inbox
+			// insert only reopens a failed row, so the 'done' row this produced
+			// could never be retried; and the gap walk advances the watermark
+			// past this message the next time it runs, so it was not even
+			// re-offered. A connection reset, a deadline or a flood wait during
+			// resolution therefore lost a published file silently, with one Info
+			// line as the only trace.
+			//
+			// Returning it hands the event to the ordinary retry budget. That is
+			// safe to repeat: the inbox is unique per message, registering is
+			// idempotent, and a rejection Telegram states outright is classified
+			// below rather than retried.
+			if permanentInboxError(resolveErr) {
+				// Telegram answered the request: the post was deleted between
+				// being published and being read, or this account may not read
+				// it. No later attempt changes either. It settles as skipped - a
+				// settled event nobody has to act on - because a listener that
+				// raised an error card for every deleted post in a busy channel
+				// would be unusable, and because the alternative this replaced
+				// was to drop it with no record at all.
+				applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "dialog_key", dialogKey, "message_id", event.MessageID, "error", resolveErr.Error())
+				return nothingToDo(resolveErr)
+			}
+			applog.Info("chat_download", "new_message_resolve_failed", "account_id", event.AccountID, "dialog_key", dialogKey, "message_id", event.MessageID, "error", resolveErr.Error())
+			return fmt.Errorf("解析新消息 %d: %w", event.MessageID, resolveErr)
 		}
 		items := resolved[includeReplies]
 		if originID := originByJob[id]; originID > 0 {
@@ -2389,9 +2676,6 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 		if minID < 0 {
 			minID = 0
 		}
-		if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
-			return err
-		}
 		result, err := client.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{Peer: target.inputPeer(), Q: "", Filter: filter, OffsetID: offset, Limit: 100, MinID: minID, MaxID: target.UpperMessageID + 1})
 		if err != nil {
 			m.recordTelegramRPCError(target.AccountID, err)
@@ -2409,9 +2693,6 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 			if group.id != 0 && group.boundary {
 				if _, done := expandedGroups[group.id]; done {
 					continue
-				}
-				if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
-					return err
 				}
 				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), group.members[0]); groupErr == nil && len(expanded) > 0 {
 					members = expanded
@@ -2501,9 +2782,6 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 		if minID < 0 {
 			minID = 0
 		}
-		if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
-			return err
-		}
 		result, err := client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: target.inputPeer(), OffsetID: offset, Limit: 100, MinID: minID, MaxID: target.UpperMessageID + 1})
 		if err != nil {
 			m.recordTelegramRPCError(target.AccountID, err)
@@ -2534,9 +2812,6 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 			}
 			members := []*tg.Message{message}
 			if grouped {
-				if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
-					return err
-				}
 				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), message); groupErr == nil && len(expanded) > 0 {
 					members = expanded
 				} else if groupErr != nil && m.recordTelegramRPCError(target.AccountID, groupErr) {
@@ -2831,6 +3106,50 @@ func (m *Manager) failChatScan(id, reason string) {
 	m.signalChat()
 }
 
+// failChatTransfer marks a session task failed when what it needs in order to
+// make progress cannot be read at all, and releases the media it had claimed.
+//
+// These are the failures the transfer worker's own retry cannot fix: the
+// snapshot of download settings the task was created with does not parse, or
+// the task has no usable Telegram peer reference. Returning them from
+// runOneChatBatch looked harmless, because the worker logs and tries again - but
+// the try happens on the idle interval with no cap and no attempt ceiling on
+// this path. The claimed items have already had their attempts incremented a few
+// lines earlier, and the per item failure handling that would have stopped them
+// runs later, after a transfer that is never reached. The task therefore stayed
+// in 下载中 with nothing in flight and nothing that could move it, held its
+// claim window against every other task that wanted the same files, and grew its
+// attempt counters for as long as the process ran.
+//
+// Failing it is what turns that into something a person can see and act on. The
+// media it had claimed is released in the same transaction, for the reason
+// failChatScan releases: a claim left behind by a task that will never transfer
+// blocks every other task that wants that file.
+func (m *Manager) failChatTransfer(id, reason string) {
+	tx, err := m.db.Begin()
+	if err != nil {
+		applog.Error("chat_download", "media_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN (?, ?, ?)`, ChatStatusFailed, reason, time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening); err != nil {
+		applog.Error("chat_download", "media_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	if err := releaseChatClaims(id)(tx); err != nil {
+		applog.Error("chat_download", "media_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		applog.Error("chat_download", "media_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	applog.Error("chat_download", "media_failure_terminal", "chat_job_id", id, "reason", reason)
+	m.touch()
+	m.markChatListenerDirty()
+	m.signalChat()
+}
+
 // orphanedMediaClaims removes global media claims held by a task that cannot
 // transfer, in either direction.
 //
@@ -2843,19 +3162,28 @@ func (m *Manager) failChatScan(id, reason string) {
 // the user deletes while its scan is failing. This sweep is what makes the
 // invariant self-healing rather than dependent on every writer remembering.
 //
-// Two different rules, deliberately. A session task holds claims only while it
-// is runnable, so a claim under any other status is stale and is dropped. An
-// ordinary message task is only dropped when its row is gone altogether: it has
-// several terminal states whose claim handling has not been audited to the same
-// standard, and deleting a claim it still intends to use would download the same
-// file twice, which is worse than leaving it.
+// Both kinds follow the same rule: a claim is kept only while its owner can
+// transfer. An ordinary message task used to be judged by a weaker one - its row
+// had to be gone altogether - which meant a claim it left behind while paused,
+// failed or partial was held by nobody and released by nothing. Every other task
+// wanting that media waited on it, and the release paths could not catch up,
+// because each of them only covers the item states it happens to write.
+//
+// The concern that motivated the weaker rule - dropping a claim a task still
+// intends to use would download the same file twice - is answered by claimMedia
+// rather than by keeping the claim: a task that still wants the media re-acquires
+// it on its next pass, and if another task got there first it adopts the
+// finished file instead of transferring it again. A permanently held claim has
+// no such recovery.
 func (m *Manager) orphanedMediaClaims() error {
 	_, err := m.db.Exec(`DELETE FROM downloaded_media d
 WHERE d.status = 'claimed' AND (
  (d.owner_kind = 'chat' AND NOT EXISTS (
    SELECT 1 FROM chat_download_jobs j WHERE j.id = d.owner_id
    AND j.status IN ('queued', 'scanning', 'downloading', 'listening')))
- OR (d.owner_kind = 'message' AND NOT EXISTS (SELECT 1 FROM download_jobs j WHERE j.id = d.owner_id))
+ OR (d.owner_kind = 'message' AND NOT EXISTS (
+   SELECT 1 FROM download_jobs j WHERE j.id = d.owner_id
+   AND j.status IN ('queued', 'running')))
  OR d.owner_kind NOT IN ('chat', 'message')
 )`)
 	return err

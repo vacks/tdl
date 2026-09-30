@@ -298,6 +298,13 @@ func (s *Service) processInbox(worker int) {
 				if err := s.downloads.RetryReactionInbox(event.ID, event.Attempts, submitErr); err != nil {
 					applog.Error("reaction", "inbox_retry_update_failed", "inbox_id", event.ID, "error", err.Error())
 				}
+				if download.IsNothingToDo(submitErr) {
+					// An answered event is not a failure, and reporting it at
+					// error level is how a queue that is working correctly came
+					// to look like one that was breaking.
+					applog.Info("reaction", "inbox_skipped", "inbox_id", event.ID, "message_id", event.Intent.Message.MessageID, "emoji", event.Emoji, "reason", submitErr.Error())
+					continue
+				}
 				applog.Error("reaction", "inbox_submit_failed", "inbox_id", event.ID, "attempt", event.Attempts, "error", submitErr.Error())
 				continue
 			}

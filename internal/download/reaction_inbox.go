@@ -39,40 +39,50 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account
 	if err != nil {
 		return false, err
 	}
-	changed, err := result.RowsAffected()
+	inserted, err := result.RowsAffected()
 	if err != nil {
 		return false, err
 	}
-	if changed == 0 {
+	// A row that already exists is reopened only where a new reaction is a
+	// genuine request to try again. Each arm below names one such state and is
+	// tried in turn, because the states are disjoint.
+	reopen := func(condition string) (bool, error) {
+		result, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND `+condition, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
+		if err != nil {
+			return false, err
+		}
+		changed, err := result.RowsAffected()
+		return changed == 1, err
+	}
+	queued = inserted == 1
+	if !queued {
 		// A terminal failure is not a permanent user-facing ban. A new matching
 		// reaction is an intentional retry request and starts a fresh attempt set.
-		result, err = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND status = 'failed'`, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
-		if err != nil {
-			return false, err
-		}
-		changed, err = result.RowsAffected()
-		if err != nil {
-			return false, err
-		}
-		if changed == 0 {
-			// A second application of the same emoji is a fresh user action when
-			// its earlier task was cancelled or deleted. Completed jobs remain
-			// idempotent so an ordinary redelivered Telegram update cannot revive
-			// them.
-			result, err = m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', attempts = 0, error = '', next_attempt_at = ?, updated_at = ? WHERE account_id = ? AND dialog_key = ? AND message_id = ? AND emoji = ? AND status = 'done' AND job_id IN (SELECT id FROM download_jobs WHERE status IN ('cancelled', 'deleted'))`, now, now, intent.AccountID, key, intent.Message.MessageID, emoji)
-			if err != nil {
-				return false, err
-			}
-			changed, err = result.RowsAffected()
-			if err != nil {
-				return false, err
-			}
-		}
+		queued, err = reopen(`status = 'failed'`)
 	}
-	if changed == 1 {
+	if err == nil && !queued {
+		// A skipped row records the answer "nothing in this message matches the
+		// filter". That answer is a function of the message and the current
+		// settings, and a new reaction is the only way to ask again - so it must
+		// re-evaluate instead of being told the event is a duplicate. Without
+		// this arm, changing the file filter and reacting again would do nothing
+		// at all, and would say nothing about why.
+		queued, err = reopen(`status = 'skipped'`)
+	}
+	if err == nil && !queued {
+		// A second application of the same emoji is a fresh user action when
+		// its earlier task was cancelled or deleted. Completed jobs remain
+		// idempotent so an ordinary redelivered Telegram update cannot revive
+		// them.
+		queued, err = reopen(`status = 'done' AND job_id IN (SELECT id FROM download_jobs WHERE status IN ('cancelled', 'deleted'))`)
+	}
+	if err != nil {
+		return false, err
+	}
+	if queued {
 		m.signal()
 	}
-	return changed == 1, nil
+	return queued, nil
 }
 
 // ClaimReactionInbox atomically leases a small batch. A process restart turns
@@ -177,8 +187,27 @@ func (m *Manager) CompleteReactionInbox(id int64, jobID string) error {
 // A rejection from Telegram is the exception to that rule, exactly as in the
 // message inbox: it cannot succeed on a later attempt, so it stops now and
 // spends the attempt budget at once instead of being revived every hour.
+//
+// An answered event is the other exception, and it is the one this queue needed
+// most. A reaction whose message holds no file the current filter accepts used
+// to be treated as a failure and retried like one - five times in half a minute,
+// then hourly to twenty - every attempt re-reading the same message from
+// Telegram to reach the answer it already had. It now settles as skipped on the
+// first attempt.
 func (m *Manager) RetryReactionInbox(id int64, attempts int, cause error) error {
 	now := time.Now().UTC()
+	if IsNothingToDo(cause) {
+		// The event was answered: nothing in this message matches the filter, so
+		// there is nothing to download. Settling it as skipped keeps it out of
+		// the queue the Bot lists while still recording that the reaction was
+		// seen - and a later reaction on the same message reopens it, which is
+		// what makes the recorded answer revisable rather than final.
+		if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'skipped', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
+			return err
+		}
+		applog.Info("reaction", "reaction_event_skipped", "inbox_id", id, "attempts", attempts, "reason", cause.Error())
+		return nil
+	}
 	if permanentInboxError(cause) {
 		if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'failed', attempts = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, inboxAttemptLimit, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
 			return err

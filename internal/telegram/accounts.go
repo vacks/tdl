@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gotd/td/bin"
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth/qrlogin"
 	messagePeer "github.com/gotd/td/telegram/message/peer"
@@ -118,6 +119,88 @@ type Manager struct {
 	cancel     context.CancelFunc
 	updatesMu  sync.Mutex
 	updates    map[string]*updateHub
+	// rpcGate paces the metadata requests this manager issues. It is installed
+	// by whoever owns the account-wide rate limit - the download service - and
+	// called before every request in the list below. Held behind a lock rather
+	// than set once at construction because the two managers are built in
+	// sequence, not together.
+	rpcGateMu sync.RWMutex
+	rpcGate   func(ctx context.Context, accountID string) error
+}
+
+// SetRPCGate installs the account-wide request gate. A nil gate disables
+// pacing, which is what tests and any future account type that does not share
+// the download service's budget want.
+func (m *Manager) SetRPCGate(gate func(ctx context.Context, accountID string) error) {
+	m.rpcGateMu.Lock()
+	defer m.rpcGateMu.Unlock()
+	m.rpcGate = gate
+}
+
+func (m *Manager) currentRPCGate() func(ctx context.Context, accountID string) error {
+	m.rpcGateMu.RLock()
+	defer m.rpcGateMu.RUnlock()
+	return m.rpcGate
+}
+
+// pacedRequest reports whether one request is the kind the account gate exists
+// for: reading messages, resolving a peer, or asking about a dialog.
+//
+// The list is deliberately an allow-list rather than "everything except the
+// byte transfer". The client's own startup issues requests - asking for the
+// config, initialising the connection - from inside the same invoker, and a gate
+// that stops to wait for a token can deadlock against the very request that
+// would unblock it. Naming what is paced also keeps the expensive, invisible
+// requests out: a file transfer and the update long-poll must never queue behind
+// a metadata budget.
+func pacedRequest(input bin.Encoder) bool {
+	switch input.(type) {
+	case *tg.MessagesGetHistoryRequest,
+		*tg.MessagesGetMessagesRequest,
+		*tg.MessagesSearchRequest,
+		*tg.MessagesGetRepliesRequest,
+		*tg.MessagesGetDiscussionMessageRequest,
+		*tg.ChannelsGetFullChannelRequest,
+		*tg.ChannelsGetChannelsRequest,
+		*tg.ChannelsGetMessagesRequest,
+		*tg.ContactsResolveUsernameRequest,
+		*tg.UsersGetFullUserRequest,
+		*tg.UsersGetUsersRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+// rpcGateMiddleware paces this account's metadata requests through the shared
+// gate.
+//
+// It used to be the caller's job: eighteen call sites inside the download
+// service each remembered to ask for a token before making a request. That
+// arrangement cannot be right by construction - a new call site, or a request
+// made by a library on the way to something else, silently bypassed the gate -
+// and it was already wrong in practice: building a peers.Manager resolves an
+// access hash with channels.getChannels, which no caller ever paced, and a
+// ?comment link resolution spends two requests under one token.
+//
+// Note the boundary: this wraps the invoker behind Client.API(). The downloader
+// pool that performs the byte transfers builds its own invoker chain
+// (dcpool.NewPool) and does not pass through here, so the per-message metadata
+// reads it makes are still un-paced. Closing that needs the pool to receive a
+// middleware of its own.
+func (m *Manager) rpcGateMiddleware(accountID string) gotd.Middleware {
+	return gotd.MiddlewareFunc(func(next tg.Invoker) gotd.InvokeFunc {
+		return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+			gate := m.currentRPCGate()
+			if gate == nil || !pacedRequest(input) {
+				return next.Invoke(ctx, input, output)
+			}
+			if err := gate(ctx, accountID); err != nil {
+				return err
+			}
+			return next.Invoke(ctx, input, output)
+		}
+	})
 }
 
 func Open(dataDir string, proxyURL func() string) (*Manager, error) {
@@ -460,6 +543,23 @@ func (m *Manager) runUpdateHub(ctx context.Context, accountID string, hub *updat
 			return
 		}
 		if err := m.runUpdateConnection(ctx, accountID, hub); err != nil && ctx.Err() == nil {
+			if isTerminalSessionError(err) {
+				// Nothing about waiting makes an unusable authorization usable.
+				// Marking the account expired stops every listener that depends
+				// on it and tells the person to log in again, which is the only
+				// thing that can actually fix this.
+				applog.Error("telegram", "update_listener_session_expired", "account_id", accountID, "error", err.Error())
+				m.markExpired(accountID)
+				// Drop the registration before returning. The hub is finished,
+				// and a subscription arriving after a re-login would otherwise
+				// attach to it and wait for updates that can never arrive.
+				m.updatesMu.Lock()
+				if m.updates[accountID] == hub {
+					delete(m.updates, accountID)
+				}
+				m.updatesMu.Unlock()
+				return
+			}
 			delay := time.Duration(1<<min(attempt, 5)) * time.Second
 			applog.Error("telegram", "update_listener_retry_scheduled", "account_id", accountID, "attempt", attempt+1, "retry_after", delay.String(), "error", err.Error())
 			select {
@@ -886,7 +986,7 @@ func (m *Manager) runAccountLocked(ctx context.Context, id string, fn func(conte
 		return ErrNotAuthorized
 	}
 	store := m.accountStore(id)
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: proxyURL()}, false)
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: proxyURL()}, false, m.rpcGateMiddleware(id))
 	if err != nil {
 		return fmt.Errorf("创建 Telegram 客户端失败: %w", err)
 	}
@@ -944,7 +1044,7 @@ func (m *Manager) checkSessions(parent context.Context) {
 		})
 		cancel()
 		operation.Unlock()
-		if isAuthKeyUnregistered(err) {
+		if isTerminalSessionError(err) {
 			m.markExpired(id)
 			continue
 		}
@@ -974,8 +1074,38 @@ func (m *Manager) Stop() {
 	}
 }
 
-func isAuthKeyUnregistered(err error) bool {
-	return err != nil && (tgerr.Is(err, "AUTH_KEY_UNREGISTERED") || strings.Contains(err.Error(), "AUTH_KEY_UNREGISTERED"))
+// terminalSessionErrors are the answers that say the stored authorization can
+// no longer be used at all, so only logging in again can change the outcome.
+// They are matched through tgerr and on the raw text, because the same
+// rejection also arrives wrapped by the transport with no type left to read.
+//
+// AUTH_KEY_UNREGISTERED used to be the only one recognized. A session revoked
+// from another device answers SESSION_REVOKED instead, and the account stayed
+// marked "authorized": the update hub reconnected every 32 seconds for as long
+// as the process lived, no listener ever stopped, and nothing ever told the
+// person that the session had to be restored. The retry budget is for answers
+// that a later attempt can outlast - a closed connection, a peer that was
+// briefly unreachable - and none of these are.
+var terminalSessionErrors = []string{
+	"AUTH_KEY_UNREGISTERED",
+	"SESSION_REVOKED",
+	"SESSION_EXPIRED",
+	"API_ID_INVALID",
+	// Covers USER_DEACTIVATED_BAN as well as the plain form.
+	"USER_DEACTIVATED",
+}
+
+func isTerminalSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	for _, name := range terminalSessionErrors {
+		if tgerr.Is(err, name) || strings.Contains(text, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldMarkSessionChecked(err error) bool { return err == nil }

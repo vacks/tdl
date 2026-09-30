@@ -164,6 +164,26 @@ func (m *Manager) SubmitSaved(ctx context.Context, intent SavedIntent) (ChatJob,
 	return created, duplicate, nil
 }
 
+// ErrNoEligibleMedia reports that a message was read successfully and every
+// file in it was rejected by the current size or type filter.
+//
+// It is an answer, not a fault. Callers that report to a person keep showing its
+// text, which is why it is still an error; the inbox settles the event that
+// produced it as skipped, because a message's contents do not change between two
+// attempts a second apart and re-asking costs a Telegram request for nothing.
+var ErrNoEligibleMedia = errors.New("消息中的文件均不符合当前文件体积或类型筛选条件")
+
+// ErrNoMedia reports that the message was read successfully and simply holds
+// nothing downloadable - ordinary text, a poll, a link preview.
+//
+// It is kept apart from ErrNoEligibleMedia because the two send the reader to
+// different places. "Filtered out" is a statement about the configured size and
+// type rules and is only true when a file actually was rejected; "no media" is a
+// statement about the link. Reporting the second with the first's wording
+// pointed people at settings that had no part in the outcome. Both are answers
+// rather than faults, so both settle an inbox event as skipped.
+var ErrNoMedia = errors.New("该消息不包含可下载的文件（纯文本、投票或链接预览）")
+
 // Submission says whether a new job was made or this request was attached to
 // an existing one. A duplicate is a successful, idempotent outcome.
 type Submission struct {
@@ -226,7 +246,7 @@ func (m *Manager) Submit(ctx context.Context, intent DownloadIntent) (Submission
 	}
 	sources = filterSources(sources, m.settings.Get().Download)
 	if len(sources) == 0 {
-		return Submission{}, errors.New("消息中的文件均不符合当前文件体积或类型筛选条件")
+		return Submission{}, nothingToDo(ErrNoEligibleMedia)
 	}
 	// A direct Telegram update may not have a public link. Keep a stable,
 	// non-public source value for audit and upstream resume bookkeeping rather
@@ -286,9 +306,6 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 	var created ChatJob
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
-		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-			return err
-		}
 		peer, startID, err := resolveChatTarget(ctx, manager, intent.URL)
 		if err != nil {
 			return err
@@ -297,9 +314,6 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 		dialogType, dialogKey, dialogID := dialogIdentityForPeer(peer, accountID)
 		if dialogType != "channel" && dialogType != "chat" {
 			return errors.New("会话下载仅支持频道和群组")
-		}
-		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-			return err
 		}
 		it := query.Messages(client.API()).GetHistory(input).BatchSize(1).Iter()
 		if !it.Next(ctx) {

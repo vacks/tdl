@@ -113,9 +113,6 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 	// could skip a different album that happens to share an id.
 	expandedGroups := make(map[int64]struct{})
 	for {
-		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-			return nil, err
-		}
 		result, err := api.MessagesGetReplies(ctx, &tg.MessagesGetRepliesRequest{Peer: threadPeer, MsgID: threadMessageID, OffsetID: offset, Limit: 100})
 		if err != nil {
 			m.recordTelegramRPCError(accountID, err)
@@ -153,9 +150,6 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 			if groupID, grouped := message.GetGroupedID(); grouped {
 				if _, alreadyExpanded := expandedGroups[groupID]; alreadyExpanded {
 					continue
-				}
-				if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-					return nil, err
 				}
 				group, groupErr := tutil.GetGroupedMessages(ctx, api, threadPeer, message)
 				if groupErr != nil {
@@ -307,9 +301,6 @@ func replyPageNextOffset(page []tg.MessageClass, previous int) int {
 // It is also used for newly received posts with zero replies so future comments
 // can be mapped without waiting for the first media reply.
 func discussionThread(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, messageID int, expectedDiscussionID int64) (tg.InputPeerClass, int, bool, error) {
-	if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-		return nil, 0, false, err
-	}
 	discussion, err := api.MessagesGetDiscussionMessage(ctx, &tg.MessagesGetDiscussionMessageRequest{Peer: originPeer, MsgID: messageID})
 	if err != nil {
 		m.recordTelegramRPCError(accountID, err)
@@ -392,9 +383,6 @@ func discussionOriginFromRoot(m *Manager, ctx context.Context, api *tg.Client, a
 	channel, ok := discussionPeer.(*tg.InputPeerChannel)
 	if !ok {
 		return "", 0, rootMessageID, nil
-	}
-	if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
-		return "", 0, rootMessageID, err
 	}
 	result, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 		Channel: &tg.InputChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},

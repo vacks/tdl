@@ -283,3 +283,81 @@ func TestTaskSourcePresentation(t *testing.T) {
 		})
 	}
 }
+
+// TestEventListShowsTheOpenQueueInTheStatusCardVocabulary checks that the list
+// reads as the drill-down behind /status: the same three labels, the attempt
+// count that says how close an event is to being left failed for good, and the
+// next retry time that distinguishes waiting work from work in flight.
+func TestEventListShowsTheOpenQueueInTheStatusCardVocabulary(t *testing.T) {
+	events := []download.ListenerEvent{
+		{Source: "message", ID: 8412, DialogName: "某频道", MessageID: 1001, Status: "pending", Attempts: 3, NextAttemptAt: "2026-09-30T05:04:00Z"},
+		{Source: "reaction", ID: 8390, DialogName: "某群组", MessageID: 2044, Emoji: "👍", Status: "failed", Attempts: download.InboxAttemptLimit, Error: "CHAT_WRITE_FORBIDDEN"},
+		{Source: "message", ID: 8377, DialogName: "某群组", MessageID: 88, Status: "processing", Attempts: 1},
+	}
+	text := eventListText(events, 12, 1, 2)
+	for _, want := range []string{
+		"<b>监听事件</b>", "共 12 个", "第 1/2 页",
+		"#8412", "等待重试 3/20", "下次 ",
+		"#8390", "反应 👍", "已停止重试 20/20", "CHAT_WRITE_FORBIDDEN",
+		"#8377", "处理中 1/20",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("eventListText() missing %q in:\n%s", want, text)
+		}
+	}
+	// Processing work has no retry time to show, and a card that printed one
+	// would describe an in-flight event as if it were backing off.
+	if strings.Count(text, "下次 ") != 1 {
+		t.Fatalf("eventListText() must show a next attempt only for waiting events:\n%s", text)
+	}
+}
+
+// TestEventLineEscapesTelegramSuppliedText covers the fields a person does not
+// control. The dialog name and emoji come from Telegram and the error text is
+// quoted from a server response, so any of them can contain the angle brackets
+// that would otherwise become markup in an HTML message.
+func TestEventLineEscapesTelegramSuppliedText(t *testing.T) {
+	line := eventLine(download.ListenerEvent{
+		Source: "reaction", ID: 7, DialogName: "A&B <频道>", MessageID: 9, Emoji: "<b>",
+		Status: "failed", Attempts: download.InboxAttemptLimit, Error: "FLOOD_WAIT <500>",
+	})
+	for _, raw := range []string{"<频道>", "A&B", "<b>", "<500>"} {
+		if strings.Contains(line, raw) {
+			t.Fatalf("eventLine() left %q unescaped: %s", raw, line)
+		}
+	}
+	for _, want := range []string{"A&amp;B", "&lt;频道&gt;", "FLOOD_WAIT &lt;500&gt;"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("eventLine() missing %q: %s", want, line)
+		}
+	}
+	// A recorded error is a chain, and the token naming the cause is its last
+	// one - on real rows it is "CHANNEL_INVALID" after four layers of wrapper.
+	// Truncating the tail would remove exactly the part worth reading.
+	real := eventLine(download.ListenerEvent{
+		Source: "message", ID: 33, Status: "failed", Attempts: download.InboxAttemptLimit,
+		Error: "callback: 读取讨论根消息: retry middleware skip: rpcDoRequest: rpc error code 400: CHANNEL_INVALID",
+	})
+	if !strings.Contains(real, "CHANNEL_INVALID") {
+		t.Fatalf("eventLine() truncated away the cause: %s", real)
+	}
+	if !strings.Contains(real, "\n  └ ") {
+		t.Fatalf("eventLine() must put the whole error on its own line: %s", real)
+	}
+}
+
+// TestEventClearConfirmTextNamesRevivableEvents guards the number that decides
+// whether a clear destroys work that was still going to be attempted. An event
+// below the attempt limit is only resting between revives, so a card that
+// reported the total alone would describe it as a dead end.
+func TestEventClearConfirmTextNamesRevivableEvents(t *testing.T) {
+	text := eventClearConfirmText(12, 4)
+	for _, want := range []string{"<b>12</b>", "4 个尚未用尽尝试次数"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("eventClearConfirmText(12, 4) missing %q: %s", want, text)
+		}
+	}
+	if quiet := eventClearConfirmText(3, 0); strings.Contains(quiet, "自动重试") {
+		t.Fatalf("eventClearConfirmText(3, 0) must not mention a revive that cannot happen: %s", quiet)
+	}
+}

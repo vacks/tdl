@@ -30,13 +30,22 @@ var errInboxUnavailable = errors.New("收件箱暂不可写入")
 // Telegram never redelivers: an event dropped here is dropped for good. Every
 // path that can fail therefore logs and queues a bounded retry instead of
 // returning silently.
-func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) {
+//
+// It reports whether the event is durably accounted for. False means the row was
+// not written and the only copy of the request now lives in this process's retry
+// queue, which the gap walk has to know: that walk is the last thing that can
+// re-offer the message, and advancing past it would leave nothing behind.
+// A filtered event - one this service deliberately does not want - returns true,
+// because it is an answer rather than a failure.
+func (m *Manager) enqueueChatMessage(event telegram.NewMessageEvent) bool {
 	if err := m.admitChatMessage(event); err != nil {
 		applog.Error("download", "inbox_enqueue_failed", "account_id", event.AccountID, "dialog_key", event.DialogKey, "message_id", event.MessageID, "error", err.Error())
 		m.scheduleInboxRetry(fmt.Sprintf("chat_message_inbox account=%s dialog=%s message=%d", event.AccountID, event.DialogKey, event.MessageID), func() error {
 			return m.admitChatMessage(event)
 		})
+		return false
 	}
+	return true
 }
 
 // admitChatMessage performs the filtered checks and the durable insert. It
@@ -239,6 +248,17 @@ func (m *Manager) completeChatMessageInbox(id int64) error {
 // recorded and counted.
 func (m *Manager) retryChatMessageInbox(id int64, attempts int, cause error) error {
 	now := time.Now().UTC()
+	if IsNothingToDo(cause) {
+		// The event was answered: there is nothing to download. Settling it as
+		// skipped records that the request was seen and acted on while keeping
+		// it out of the queue the Bot lists, because an event nobody can act on
+		// does not belong in the list of events someone can.
+		if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'skipped', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
+			return err
+		}
+		applog.Info("chat_download", "new_message_event_skipped", "inbox_id", id, "attempts", attempts, "reason", cause.Error())
+		return nil
+	}
 	if permanentInboxError(cause) {
 		// Telegram rejected the request itself, so no later attempt can succeed.
 		// Spend the whole attempt budget at once: reviveExhaustedInboxEvents only
@@ -293,9 +313,24 @@ var retryableTelegram400Types = []string{
 // The allowlist is deliberately short. A 400 that is not in it stops on the
 // first attempt with its error recorded and visible, which is the same place a
 // fully retried event ends up, only sooner and without the requests.
+//
+// 401 and 403 belong to the same class for the same reason. They are statements
+// about the session, not about timing: SESSION_REVOKED, AUTH_KEY_UNREGISTERED,
+// USER_DEACTIVATED_BAN and CHAT_WRITE_FORBIDDEN are all answers that only
+// re-authenticating or relinking the dialog can change. Reaching them by asking
+// again is impossible, so they stop immediately like a rejection. Only the 400
+// allowlist above names answers that a later attempt can outlast.
 func permanentInboxError(err error) bool {
+	if isPermanentFailure(err) {
+		return true
+	}
 	rpcErr, ok := tgerr.As(err)
-	if !ok || rpcErr.Code != 400 {
+	if !ok {
+		return false
+	}
+	switch rpcErr.Code {
+	case 400, 401, 403:
+	default:
 		return false
 	}
 	upper := strings.ToUpper(rpcErr.Type)
@@ -330,6 +365,11 @@ const inboxAttemptLimit = 20
 // the user made, so a slow retry is the right default and a permanent, silent
 // loss is not. Errors are returned rather than swallowed so the sweep's own
 // failures are visible too.
+//
+// It selects 'failed' and nothing else. A 'skipped' row is the other terminal
+// outcome and is deliberately excluded: it records an answer - there is nothing
+// to download - and offering it again would re-ask a question that already has
+// one, which is exactly the retry loop this row exists to avoid.
 func (m *Manager) reviveExhaustedInboxEvents() error {
 	now := time.Now().UTC()
 	retryAt := now.Add(inboxReviveInterval).Format(time.RFC3339Nano)

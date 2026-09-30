@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 // A listener-named dialog must read its display name from the same entity map
@@ -51,6 +52,45 @@ func TestSessionCheckOnlyMarksSuccessfulProbe(t *testing.T) {
 	}
 	if shouldMarkSessionChecked(errors.New("proxy timeout")) {
 		t.Fatal("failed network probe was accepted as a session check")
+	}
+}
+
+// An authorization that no longer works has to be recognized as such, because
+// the retry loop that consumes this predicate runs forever otherwise: the
+// update hub reconnected on a capped delay with no end, and the account stayed
+// marked "authorized" so nothing ever told the person to log in again.
+func TestTerminalSessionErrorsStopRetryingAndTransientOnesDoNot(t *testing.T) {
+	terminal := []error{
+		tgerr.New(401, "SESSION_REVOKED"),
+		tgerr.New(401, "SESSION_EXPIRED"),
+		tgerr.New(401, "AUTH_KEY_UNREGISTERED"),
+		tgerr.New(401, "USER_DEACTIVATED_BAN"),
+		tgerr.New(400, "API_ID_INVALID"),
+		// The same rejection also arrives wrapped by the transport with no type
+		// left to read, which is why the text is matched as well.
+		errors.New("rpcDoRequest: rpc error code 401: SESSION_REVOKED"),
+	}
+	for _, err := range terminal {
+		if !isTerminalSessionError(err) {
+			t.Errorf("%v was not recognized as terminal", err)
+		}
+	}
+	// Everything a later attempt can outlast must keep being retried. Treating
+	// one of these as terminal would log the account out over a network blip.
+	transient := []error{
+		nil,
+		errors.New("connection reset by peer"),
+		errors.New("proxy timeout"),
+		tgerr.New(420, "FLOOD_WAIT_42"),
+		tgerr.New(500, "INTERNAL_SERVER_ERROR"),
+		// Duplicated keys resolve once the other client disconnects, so this is
+		// deliberately not in the list.
+		tgerr.New(406, "AUTH_KEY_DUPLICATED"),
+	}
+	for _, err := range transient {
+		if isTerminalSessionError(err) {
+			t.Errorf("%v was wrongly treated as terminal", err)
+		}
 	}
 }
 

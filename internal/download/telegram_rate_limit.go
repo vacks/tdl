@@ -67,6 +67,20 @@ func (m *Manager) loadTelegramRateLimits() error {
 	return rows.Err()
 }
 
+// awaitTelegramRPC blocks until one metadata request may be issued for this
+// account, or the account's flood cooldown has expired.
+//
+// It is installed on telegram.Manager as the account gate, so it is called from
+// the client's invoker rather than from a call site: every paced request waits
+// here, including the ones a library makes on the way to something else. That is
+// the point - this used to be eighteen explicit calls scattered through the
+// download service, and any request nobody remembered to precede simply went
+// un-paced.
+//
+// The downloader pool that moves the bytes builds its own invoker and is
+// deliberately not wired to this gate: a transfer is not a metadata request, and
+// a 4-per-second budget would define its throughput. Its per-message metadata
+// reads do not pass through here either, which is the remaining gap.
 func (m *Manager) awaitTelegramRPC(ctx context.Context, accountID string) error {
 	if accountID == "" {
 		return nil

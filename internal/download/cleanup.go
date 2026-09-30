@@ -61,7 +61,7 @@ func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, erro
 		}
 	}
 	for {
-		count, err := m.cleanupPostgresBatch(`DELETE FROM reaction_inbox WHERE id IN (SELECT id FROM reaction_inbox WHERE status IN ('done', 'failed') AND updated_at < ? ORDER BY updated_at, id LIMIT ?)`, cutoff)
+		count, err := m.cleanupPostgresBatch(`DELETE FROM reaction_inbox WHERE id IN (SELECT id FROM reaction_inbox WHERE status IN ('done', 'failed', 'skipped') AND updated_at < ? ORDER BY updated_at, id LIMIT ?)`, cutoff)
 		if err != nil {
 			return CleanupResult{}, err
 		}
@@ -71,7 +71,7 @@ func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, erro
 		}
 	}
 	for {
-		count, err := m.cleanupPostgresBatch(`DELETE FROM chat_message_inbox WHERE id IN (SELECT id FROM chat_message_inbox WHERE status IN ('done', 'failed') AND updated_at < ? ORDER BY updated_at, id LIMIT ?)`, cutoff)
+		count, err := m.cleanupPostgresBatch(`DELETE FROM chat_message_inbox WHERE id IN (SELECT id FROM chat_message_inbox WHERE status IN ('done', 'failed', 'skipped') AND updated_at < ? ORDER BY updated_at, id LIMIT ?)`, cutoff)
 		if err != nil {
 			return CleanupResult{}, err
 		}

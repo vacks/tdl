@@ -364,7 +364,14 @@ func (s *Server) downloadsAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请输入 Telegram 消息链接"})
 			return
 		}
-		submission, err := s.downloads.Submit(r.Context(), download.DownloadIntent{Source: download.SourceWeb, URL: strings.TrimSpace(input.URL)})
+		submission, err, settled := s.submitLink(r.Context(), strings.TrimSpace(input.URL))
+		if !settled {
+			// The link is being resolved in the background: the request is
+			// accepted, and the task will appear through the same event stream
+			// every other task does.
+			writeJSON(w, http.StatusAccepted, map[string]any{"pending": true})
+			return
+		}
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -372,6 +379,74 @@ func (s *Server) downloadsAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, submission)
 	default:
 		methodNotAllowed(w, "GET, POST")
+	}
+}
+
+const (
+	// submissionWaitBudget is how long a request waits for a link to resolve
+	// before the answer becomes "accepted" and the work continues without it.
+	// Creating a task is normally fast - one lookup and one insert - so this
+	// window is only reached by the shape that has real work to do: a post whose
+	// discussion thread is walked in full.
+	submissionWaitBudget = 8 * time.Second
+	// submissionWorkBudget bounds the handed-off resolution itself. It has to be
+	// generous, because the comment walk is paced by the account's Telegram
+	// budget, and it has to exist, because the goroutine outlives the request
+	// that started it.
+	submissionWorkBudget = 3 * time.Minute
+)
+
+// submitLink resolves and queues a message link, waiting for a bounded time.
+//
+// It exists because the whole resolution used to run inside the request: read
+// the message, expand its album, walk every page of its comment thread - tens of
+// seconds of paced Telegram requests on a popular post - and only then answer.
+// Two things were wrong with that. The browser sat on a button that could not
+// finish, with no timeout of its own; and the work was tied to the request
+// context, so a client that gave up, or navigated away, cancelled the resolution
+// and the task was never created - with nothing recorded that it had ever been
+// asked for.
+//
+// Now the work runs under its own budget, detached from the request, and the
+// handler stops waiting after submissionWaitBudget. A link that resolves quickly
+// answers exactly as it did before; one that does not is reported as accepted
+// and lands in the task list on its own.
+//
+// settled reports whether the outcome is known. When it is false the caller
+// answers "accepted" and the resolution finishes in the background; a failure
+// discovered after that point is logged rather than shown, because there is no
+// longer a request to show it to.
+func (s *Server) submitLink(requestCtx context.Context, url string) (submission download.Submission, err error, settled bool) {
+	// WithoutCancel keeps the request's values and drops its cancellation, which
+	// is the entire point: the work must survive the client going away.
+	workCtx, cancelWork := context.WithTimeout(context.WithoutCancel(requestCtx), submissionWorkBudget)
+	result := make(chan struct {
+		submission download.Submission
+		err        error
+	}, 1)
+	go func() {
+		defer cancelWork()
+		submission, err := s.downloads.Submit(workCtx, download.DownloadIntent{Source: download.SourceWeb, URL: url})
+		result <- struct {
+			submission download.Submission
+			err        error
+		}{submission, err}
+	}()
+	timer := time.NewTimer(submissionWaitBudget)
+	defer timer.Stop()
+	select {
+	case outcome := <-result:
+		return outcome.submission, outcome.err, true
+	case <-timer.C:
+		go func() {
+			outcome := <-result
+			if outcome.err != nil {
+				applog.Error("http", "link_resolution_failed_after_accept", "url", url, "error", outcome.err.Error())
+				return
+			}
+			applog.Info("http", "link_resolution_completed_after_accept", "url", url, "job_id", outcome.submission.Job.ID)
+		}()
+		return download.Submission{}, nil, false
 	}
 }
 
@@ -545,13 +620,54 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case event, ok := <-events:
-			if !ok || !write(&event) {
+			if !ok {
+				return
+			}
+			// One burst of state changes, one message. Publishing a multi-file
+			// download moves each file through several states in quick
+			// succession, and the browser answers every message with two list
+			// requests; sending one message per transition made the download
+			// itself the thing that kept the client querying. The payload
+			// carries the revision read at send time, so a coalesced message
+			// tells the client exactly as much as the messages it replaces.
+			coalesced := coalesceEvents(events, event)
+			if !write(&coalesced) {
 				return
 			}
 		case <-ticker.C:
 			if !write(nil) {
 				return
 			}
+		}
+	}
+}
+
+// sseCoalesceWindow is how long a burst of task events is allowed to gather
+// before one message carries them all. It is deliberately short: it has to be
+// invisible to someone watching a progress bar, and the progress figures travel
+// on the one-second ticker in any case, so this only delays the list refresh
+// that follows a status change.
+const sseCoalesceWindow = 300 * time.Millisecond
+
+// coalesceEvents absorbs the rest of a burst and returns its last event. The
+// events carry no data beyond the task they concern - every consumer re-reads
+// canonical state from PostgreSQL - so the last one describes the same situation
+// as the ones it replaces, and the revision in the payload is read when the
+// message is finally written.
+func coalesceEvents(events <-chan download.Event, first download.Event) download.Event {
+	timer := time.NewTimer(sseCoalesceWindow)
+	defer timer.Stop()
+	latest := first
+	for {
+		select {
+		case next, ok := <-events:
+			if !ok {
+				// The bus closed; the caller detects this on its next receive.
+				return latest
+			}
+			latest = next
+		case <-timer.C:
+			return latest
 		}
 	}
 }

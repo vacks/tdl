@@ -137,6 +137,13 @@ type listPageState struct {
 type helpRetry struct {
 	next     time.Time
 	attempts int
+	// gaveUp ends the retries for this recipient. A send that failed on every
+	// attempt with the same answer - the control user blocked the Bot, the chat
+	// is gone - will fail on the next one too, and without this the backoff
+	// pinned at five minutes means it asks again every five minutes for as long
+	// as the process runs. helpSent stays unset, so restarting the service
+	// tries once more.
+	gaveUp bool
 }
 
 const (
@@ -149,6 +156,16 @@ const (
 	listPageTTL        = 30 * time.Minute
 	maxListPageEntries = 256
 	maxListPageHistory = 64
+	// startupHelpAttempts bounds the startup greeting. Its backoff caps at five
+	// minutes, so without a bound a permanent send failure - a control user who
+	// blocked the Bot, a token that was revoked - was retried every five
+	// minutes for the life of the process.
+	startupHelpAttempts = 8
+	// cursorSaveAttempts bounds one write of the update cursor. The write is
+	// attempted from the acknowledge path, which holds the lock that orders a
+	// conversation's commands, so an unbounded retry there did not merely fail
+	// to make progress: it blocked every later acknowledge behind it.
+	cursorSaveAttempts = 5
 )
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
@@ -378,6 +395,28 @@ func (s *Service) Stop() {
 	s.clientMu.Unlock()
 }
 
+// helpRetryStep advances the startup greeting's retry state after a failed
+// send, and reports whether to try again at all.
+//
+// The backoff is capped at five minutes, which is what made the bound
+// necessary: a send that fails for a reason no retry can change - the control
+// user blocked the Bot, the token was revoked - would otherwise be attempted
+// again every five minutes for the life of the process. Giving up leaves
+// helpSent unset, so a later start of the service tries once more.
+func helpRetryStep(retry helpRetry, now time.Time) (helpRetry, bool) {
+	if retry.attempts >= startupHelpAttempts {
+		retry.gaveUp = true
+		return retry, false
+	}
+	retry.attempts++
+	delay := time.Second * time.Duration(1<<min(retry.attempts, 8))
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	retry.next = now.Add(delay)
+	return retry, true
+}
+
 // sendStartupHelp confirms to authorized users that Bot control is available
 // after this application instance has completed its initialization.
 func (s *Service) sendStartupHelp(cfg settings.Bot) {
@@ -386,21 +425,18 @@ func (s *Service) sendStartupHelp(cfg settings.Bot) {
 		alreadySent := s.helpSent[id]
 		retry := s.helpRetry[id]
 		s.mu.Unlock()
-		if alreadySent || time.Now().Before(retry.next) {
+		if alreadySent || retry.gaveUp || time.Now().Before(retry.next) {
 			continue
 		}
 		if _, err := s.send(cfg.Token, id, helpText(), nil); err != nil {
-			applog.Error("bot", "startup_help_send_failed", "chat_id", id, "error", redactBotError(cfg.Token, err.Error()))
-			if retry.attempts < 8 {
-				retry.attempts++
-			}
-			delay := time.Second * time.Duration(1<<min(retry.attempts, 8))
-			if delay > 5*time.Minute {
-				delay = 5 * time.Minute
-			}
+			applog.Error("bot", "startup_help_send_failed", "chat_id", id, "attempt", retry.attempts+1, "error", redactBotError(cfg.Token, err.Error()))
+			next, again := helpRetryStep(retry, time.Now())
 			s.mu.Lock()
-			s.helpRetry[id] = helpRetry{next: time.Now().Add(delay), attempts: retry.attempts}
+			s.helpRetry[id] = next
 			s.mu.Unlock()
+			if !again {
+				applog.Error("bot", "startup_help_send_gave_up", "chat_id", id, "attempts", next.attempts, "error", redactBotError(cfg.Token, err.Error()))
+			}
 			continue
 		}
 		s.mu.Lock()
@@ -469,7 +505,16 @@ func (s *Service) advanceOffset(token string, offset int64) bool {
 		applog.Error("bot", "update_cursor_encode_failed", "error", err.Error())
 		return false
 	}
-	for attempt := 0; ; attempt++ {
+	// The loop is bounded. It used to run until the write succeeded, which is
+	// right for a transient failure and wrong for a path that can never
+	// succeed: an unwritable cursor file is a permission or filesystem state,
+	// not a race, so the retries went on for as long as the process lived and
+	// the caller never returned. Callers are the acknowledge path, which holds
+	// the ordering lock for a conversation's commands, so that block also
+	// stopped every acknowledge behind it. Giving up here leaves the in-memory
+	// offset untouched - which only means Telegram redelivers updates the
+	// dispatcher already knows - and the next acknowledge tries again.
+	for attempt := 0; attempt < cursorSaveAttempts; attempt++ {
 		if err := writePrivateFile(s.cursorPath, data); err == nil {
 			s.mu.Lock()
 			if offset > s.offset {
@@ -481,11 +526,16 @@ func (s *Service) advanceOffset(token string, offset int64) bool {
 		} else {
 			applog.Error("bot", "update_cursor_save_failed", "offset", offset, "attempt", attempt+1, "error", err.Error())
 		}
+		if attempt == cursorSaveAttempts-1 {
+			break
+		}
 		delay := time.Second * time.Duration(1<<min(attempt, 5))
 		if !waitContext(s.ctx, delay) {
 			return false
 		}
 	}
+	applog.Error("bot", "update_cursor_save_gave_up", "offset", offset, "attempts", cursorSaveAttempts)
+	return false
 }
 
 func tokenFingerprint(token string) string {
@@ -542,6 +592,14 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 		s.handleSavedCommand(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/saved")))
 	case text == "/status":
 		s.send(cfg.Token, msg.Chat.ID, s.statusText(), nil)
+	case text == "/event":
+		s.sendEventList(cfg, msg.Chat.ID)
+	case strings.HasPrefix(text, "/event "):
+		if strings.TrimSpace(strings.TrimPrefix(text, "/event ")) == "clear" {
+			s.sendEventClearConfirm(cfg, msg.Chat.ID)
+			break
+		}
+		s.send(cfg.Token, msg.Chat.ID, "用法：<code>/event</code> 查看监听的待处理事件；<code>/event clear</code> 清空已停止重试的事件。", nil)
 	case text == "/config":
 		s.send(cfg.Token, msg.Chat.ID, configText(s.settings.Get()), nil)
 	case text == "/restart":
@@ -617,6 +675,10 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	}
 	if strings.HasPrefix(query.Data, "c:") {
 		s.handleChatCallback(cfg, query)
+		return
+	}
+	if strings.HasPrefix(query.Data, "e:") {
+		s.handleEventCallback(cfg, query)
 		return
 	}
 	if strings.HasPrefix(query.Data, "l:") {
@@ -937,6 +999,213 @@ func (s *Service) chatTaskList(state *listPageState) (string, [][]button, error)
 	}
 	buttons = append(buttons, navigation)
 	return fmt.Sprintf("<b>会话下载</b> · 共 %d 个 · 第 %d/%d 页", total, state.page, totalPages), buttons, nil
+}
+
+// eventPageSize is the number of rows one /event page shows. Ten events plus a
+// header is a card that reads without scrolling on a phone.
+const eventPageSize = 10
+
+func (s *Service) sendEventList(cfg settings.Bot, chatID int64) {
+	state := listPageState{kind: "event", page: 1}
+	text, buttons, err := s.eventList(&state)
+	if err != nil {
+		s.send(cfg.Token, chatID, "读取监听事件失败。", nil)
+		return
+	}
+	messageID, err := s.send(cfg.Token, chatID, text, buttons)
+	if err == nil {
+		s.putListPage("event", chatID, messageID, state)
+	}
+}
+
+func (s *Service) editEventList(cfg settings.Bot, chatID, messageID int64, direction string) {
+	state, ok := s.getListPage("event", chatID, messageID)
+	if !ok {
+		s.edit(cfg.Token, chatID, messageID, "事件列表已过期，请重新发送 /event。", nil)
+		return
+	}
+	if direction != "refresh" {
+		var moved bool
+		state, moved = moveListPage(state, direction)
+		if !moved {
+			return
+		}
+	}
+	text, buttons, err := s.eventList(&state)
+	if err != nil {
+		s.edit(cfg.Token, chatID, messageID, "读取监听事件失败。", nil)
+		return
+	}
+	s.putListPage("event", chatID, messageID, state)
+	s.edit(cfg.Token, chatID, messageID, text, buttons)
+}
+
+func (s *Service) eventList(state *listPageState) (string, [][]button, error) {
+	events, total, next, err := s.downloads.ListListenerEvents(state.cursor, eventPageSize)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(events) == 0 {
+		return "暂无监听事件。", nil, nil
+	}
+	totalPages := max(1, (total+eventPageSize-1)/eventPageSize)
+	state.next = next
+	// An event has no per-row action: it is either already being handled or it
+	// has stopped, and the only thing a person can do about the latter is the
+	// clear that applies to all of them at once. So the card carries navigation
+	// and nothing else.
+	navigation := make([]button, 0, 3)
+	if len(state.previous) > 0 {
+		navigation = append(navigation, button{Text: "‹ 上一页", CallbackData: "e:prev"})
+	}
+	navigation = append(navigation, button{Text: fmt.Sprintf("第 %d/%d 页", state.page, totalPages), CallbackData: "e:refresh"})
+	if state.next != "" {
+		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: "e:next"})
+	}
+	return eventListText(events, total, state.page, totalPages), [][]button{navigation}, nil
+}
+
+func eventListText(events []download.ListenerEvent, total, page, totalPages int) string {
+	lines := make([]string, 0, len(events)+1)
+	lines = append(lines, fmt.Sprintf("<b>监听事件</b> · 共 %d 个 · 第 %d/%d 页", total, page, totalPages))
+	for _, event := range events {
+		lines = append(lines, eventLine(event))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// eventLine renders one queue row. The dialog name, the emoji and the recorded
+// error all originate outside this program, so each is escaped before it goes
+// into an HTML message.
+func eventLine(event download.ListenerEvent) string {
+	kind := "消息"
+	if event.Source == "reaction" {
+		kind = "反应 " + html.EscapeString(event.Emoji)
+	}
+	line := fmt.Sprintf("#%d · %s · %s · #%d · %s %d/%d", event.ID, kind, html.EscapeString(short(event.DialogName, 18)), event.MessageID, eventStatusLabel(event.Status), event.Attempts, download.InboxAttemptLimit)
+	if event.Status == "pending" {
+		if next := eventClock(event.NextAttemptAt); next != "" {
+			line += " · 下次 " + next
+		}
+	}
+	if event.Status == "failed" && event.Error != "" {
+		// The recorded error is the whole chain that produced it, and the token
+		// that says what actually happened is at the end of it. Appending a
+		// truncated tail to the row would cut off exactly that token, so the
+		// error gets its own line and enough room to be read in full.
+		line += "\n  └ " + html.EscapeString(short(event.Error, 120))
+	}
+	return line
+}
+
+// eventStatusLabel deliberately reuses the wording of the /status card: the
+// list is the drill-down behind those three numbers, so a person moving between
+// them must not have to learn a second vocabulary.
+func eventStatusLabel(status string) string {
+	switch status {
+	case "processing":
+		return "处理中"
+	case "pending":
+		return "等待重试"
+	case "failed":
+		return "已停止重试"
+	case "done":
+		return "已完成"
+	default:
+		return status
+	}
+}
+
+func eventClock(raw string) string {
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Local().Format("01-02 15:04")
+}
+
+func (s *Service) sendEventClearConfirm(cfg settings.Bot, chatID int64) {
+	stopped, revivable, err := s.downloads.StoppedEventCounts()
+	if err != nil {
+		s.send(cfg.Token, chatID, "读取已停止重试的事件失败。", nil)
+		return
+	}
+	if stopped == 0 {
+		s.send(cfg.Token, chatID, "当前没有已停止重试的事件。", nil)
+		return
+	}
+	s.send(cfg.Token, chatID, eventClearConfirmText(stopped, revivable), [][]button{{
+		{Text: fmt.Sprintf("确认清空 %d 个", stopped), CallbackData: "e:clear:confirm"},
+		{Text: "取消", CallbackData: "e:clear:cancel"},
+	}})
+}
+
+// eventClearConfirmText states what is about to be lost. A failed event below
+// the attempt limit is not a dead end - the hourly revive offers it to a worker
+// again - so a clear removes work that was still going to be attempted, and
+// saying only "12 个" would hide that.
+func eventClearConfirmText(stopped, revivable int64) string {
+	text := fmt.Sprintf("⚠️ 将永久删除 <b>%d</b> 个已停止重试的事件。", stopped)
+	if revivable > 0 {
+		text += fmt.Sprintf("\n其中 %d 个尚未用尽尝试次数，本会在下一轮自动重试。", revivable)
+	}
+	return text
+}
+
+func (s *Service) handleEventCallback(cfg settings.Bot, query callbackQuery) {
+	if query.Message == nil {
+		return
+	}
+	parts := strings.Split(query.Data, ":")
+	if len(parts) == 2 {
+		direction := parts[1]
+		if direction == "back" {
+			direction = "refresh"
+		}
+		if direction != "prev" && direction != "next" && direction != "refresh" {
+			return
+		}
+		s.editEventList(cfg, query.Message.Chat.ID, query.Message.MessageID, direction)
+		s.answer(cfg.Token, query.ID, "")
+		return
+	}
+	if len(parts) != 3 || parts[1] != "clear" {
+		return
+	}
+	switch parts[2] {
+	case "cancel":
+		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, "已取消。", nil)
+		s.answer(cfg.Token, query.ID, "")
+	case "confirm":
+		s.confirmEventClear(cfg, query)
+	}
+}
+
+// confirmEventClear recounts rather than trusting the number the card showed.
+// The hourly revive runs on its own schedule, so between the card and the press
+// an event can have moved back into the queue; deleting what is actually failed
+// now is both simpler than pinning a list and more honest about what happened.
+func (s *Service) confirmEventClear(cfg settings.Bot, query callbackQuery) {
+	message := query.Message
+	messages, reactions, err := s.downloads.ClearStoppedEvents()
+	if err != nil {
+		// The delete runs in batches, so a failure can land after some of them
+		// committed. Reporting the count that did go is the difference between
+		// a person re-running the command and a person wondering what happened.
+		applog.Error("bot", "event_clear_failed", "user_id", query.From.ID, "messages", messages, "reactions", reactions, "error", err.Error())
+		s.answer(cfg.Token, query.ID, "清空失败")
+		s.edit(cfg.Token, message.Chat.ID, message.MessageID, fmt.Sprintf("❌ 清空已停止重试的事件失败，已删除 %d 个。", messages+reactions), nil)
+		return
+	}
+	applog.Info("bot", "event_clear_completed", "user_id", query.From.ID, "messages", messages, "reactions", reactions)
+	text := fmt.Sprintf("✅ 已清空 %d 个已停止重试的事件（消息 %d · 反应 %d）。", messages+reactions, messages, reactions)
+	if remaining, _, countErr := s.downloads.StoppedEventCounts(); countErr == nil && remaining > 0 {
+		// Reached only when the queue held more failed events than one call
+		// clears, which says so instead of reporting a partial clear as done.
+		text += fmt.Sprintf("\n仍有 %d 个，请再次执行 <code>/event clear</code>。", remaining)
+	}
+	s.answer(cfg.Token, query.ID, "已清空")
+	s.edit(cfg.Token, message.Chat.ID, message.MessageID, text, nil)
 }
 
 func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
@@ -1719,7 +1988,7 @@ func messageFullText(value string) string {
 }
 
 func helpText() string {
-	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/saved all</code> 下载本人收藏夹历史消息\n<code>/saved listen</code> 监听本人收藏夹新消息\n<code>/saved stop</code> 停止收藏夹监听\n<code>/saved status</code> 查看收藏夹任务\n<code>/status</code> 获取当前状态\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
+	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/saved all</code> 下载本人收藏夹历史消息\n<code>/saved listen</code> 监听本人收藏夹新消息\n<code>/saved stop</code> 停止收藏夹监听\n<code>/saved status</code> 查看收藏夹任务\n<code>/status</code> 获取当前状态\n<code>/event</code> 查看监听的待处理事件（10 条一页）\n<code>/event clear</code> 清空已停止重试的事件\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
 }
 
 func (s *Service) statusText() string {
@@ -2075,6 +2344,7 @@ func (s *Service) configureCommands(token string) {
 		{"command": "chats", "description": "获取或创建会话下载"},
 		{"command": "saved", "description": "管理本人收藏夹下载"},
 		{"command": "status", "description": "获取当前状态"},
+		{"command": "event", "description": "查看或清空监听事件"},
 		{"command": "config", "description": "获取当前配置"},
 		{"command": "restart", "description": "重启所有服务"},
 	}
