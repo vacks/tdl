@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,11 @@ const (
 	// whose account is not inside a Telegram cooldown. A handful of rows is
 	// enough to step over a blocked account without scanning permanent history.
 	queuedCandidateWindow = 16
+	// defaultItemPageSize bounds the file records one task read returns, and
+	// maxItemPageSize caps what a caller may ask for. A task's file count is not
+	// bounded, so every display path pages rather than loading the whole history.
+	defaultItemPageSize = 50
+	maxItemPageSize     = 200
 	// Inbox writes are the one place where losing an event is unrecoverable: the
 	// update dispatcher returns nil to gotd, which advances the update state, so
 	// Telegram never redelivers. A failed insert is therefore retried in memory,
@@ -151,7 +157,11 @@ type Job struct {
 	DirectPeerID   int64
 	DirectPeerHash int64
 	ConfigJSON     string
-	Items          []Item `json:"items"`
+	// Items carries one bounded page of the task's file records, and
+	// ItemsNextCursor continues from it. A task's file count is not bounded, so
+	// the field is never the whole history; a reader that wants all of it pages.
+	Items           []Item `json:"items"`
+	ItemsNextCursor string `json:"itemsNextCursor,omitempty"`
 }
 
 // BotMessageRef identifies one Bot lifecycle message. It is persisted so a
@@ -449,8 +459,10 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	// The account gate is installed before any worker starts, so the first
 	// request an account makes is already paced. The download service owns the
 	// budget because the limit is per Telegram account and the accounts are
-	// shared with the reaction and listener features.
-	accounts.SetRPCGate(m.awaitTelegramRPC)
+	// shared with the reaction and listener features. Both halves are installed:
+	// pacing on its own left the cooldown that every admission predicate reads
+	// unset for metadata requests.
+	accounts.SetRPCGate(rpcGate{manager: m})
 	for worker := 0; worker < workerCount; worker++ {
 		go m.worker()
 	}
@@ -931,31 +943,40 @@ func (m *Manager) BotLifecycleMessages(jobID string) ([]BotMessageRef, error) {
 	return refs, rows.Err()
 }
 
+// ErrJobNotFound reports that a task id names no row. It is a sentinel so a
+// caller can tell a task that is genuinely gone from a database that could not
+// answer: the first is an outcome to settle, the second is a read to retry.
+var ErrJobNotFound = errors.New("下载任务不存在")
+
 // Get returns one task including its file records. It is used by the Bot to
 // refresh one displayed task without repeatedly loading unrelated task pages.
 func (m *Manager) Get(id string) (Job, error) {
 	var job Job
 	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, attempts, status, error, created_at, updated_at, message_text FROM download_jobs WHERE id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.MessageText)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, errors.New("下载任务不存在")
+		return Job{}, ErrJobNotFound
 	}
 	if err != nil {
 		return Job{}, err
 	}
 	job.HasPublicLink = isPublicMessageLink(job.SourceURL)
-	items, err := m.items(id)
+	// The counts come from the summary the triggers maintain. Reading them off
+	// the file rows was exact only by loading every one of them, which is the
+	// read this method exists to avoid; a task's file count has no bound.
+	total, completed, ok := m.itemCounts(id)
+	if !ok {
+		// No summary at all: count, which is what this used to do. A task with
+		// files but no summary must not read as an empty one.
+		if err := m.db.QueryRow(`SELECT COUNT(1), COUNT(1) FILTER (WHERE status = 'completed') FROM download_items WHERE job_id = ?`, id).Scan(&total, &completed); err != nil {
+			return Job{}, err
+		}
+	}
+	job.TotalItems, job.CompletedItems = int(total), int(completed)
+	items, next, err := m.ItemsPage(id, "", defaultItemPageSize)
 	if err != nil {
 		return Job{}, err
 	}
-	job.Items, job.TotalItems = items, len(items)
-	// The counts come from the rows already in hand rather than from the
-	// maintained summary, so this single-task view stays exact even if a summary
-	// row were ever missing.
-	for _, item := range items {
-		if item.Status == "completed" {
-			job.CompletedItems++
-		}
-	}
+	job.Items, job.ItemsNextCursor = items, next
 	return job, nil
 }
 
@@ -1534,8 +1555,8 @@ func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner boo
 		_ = m.setJob(jobID, "queued", "等待其他任务完成同一文件")
 		return
 	}
-	var completed int
-	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, jobID).Scan(&completed); err != nil {
+	completed, err := m.completedItems(jobID)
+	if err != nil {
 		return
 	}
 	if completed > 0 {
@@ -2070,7 +2091,47 @@ func isPublicMessageLink(value string) bool {
 	return strings.HasPrefix(value, "https://t.me/") || strings.HasPrefix(value, "http://t.me/")
 }
 
+// itemCounts reads a task's file totals from the summary the download_items
+// triggers maintain. ok is false when the task has no summary row at all, which
+// is not the same as a task with no files: the callers must not read "no row" as
+// "nothing outstanding".
+func (m *Manager) itemCounts(jobID string) (total, completed int64, ok bool) {
+	if err := m.db.QueryRow(`SELECT total_items, completed_items FROM download_item_stats WHERE job_id = ?`, jobID).Scan(&total, &completed); err != nil {
+		return 0, 0, false
+	}
+	return total, completed, true
+}
+
+// completedItems reports how many of a task's files are done, falling back to
+// counting when no summary row exists.
+func (m *Manager) completedItems(jobID string) (int64, error) {
+	if _, completed, ok := m.itemCounts(jobID); ok {
+		return completed, nil
+	}
+	var completed int64
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, jobID).Scan(&completed); err != nil {
+		return 0, err
+	}
+	return completed, nil
+}
+
+// allItemsCompleted reports whether every file of a task has reached its
+// terminal state.
+//
+// It reads the maintained summary rather than counting the task's rows. That
+// count is proportional to the task's size and this sits on hot paths - the
+// claim reconciler asks once per promoted item and the settle pass once per task
+// - so with linked comments enabled, which is the default, one bounded pass
+// turned into a scan of a task's whole file history up to reconcileBatchSize
+// times over.
+//
+// A missing summary falls back to the count. That is not merely defensive:
+// "no row" and "no unfinished files" must never be the same answer, because a
+// task with files but no summary would otherwise be declared complete.
 func (m *Manager) allItemsCompleted(jobID string) bool {
+	if total, completed, ok := m.itemCounts(jobID); ok {
+		return total == completed
+	}
 	var incomplete int
 	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status != 'completed'`, jobID).Scan(&incomplete); err != nil {
 		return false
@@ -2753,12 +2814,11 @@ func groupDisplayText(messages []*tg.Message) string {
 	return ""
 }
 
-func (m *Manager) items(jobID string) ([]Item, error) {
-	rows, err := m.db.Query(`SELECT id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error FROM download_items WHERE job_id = ? ORDER BY id`, jobID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// itemColumns is the one definition of a file record's projection, so the full
+// read and the paged read cannot drift apart.
+const itemColumns = `id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, final_path, started_at, finished_at, elapsed_ms, attempts, status, error`
+
+func scanItems(rows *databaseRows) ([]Item, error) {
 	items := make([]Item, 0)
 	for rows.Next() {
 		var item Item
@@ -2777,6 +2837,75 @@ func (m *Manager) items(jobID string) ([]Item, error) {
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+// items reads every file record of a task. It is for the transfer path, which
+// needs the whole pending set before it starts, and it is deliberately not used
+// to render anything: see ItemsPage.
+func (m *Manager) items(jobID string) ([]Item, error) {
+	rows, err := m.db.Query(`SELECT `+itemColumns+` FROM download_items WHERE job_id = ? ORDER BY id`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}
+
+// ItemsPage returns one bounded page of a task's file records, in id order, with
+// the cursor for the page after it. An empty cursor starts at the beginning.
+//
+// A task's file count has no bound - with linked comments and replies enabled,
+// which is the default, one channel post's task holds a row per media comment -
+// so returning all of them is not a read that any display path can afford, and
+// on the tens-of-millions target it is not one the process can either. This is a
+// keyset page on the primary key rather than an OFFSET page, so the cost of the
+// hundredth page equals the cost of the first.
+func (m *Manager) ItemsPage(jobID, cursor string, pageSize int) ([]Item, string, error) {
+	if pageSize < 1 {
+		pageSize = defaultItemPageSize
+	}
+	if pageSize > maxItemPageSize {
+		pageSize = maxItemPageSize
+	}
+	after, err := decodeItemCursor(cursor)
+	if err != nil {
+		return nil, "", err
+	}
+	// One extra row is how the caller learns there is a page after this one,
+	// without a second query or a count.
+	rows, err := m.db.Query(`SELECT `+itemColumns+` FROM download_items WHERE job_id = ? AND id > ? ORDER BY id LIMIT ?`, jobID, after, pageSize+1)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	items, err := scanItems(rows)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(items) <= pageSize {
+		return items, "", nil
+	}
+	items = items[:pageSize]
+	return items, encodeItemCursor(items[len(items)-1].ID), nil
+}
+
+func encodeItemCursor(id int64) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(id, 10)))
+}
+
+func decodeItemCursor(cursor string) (int64, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, errors.New("分页游标无效，请重新打开该任务")
+	}
+	id, err := strconv.ParseInt(string(data), 10, 64)
+	if err != nil || id < 0 {
+		return 0, errors.New("分页游标无效，请重新打开该任务")
+	}
+	return id, nil
 }
 func (m *Manager) sources(jobID string) ([]source, error) {
 	var dialogName string

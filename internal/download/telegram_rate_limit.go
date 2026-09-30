@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/vacks/tdl/internal/applog"
 )
 
 // Telegram metadata requests are deliberately kept separate from file byte
@@ -128,6 +130,20 @@ func minFloat(a, b float64) float64 {
 	return b
 }
 
+// rpcGate adapts this manager to the gate the Telegram layer installs on every
+// client it opens. The two halves have to travel together: Acquire is the
+// pacing, Report is where a server-mandated wait is observed, and a gate that
+// only paced would leave the account-wide cooldown empty.
+type rpcGate struct{ manager *Manager }
+
+func (g rpcGate) Acquire(ctx context.Context, accountID string) error {
+	return g.manager.awaitTelegramRPC(ctx, accountID)
+}
+
+func (g rpcGate) Report(accountID string, err error) {
+	g.manager.recordTelegramRPCError(accountID, err)
+}
+
 // telegramAccountBlocked reports whether Telegram has told us to wait for this
 // account. It reads the same in-memory state awaitTelegramRPC gates on, so the
 // scheduler can never admit a transfer that the metadata gate would refuse, and
@@ -162,8 +178,19 @@ func (m *Manager) recordTelegramRPCError(accountID string, err error) bool {
 		state.blockedUntil = until
 	}
 	m.rpcMu.Unlock()
-	if _, dbErr := m.db.Exec(`INSERT INTO telegram_rate_limits(account_id, blocked_until, reason, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET blocked_until = GREATEST(telegram_rate_limits.blocked_until, EXCLUDED.blocked_until), reason = EXCLUDED.reason, updated_at = EXCLUDED.updated_at`, accountID, until.Format(time.RFC3339Nano), err.Error(), time.Now().UTC().Format(time.RFC3339Nano)); dbErr != nil {
-		return true
+	// The longer of the two windows wins, and it has to be decided as a
+	// timestamptz rather than by GREATEST on the stored column. blocked_until is
+	// TEXT holding RFC3339Nano, whose trailing-zero trimming makes lexical order
+	// disagree with chronological order - the very thing the read at the top of
+	// this file casts around - so GREATEST picked whichever value merely looked
+	// larger as a string, and a longer server-mandated cooldown could be
+	// discarded in favour of a shorter one that happened to sort higher.
+	if _, dbErr := m.db.Exec(`INSERT INTO telegram_rate_limits(account_id, blocked_until, reason, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET blocked_until = CASE WHEN telegram_rate_limits.blocked_until::timestamptz >= EXCLUDED.blocked_until::timestamptz THEN telegram_rate_limits.blocked_until ELSE EXCLUDED.blocked_until END, reason = EXCLUDED.reason, updated_at = EXCLUDED.updated_at`, accountID, until.Format(time.RFC3339Nano), err.Error(), time.Now().UTC().Format(time.RFC3339Nano)); dbErr != nil {
+		// Reported instead of discarded. The in-memory window above is what the
+		// scheduler and the gate act on, so the caller's decision to requeue is
+		// still right - but the durable row is what carries the cooldown across a
+		// restart, and an operator has to be able to see when that did not happen.
+		applog.Error("download", "rate_limit_persist_failed", "account_id", accountID, "error", dbErr.Error())
 	}
 	return true
 }

@@ -691,6 +691,23 @@ func (s *Server) downloadControlAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, job)
 		return
 	}
+	if parts[1] == "items" {
+		// One bounded page of a task's file records. The task read above carries
+		// the first page and the cursor that continues it; a task whose file count
+		// is not bounded is never returned whole.
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+		items, nextCursor, err := s.downloads.ItemsPage(parts[0], r.URL.Query().Get("cursor"), pageSize)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "nextCursor": nextCursor})
+		return
+	}
 	if parts[1] == "delete" {
 		if r.Method != http.MethodDelete {
 			methodNotAllowed(w, http.MethodDelete)

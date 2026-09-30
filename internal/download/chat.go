@@ -236,6 +236,12 @@ func boolInt(value bool) int {
 	return 0
 }
 
+// ErrChatJobNotFound is the sibling of ErrJobNotFound for session tasks. The
+// same distinction matters: a card whose task is gone must be dropped, while one
+// the database could not answer for must be retried rather than quietly
+// forgotten.
+var ErrChatJobNotFound = errors.New("会话下载任务不存在")
+
 // GetChat returns one parent task and its transactionally maintained summary.
 // Individual media rows are deliberately not loaded here.
 func (m *Manager) GetChat(id string) (ChatJob, error) {
@@ -246,7 +252,7 @@ func (m *Manager) GetChat(id string) (ChatJob, error) {
  FROM chat_download_jobs c LEFT JOIN chat_download_stats s ON s.chat_job_id = c.id
 	WHERE c.id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogID, &job.DialogName, &job.AccountID, &job.StartMessageID, &job.UpperMessageID, &listen, &job.Status, &job.ScanState, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.Discovered, &job.Completed, &job.Failed, &job.EarliestMediaID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ChatJob{}, errors.New("会话下载任务不存在")
+		return ChatJob{}, ErrChatJobNotFound
 	}
 	if err != nil {
 		return ChatJob{}, err

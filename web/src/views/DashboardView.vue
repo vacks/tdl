@@ -6,10 +6,14 @@ import { projectVersion } from '@/buildInfo'
 
 type Point = { at: string; cpuPercent: number; memoryUsed: number; memoryTotal: number; receiveBps: number; transmitBps: number; diskUsed: number; diskTotal: number }
 type Dashboard = { telegram: { status: string }; database: { status: string; error?: string }; upstreamVersion: string; system: { current: Point; trend: Point[] } }
-const router = useRouter(); const dashboard = ref<Dashboard>(); const username = ref(''); let timer: number | undefined
+const router = useRouter(); const dashboard = ref<Dashboard>(); const username = ref(''); let timer: number | undefined; let disposed = false
 async function load() { try { dashboard.value = await api<Dashboard>('/api/dashboard') } catch (error) { if (error instanceof APIError && error.status === 401) { if (timer) window.clearInterval(timer); timer = undefined; await router.replace('/login') } } }
-onMounted(async () => { try { const session = await api<{ authenticated: boolean; username?: string }>('/api/auth/session'); if (!session.authenticated) return void router.replace('/login'); username.value = session.username || ''; await load(); timer = window.setInterval(() => void load(), 3000) } catch { await router.replace('/login') } })
-onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
+// Both the session probe and the first load are awaited, so the interval is
+// created one tick later at the earliest. Without the disposed check a page
+// left before they resolved started a three second poll that nothing could ever
+// stop: onBeforeUnmount runs synchronously, when `timer` is still undefined.
+onMounted(async () => { try { const session = await api<{ authenticated: boolean; username?: string }>('/api/auth/session'); if (disposed) return; if (!session.authenticated) return void router.replace('/login'); username.value = session.username || ''; await load(); if (disposed) return; timer = window.setInterval(() => void load(), 3000) } catch { if (!disposed) await router.replace('/login') } })
+onBeforeUnmount(() => { disposed = true; if (timer) window.clearInterval(timer) })
 async function logout() { if (timer) window.clearInterval(timer); timer = undefined; await api('/api/auth/logout', { method: 'POST' }); await router.replace('/login') }
 const current = computed(() => dashboard.value?.system.current)
 const trend = computed(() => dashboard.value?.system.trend || [])

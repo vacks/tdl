@@ -18,6 +18,12 @@ func TestNormalizeCommand(t *testing.T) {
 		"/tasks@TDLControlBot": "/tasks",
 		"https://t.me/a/1":     "https://t.me/a/1",
 		"/help arguments":      "/help arguments",
+		// The suffix belongs to the command token whatever follows it. Stripping
+		// it only for a single-token message made every command that takes an
+		// argument unrecognizable when Telegram appended the Bot name.
+		"/tasks@TDLControlBot 下载中": "/tasks 下载中",
+		"/saved@TDLControlBot all": "/saved all",
+		"/help  two   spaces":      "/help two spaces",
 	}
 	for input, want := range tests {
 		if got := normalizeCommand(input); got != want {

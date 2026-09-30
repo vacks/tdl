@@ -21,6 +21,10 @@ const loginAccountId = ref('')
 const password = ref('')
 const passwordLoading = ref(false)
 let timer: number | undefined
+// Set by onBeforeUnmount. The interval below is created after two awaited
+// requests, so a page left before they resolved started a poll nothing could
+// stop: onBeforeUnmount runs synchronously, when `timer` is still undefined.
+let disposed = false
 
 const loginAccount = computed(() => accounts.value.find((item) => item.id === loginAccountId.value))
 const needsPolling = computed(() => accounts.value.some((item) => ['starting', 'waiting_for_qr', 'waiting_for_2fa'].includes(item.state)))
@@ -51,7 +55,10 @@ async function selectAccount(id: string) {
 }
 
 async function submitPassword() {
-  if (!loginAccount.value) return
+  // The button's loading state disables the click, but Enter in the password
+  // field reaches this directly and is not disabled - so repeated presses sent
+  // the same password concurrently.
+  if (!loginAccount.value || passwordLoading.value) return
   passwordLoading.value = true
   try {
     await api(`/api/telegram/accounts/${loginAccount.value.id}/password`, { method: 'POST', body: JSON.stringify({ password: password.value }) })
@@ -100,11 +107,13 @@ async function logout() { await api('/api/auth/logout', { method: 'POST' }); awa
 
 onMounted(async () => {
   const session = await api<{ authenticated: boolean }>('/api/auth/session')
+  if (disposed) return
   if (!session.authenticated) return void router.replace('/login')
   await load()
+  if (disposed) return
   timer = window.setInterval(() => { if (needsPolling.value) void load() }, 2500)
 })
-onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
+onBeforeUnmount(() => { disposed = true; if (timer) window.clearInterval(timer) })
 </script>
 
 <template>

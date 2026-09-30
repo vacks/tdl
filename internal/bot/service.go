@@ -64,7 +64,7 @@ type Service struct {
 	// chat. The card is edited as the job advances instead of sending a new
 	// Bot message for every state transition.
 	lifecycle map[string]map[int64]messageRef
-	deleted   map[string]struct{}
+	deleted   map[string]time.Time
 	dirty     map[string]struct{}
 	// suppressedStatus consumes the state event emitted synchronously by a
 	// successful Bot action. The callback itself has already rendered that
@@ -170,7 +170,7 @@ const (
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1), dispatch: newUpdateDispatch(), commandSlots: make(chan struct{}, commandWorkers)}
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]time.Time{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1), dispatch: newUpdateDispatch(), commandSlots: make(chan struct{}, commandWorkers)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -187,8 +187,21 @@ func New(store *settings.Store, downloads *download.Manager, telegram *telegram.
 func (s *Service) watchDownloadEvents(events <-chan download.Event) {
 	for event := range events {
 		s.mu.Lock()
-		if expected, suppressed := s.suppressedStatus[event.JobID]; suppressed && event.Status == expected {
+		// Only a task status change can be the one an action already rendered.
+		// Item transitions carry statuses from the same vocabulary - pausing a
+		// multi-file task emits one 'paused' per file - and matching on the
+		// status alone let those consume a suppression that belonged to the task
+		// event, which then went on to produce the second, confusing edit the
+		// suppression exists to prevent.
+		if expected, suppressed := s.suppressedStatus[event.JobID]; suppressed && event.Kind == "job_status_changed" {
+			// The entry is spent either way. If the action landed on a different
+			// status than expected, the refresh still has to see it - and leaving
+			// the entry behind would let it swallow a later event that happens to
+			// carry the status it was waiting for.
 			delete(s.suppressedStatus, event.JobID)
+			if event.Status != expected {
+				s.dirty[event.JobID] = struct{}{}
+			}
 		} else {
 			s.dirty[event.JobID] = struct{}{}
 		}
@@ -227,7 +240,7 @@ func (s *Service) loop() {
 			} else {
 				s.offset = 0
 			}
-			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.liveRendered, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[string]string{}, map[int64]int{}, time.Time{}
+			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.liveRendered, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]time.Time{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[string]string{}, map[int64]int{}, time.Time{}
 			s.chatTracked = map[string]chatTrackedRef{}
 			s.listPages = map[string]listPageState{}
 			// A different Bot identity starts from its own offset. Workers still
@@ -256,18 +269,19 @@ func (s *Service) loop() {
 				if update.UpdateID < acknowledged {
 					continue
 				}
-				// All workers busy: leave the update unclaimed rather than queue
-				// behind them. Telegram redelivers everything at or above the
-				// stored offset, so offering it again later loses nothing.
-				select {
-				case s.commandSlots <- struct{}{}:
-				default:
-					continue
-				}
+				// The smallest id this batch returned is where the acknowledgement
+				// walk starts. Telegram only returns updates at or above the
+				// offset it was given, so nothing below this one exists, and on a
+				// fresh install the stored offset is 0 - an id no update carries.
+				// See updateDispatch.lowest.
+				s.dispatch.noteDelivered(update.UpdateID)
 				if !s.dispatch.claim(update.UpdateID) {
-					<-s.commandSlots
 					continue
 				}
+				// The worker permit is taken inside runCommand, after this
+				// conversation's lock, so a command that is waiting for a permit or
+				// backing off holds neither the permit nor a place in the queue
+				// behind a command that is not working.
 				go s.runCommand(cfg, update)
 			}
 			s.acknowledgeHandled(cfg.Token)
@@ -291,26 +305,76 @@ func (s *Service) loop() {
 // throughput.
 const commandWorkers = 4
 
+// maxCommandAttempts bounds the retries of one command. It is deliberately
+// finite: the failures it exists for (a connection error, a flood wait) are
+// transient, but the same shape of failure is also what a command that can never
+// succeed produces, and an unbounded retry of those keeps the update unfinished
+// forever - which stalls the acknowledgement cursor behind it and, once the
+// unconfirmed backlog fills, stops the Bot receiving anything.
+const maxCommandAttempts = 8
+
+// botCardItemLines bounds the file list a task card renders. Telegram refuses a
+// message longer than 4096 characters, and one line is roughly sixty, so this
+// leaves room for the header and footer while staying well inside that.
+const botCardItemLines = 20
+
 // runCommand handles one update, retrying in its own goroutine so a failure
 // cannot hold the poll loop. It keeps the durable-acknowledgement the loop had:
 // the update stays unfinished until it succeeds, and the stored offset cannot
 // pass an unfinished update, so a crash during the backoff still leaves the
 // command to be redelivered.
 func (s *Service) runCommand(cfg settings.Bot, update update) {
-	defer func() { <-s.commandSlots }()
 	lock := s.commandLock(update)
 	lock.Lock()
 	defer lock.Unlock()
-	for {
-		if s.handle(cfg, update) {
-			s.clearRetry(update.UpdateID)
-			s.dispatch.finish(update.UpdateID)
-			s.acknowledgeHandled(cfg.Token)
+	for attempt := 1; ; attempt++ {
+		// The permit covers one attempt's work, not the backoff between attempts.
+		// Holding it across the backoff - as this used to - meant a command
+		// waiting out a five minute retry kept one of the four permits for that
+		// whole time, while every later command of the same conversation took
+		// another one just to block on this conversation's lock.
+		if !s.acquireCommandSlot() {
+			return
+		}
+		done := s.handle(cfg, update)
+		<-s.commandSlots
+		if done {
+			s.finishCommand(cfg.Token, update.UpdateID)
+			return
+		}
+		if attempt >= maxCommandAttempts {
+			// The command is dropped, loudly, so the offset can move past it. The
+			// loop had no limit at all, and a link whose resolution exceeds the
+			// submit deadline fails identically every time: retrying it forever is
+			// not a retry. It also blocked the cursor, because nothing below an
+			// unfinished update can be confirmed, so the unconfirmed backlog grew
+			// until the server stopped returning new commands to anyone.
+			applog.Error("bot", "command_abandoned", "update_id", update.UpdateID, "attempts", attempt)
+			s.finishCommand(cfg.Token, update.UpdateID)
 			return
 		}
 		if !waitContext(s.ctx, s.retryDelay(update.UpdateID)) {
 			return
 		}
+	}
+}
+
+// finishCommand records a handled update and stores the offset its completion
+// unblocks.
+func (s *Service) finishCommand(token string, updateID int64) {
+	s.clearRetry(updateID)
+	s.dispatch.finish(updateID)
+	s.acknowledgeHandled(token)
+}
+
+// acquireCommandSlot takes one worker permit, waiting for a free one. It reports
+// false when the service is stopping.
+func (s *Service) acquireCommandSlot() bool {
+	select {
+	case s.commandSlots <- struct{}{}:
+		return true
+	case <-s.ctx.Done():
+		return false
 	}
 }
 
@@ -335,9 +399,20 @@ func (s *Service) acknowledgeHandled(token string) {
 	s.mu.Lock()
 	current := s.offset
 	s.mu.Unlock()
-	if next := s.dispatch.acknowledge(current); next > current {
-		s.advanceOffset(token, next)
+	next := s.dispatch.acknowledgeable(current)
+	if next <= current {
+		return
 	}
+	// The durable write comes first. Deleting the finished records before it - as
+	// this used to - meant that a write which never succeeded (a full disk, a
+	// read-only data directory) left the stored offset where it was while the
+	// only record that those updates had already run was gone: the next poll
+	// redelivered them, claim succeeded because nothing remembered them, and the
+	// command ran a second time.
+	if !s.advanceOffset(token, next) {
+		return
+	}
+	s.dispatch.committed(next)
 }
 
 // refreshLoop is intentionally independent from command long-polling. A
@@ -670,7 +745,12 @@ func (s *Service) clearRetry(updateID int64) {
 }
 
 func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
+	// Every path out of this handler answers the query. Telegram leaves the
+	// button showing its loading state until answerCallbackQuery arrives, so an
+	// unrecognized or malformed payload that returned silently left the person
+	// who tapped it watching a spinner until the client gave up.
 	if query.Message == nil {
+		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	if strings.HasPrefix(query.Data, "c:") {
@@ -684,6 +764,7 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	if strings.HasPrefix(query.Data, "l:") {
 		direction := strings.TrimPrefix(query.Data, "l:")
 		if direction != "prev" && direction != "next" && direction != "refresh" && direction != "back" {
+			s.answer(cfg.Token, query.ID, "")
 			return
 		}
 		s.untrackMessage(query.Message.Chat.ID, query.Message.MessageID)
@@ -697,6 +778,7 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	if strings.HasPrefix(query.Data, "v:") {
 		id := strings.TrimPrefix(query.Data, "v:")
 		if id == "" || strings.Contains(id, ":") {
+			s.answer(cfg.Token, query.ID, "")
 			return
 		}
 		s.editTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID))
@@ -705,6 +787,7 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	}
 	parts := strings.Split(query.Data, ":")
 	if len(parts) != 3 || parts[0] != "t" {
+		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	id, action := parts[1], parts[2]
@@ -740,6 +823,17 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, deletedTaskText(query.Message.Text), deletedTaskKeyboard(s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID)))
 		return
 	}
+	// Registered before the action runs, not after it. The action emits its
+	// status event synchronously from inside the download manager, so a
+	// suppression written afterwards - as this used to do, from
+	// renderActionResult, across an answerCallbackQuery round trip - raced the
+	// watcher goroutine and usually lost, leaving an entry nothing would ever
+	// consume and letting the generic refresh edit the card a second time.
+	if expected, known := actionResultStatus[action]; known {
+		s.mu.Lock()
+		s.suppressedStatus[id] = expected
+		s.mu.Unlock()
+	}
 	var err error
 	switch action {
 	case "pause":
@@ -754,6 +848,8 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 		err = fmt.Errorf("未知操作")
 	}
 	if err != nil {
+		// The action never ran, so no event is coming to consume the entry.
+		s.forgetSuppressed(id)
 		s.answer(cfg.Token, query.ID, err.Error())
 		return
 	}
@@ -761,9 +857,29 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	s.renderActionResult(cfg, *query.Message, id, s.hasListPage("task", query.Message.Chat.ID, query.Message.MessageID))
 }
 
-// renderActionResult is the sole post-action renderer. A callback already has
-// the final durable status, so consuming its matching domain event prevents a
-// second, visually confusing edit from the generic lifecycle refresh.
+// actionResultStatus is the durable status each card action drives its task to.
+// The download manager's control methods are the single definition of these
+// transitions, and knowing the outcome in advance is what lets the event they
+// emit be suppressed before it is emitted.
+var actionResultStatus = map[string]string{
+	"pause":  "paused",
+	"resume": "queued",
+	"retry":  "queued",
+	"cancel": "cancelled",
+}
+
+// forgetSuppressed drops a suppression whose action never produced the event it
+// was waiting for.
+func (s *Service) forgetSuppressed(jobID string) {
+	s.mu.Lock()
+	delete(s.suppressedStatus, jobID)
+	s.mu.Unlock()
+}
+
+// renderActionResult is the sole post-action renderer. It runs after the action
+// has already emitted the status event that the pre-registered suppression
+// consumed, so it only has to record the status it rendered and clear the
+// pending flag that event would otherwise have set.
 func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID string, fromList bool) {
 	job, err := s.downloads.Get(jobID)
 	if err != nil {
@@ -773,7 +889,6 @@ func (s *Service) renderActionResult(cfg settings.Bot, message message, jobID st
 	s.mu.Lock()
 	s.known[job.ID] = job.Status
 	delete(s.dirty, job.ID)
-	s.suppressedStatus[job.ID] = job.Status
 	s.mu.Unlock()
 	if s.isLifecycleMessage(job.ID, message.Chat.ID, message.MessageID) {
 		s.updateLifecycle(cfg, job)
@@ -1209,16 +1324,20 @@ func (s *Service) confirmEventClear(cfg settings.Bot, query callbackQuery) {
 }
 
 func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
+	// Same rule as handleCallback: the query is answered on every path out.
 	if query.Message == nil {
+		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	parts := strings.Split(query.Data, ":")
 	if len(parts) < 3 {
+		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	if parts[1] == "l" && len(parts) == 3 {
 		direction := parts[2]
 		if direction != "prev" && direction != "next" && direction != "refresh" && direction != "back" {
+			s.answer(cfg.Token, query.ID, "")
 			return
 		}
 		s.untrackChatMessage(query.Message.Chat.ID, query.Message.MessageID)
@@ -1235,6 +1354,7 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 		return
 	}
 	if parts[1] != "t" || len(parts) != 4 {
+		s.answer(cfg.Token, query.ID, "")
 		return
 	}
 	id, action := parts[2], parts[3]
@@ -1396,7 +1516,26 @@ func (s *Service) refresh(cfg settings.Bot) {
 	for _, id := range ids {
 		job, err := s.downloads.Get(id)
 		if err != nil {
+			// A task that is genuinely gone settles here. A read the database
+			// could not answer stays pending, because these notifications are
+			// mostly one-shot - 'completed' is the last status a task ever has -
+			// and dropping the event on a moment's database trouble left the card
+			// showing the state before it for good.
+			if errors.Is(err, download.ErrJobNotFound) {
+				s.consumeDirty(id)
+				// The row is gone for good, so a remembered deletion of it has
+				// nothing left to suppress. Forgetting it here is what keeps the
+				// set from growing with every task the user ever deleted.
+				s.unmarkDeleted(id)
+			}
 			continue
+		}
+		s.consumeDirty(id)
+		if s.isDeleted(job.ID) && job.Status != "deleted" {
+			// A deleted task that has a live status again was reactivated by a
+			// later submission. It is ordinary work once more, and a deletion
+			// remembered from its previous life would suppress its card forever.
+			s.unmarkDeleted(job.ID)
 		}
 		s.mu.Lock()
 		previous, exists := s.known[job.ID]
@@ -1428,7 +1567,11 @@ func (s *Service) refresh(cfg settings.Bot) {
 	for key, ref := range tracked {
 		job, err := s.downloads.Get(ref.JobID)
 		if err != nil {
-			s.untrack(key)
+			// Untracking is permanent: it is how a card stops being refreshed. A
+			// read the database could not answer must not end it.
+			if errors.Is(err, download.ErrJobNotFound) {
+				s.untrack(key)
+			}
 			continue
 		}
 		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, taskText(job, s.downloads.LiveProgress()), taskKeyboard(job, s.hasListPage("task", ref.ChatID, ref.MessageID))) {
@@ -1444,7 +1587,9 @@ func (s *Service) refresh(cfg settings.Bot) {
 	for key, ref := range chatTracked {
 		job, err := s.downloads.GetChat(ref.JobID)
 		if err != nil {
-			s.untrackChat(key)
+			if errors.Is(err, download.ErrChatJobNotFound) {
+				s.untrackChat(key)
+			}
 			continue
 		}
 		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, chatTaskText(job), chatTaskKeyboard(job, s.hasListPage("chat", ref.ChatID, ref.MessageID))) {
@@ -1457,6 +1602,11 @@ func (s *Service) refresh(cfg settings.Bot) {
 	}
 }
 
+// refreshIDs returns the tasks with a pending notification and the viewed cards,
+// without retiring either. An id leaves the pending set in consumeDirty, which
+// the caller reaches only after the task has actually been read: clearing the
+// set here made the read that follows the last chance to observe the change, and
+// a read that failed threw the notification away.
 func (s *Service) refreshIDs() ([]string, map[string]trackedRef) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1464,12 +1614,18 @@ func (s *Service) refreshIDs() ([]string, map[string]trackedRef) {
 	for id := range s.dirty {
 		ids = append(ids, id)
 	}
-	s.dirty = make(map[string]struct{})
 	tracked := make(map[string]trackedRef, len(s.tracked))
 	for key, ref := range s.tracked {
 		tracked[key] = ref
 	}
 	return ids, tracked
+}
+
+// consumeDirty retires one task from the pending-notification set.
+func (s *Service) consumeDirty(id string) {
+	s.mu.Lock()
+	delete(s.dirty, id)
+	s.mu.Unlock()
 }
 
 func (s *Service) track(id string, ref messageRef) {
@@ -1632,11 +1788,16 @@ func (s *Service) rememberLifecycle(jobID string, ref messageRef) {
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.lifecycle[jobID] == nil {
 		s.lifecycle[jobID] = make(map[int64]messageRef)
 	}
 	s.lifecycle[jobID][ref.ChatID] = ref
+	s.mu.Unlock()
+	// The database write happens outside the lock. s.mu is the one lock every
+	// other part of the Bot takes - the event watcher, the live refresh, all the
+	// trackers - so a synchronous upsert held inside it turned a moment of
+	// database trouble into a stall of the whole notification path. Its
+	// counterpart forgetLifecycleMessage has always written after unlocking.
 	if err := s.downloads.SaveBotLifecycleMessage(jobID, download.BotMessageRef{ChatID: ref.ChatID, MessageID: ref.MessageID, Text: ref.Text, TokenHash: ref.TokenHash}); err != nil {
 		applog.Error("bot", "lifecycle_message_save_failed", "job_id", jobID, "chat_id", ref.ChatID, "error", err.Error())
 	}
@@ -1688,9 +1849,18 @@ func (s *Service) markLifecycleDeleted(cfg settings.Bot, refs []messageRef, skip
 	}
 }
 
+// deletedRecordTTL bounds how long a deleted task is remembered.
+//
+// The record exists to stop a refresh that was already in flight when the user
+// confirmed the deletion from re-rendering the card a moment later - a window of
+// seconds. Keeping it forever grew the set with every task ever deleted, and,
+// because a deleted task's row survives as 'deleted' rather than being removed,
+// it also kept a task silenced after a later submission reactivated it.
+const deletedRecordTTL = 5 * time.Minute
+
 func (s *Service) markDeleted(jobID string) {
 	s.mu.Lock()
-	s.deleted[jobID] = struct{}{}
+	s.deleted[jobID] = time.Now()
 	s.mu.Unlock()
 }
 
@@ -1703,8 +1873,15 @@ func (s *Service) unmarkDeleted(jobID string) {
 func (s *Service) isDeleted(jobID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, exists := s.deleted[jobID]
-	return exists
+	at, exists := s.deleted[jobID]
+	if !exists {
+		return false
+	}
+	if time.Since(at) > deletedRecordTTL {
+		delete(s.deleted, jobID)
+		return false
+	}
+	return true
 }
 
 func (s *Service) sendLifecycle(cfg settings.Bot, job download.Job) {
@@ -1884,7 +2061,16 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 		byID[fmt.Sprintf("%s:%d", p.DialogKey, p.MessageID)] = p
 	}
 	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), fmt.Sprintf("<b>进度：</b>%d/%d 文件", job.CompletedItems, job.TotalItems)}
-	for _, item := range job.Items {
+	// The card lists a bounded prefix of the files. A task can hold one row per
+	// media comment, and Telegram rejects a message longer than 4096 characters,
+	// so rendering every one of them produced a card that could not be sent at
+	// all - and the counts above already answer "how much is left", which is what
+	// the list is for.
+	items := job.Items
+	if len(items) > botCardItemLines {
+		items = items[:botCardItemLines]
+	}
+	for _, item := range items {
 		p := byID[fmt.Sprintf("%s:%d", item.DialogKey, item.MessageID)]
 		percent := "—"
 		speed := ""
@@ -1901,6 +2087,9 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 			origin = " · 评论/回复"
 		}
 		lines = append(lines, fmt.Sprintf("%s %s  %s%s%s", statusIcon(item.Status), html.EscapeString(short(item.OriginalName, 26)), percent, speed, origin))
+	}
+	if len(job.Items) > len(items) {
+		lines = append(lines, fmt.Sprintf("<i>另有 %d 个文件未在此列出，可在管理台查看完整列表。</i>", len(job.Items)-len(items)))
 	}
 	lines = append(lines,
 		"<b>对话：</b>"+html.EscapeString(short(job.DialogName, 36)),
@@ -2182,7 +2371,7 @@ func (s *Service) callWithTimeout(token, method string, body any, out any, timeo
 		}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("Bot API %s returned HTTP %d", method, resp.StatusCode)
+		return &botAPIError{method: method, status: resp.StatusCode}
 	}
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -2295,14 +2484,18 @@ func (s *Service) httpClient() *http.Client {
 }
 
 func normalizeCommand(text string) string {
-	parts := strings.Fields(text)
-	if len(parts) != 1 || !strings.HasPrefix(parts[0], "/") {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
 		return text
 	}
-	if at := strings.IndexByte(parts[0], '@'); at > 1 {
-		return parts[0][:at]
+	// The @BotName suffix belongs to the command token whatever follows it.
+	// Stripping it only for a single-token message meant every command that takes
+	// an argument - "/tasks@MyBot 下载中", "/chats@MyBot <链接>",
+	// "/saved@MyBot all" - was rejected as an unknown command.
+	if at := strings.IndexByte(fields[0], '@'); at > 1 {
+		fields[0] = fields[0][:at]
 	}
-	return parts[0]
+	return strings.Join(fields, " ")
 }
 
 func (s *Service) editLive(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
@@ -2372,9 +2565,17 @@ func (s *Service) send(token string, chatID int64, text string, keyboard [][]but
 	}
 	err := s.call(token, "sendMessage", payload, &result)
 	if err != nil {
+		// Every send is logged, including the ones whose result the caller
+		// ignores. Without this a revoked token or a user who blocked the Bot made
+		// every command fail silently: the caller discarded the error and
+		// callWithTimeout, which is where the transport error surfaces, does not
+		// log. The edit and command-registration paths have always logged; this
+		// one did not.
+		applog.Error("bot", "message_send_failed", "chat_id", chatID, "error", redactBotError(token, err.Error()))
 		return 0, err
 	}
 	if !result.OK {
+		applog.Error("bot", "message_send_rejected", "chat_id", chatID, "error", redactBotError(token, result.Description))
 		return 0, fmt.Errorf("%s", result.Description)
 	}
 	return result.Result.MessageID, nil
@@ -2387,13 +2588,22 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 	// boolean. Keep the result opaque: only the API's OK/description fields are
 	// relevant here and decoding it as bool makes every successful edit fail.
 	var result apiResponse[json.RawMessage]
-	payload := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true}
-	if keyboard != nil {
-		payload["reply_markup"] = map[string]any{"inline_keyboard": keyboard}
+	// The keyboard travels in the same request as the text, including when the
+	// card has none: an empty inline keyboard is how Telegram is told to remove
+	// the existing one. Sending it as a second editMessageReplyMarkup call - as
+	// this used to - doubled the outbound cost of every keyboardless render
+	// against the same budget the progress refreshes and command replies share.
+	markup := keyboard
+	if markup == nil {
+		markup = [][]button{}
 	}
+	payload := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true, "reply_markup": map[string]any{"inline_keyboard": markup}}
 	if err := s.call(token, "editMessageText", payload, &result); err != nil {
 		applog.Error("bot", "message_edit_failed", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, err.Error()))
-		return false, false
+		// A chat that can never be written to again is reported as missing so its
+		// card reference is dropped instead of being retried on every later status
+		// change.
+		return unreachableTarget(err), false
 	}
 	if !result.OK {
 		if isMissingMessage(result.Description) {
@@ -2405,31 +2615,56 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 		applog.Error("bot", "message_edit_rejected", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, result.Description))
 		return false, false
 	}
-	if keyboard == nil {
-		s.clearKeyboard(token, chatID, messageID)
-	}
 	return false, true
+}
+
+// botAPIError is an HTTP-level Bot API failure. It carries the status code
+// because a caller has to tell a conversation that can no longer be written to
+// from one that is merely having a bad moment, and the response body - which
+// holds Telegram's own wording - is not read on this path.
+type botAPIError struct {
+	method string
+	status int
+}
+
+func (e *botAPIError) Error() string {
+	return fmt.Sprintf("Bot API %s returned HTTP %d", e.method, e.status)
+}
+
+// unreachableTarget reports whether an edit failed because this chat or message
+// can never be written to again: the user blocked the Bot, the Bot was removed
+// from the group, the account was deleted, or the id is unknown. Telegram
+// answers all of those with 403.
+//
+// Treating them as retryable is what made a blocked user expensive forever: the
+// card reference survived, so every later status change of that task sent
+// another editMessageText that could not succeed, against the same outbound
+// budget the progress refreshes and command replies draw on.
+func unreachableTarget(err error) bool {
+	var apiErr *botAPIError
+	return errors.As(err, &apiErr) && apiErr.status == http.StatusForbidden
 }
 
 func isMissingMessage(description string) bool {
 	v := strings.ToLower(description)
-	return strings.Contains(v, "message to edit not found") || strings.Contains(v, "message_id_invalid")
+	for _, permanent := range []string{
+		"message to edit not found",
+		"message_id_invalid",
+		// The chat itself is gone, not just the card in it. Same conclusion:
+		// nothing can be rendered here again.
+		"chat not found",
+		"bot was blocked by the user",
+		"bot was kicked",
+		"user is deactivated",
+		"peer_id_invalid",
+	} {
+		if strings.Contains(v, permanent) {
+			return true
+		}
+	}
+	return false
 }
 
-func (s *Service) clearKeyboard(token string, chatID, messageID int64) {
-	var result apiResponse[json.RawMessage]
-	payload := map[string]any{
-		"chat_id": chatID, "message_id": messageID,
-		"reply_markup": map[string]any{"inline_keyboard": [][]button{}},
-	}
-	if err := s.call(token, "editMessageReplyMarkup", payload, &result); err != nil {
-		applog.Error("bot", "keyboard_clear_failed", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, err.Error()))
-		return
-	}
-	if !result.OK {
-		applog.Error("bot", "keyboard_clear_rejected", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, result.Description))
-	}
-}
 func (s *Service) answer(token, id, text string) {
 	var result apiResponse[bool]
 	_ = s.call(token, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": short(text, 180)}, &result)

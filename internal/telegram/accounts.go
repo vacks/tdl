@@ -125,19 +125,33 @@ type Manager struct {
 	// than set once at construction because the two managers are built in
 	// sequence, not together.
 	rpcGateMu sync.RWMutex
-	rpcGate   func(ctx context.Context, accountID string) error
+	rpcGate   RPCGate
+}
+
+// RPCGate is the account-wide metadata gate.
+//
+// Acquire paces one request. Report is handed whatever that request returned,
+// and it is the only place a server-mandated wait can be observed: the
+// flood-wait middleware the upstream client installs ahead of this one sleeps
+// off a FLOOD_WAIT and retries inside the invoker, so the error never reaches
+// the caller that would otherwise record it. Reporting from here is what makes
+// the account-wide cooldown real for metadata requests rather than only for the
+// byte transfers, whose invoker has no such middleware.
+type RPCGate interface {
+	Acquire(ctx context.Context, accountID string) error
+	Report(accountID string, err error)
 }
 
 // SetRPCGate installs the account-wide request gate. A nil gate disables
 // pacing, which is what tests and any future account type that does not share
 // the download service's budget want.
-func (m *Manager) SetRPCGate(gate func(ctx context.Context, accountID string) error) {
+func (m *Manager) SetRPCGate(gate RPCGate) {
 	m.rpcGateMu.Lock()
 	defer m.rpcGateMu.Unlock()
 	m.rpcGate = gate
 }
 
-func (m *Manager) currentRPCGate() func(ctx context.Context, accountID string) error {
+func (m *Manager) currentRPCGate() RPCGate {
 	m.rpcGateMu.RLock()
 	defer m.rpcGateMu.RUnlock()
 	return m.rpcGate
@@ -195,10 +209,14 @@ func (m *Manager) rpcGateMiddleware(accountID string) gotd.Middleware {
 			if gate == nil || !pacedRequest(input) {
 				return next.Invoke(ctx, input, output)
 			}
-			if err := gate(ctx, accountID); err != nil {
+			if err := gate.Acquire(ctx, accountID); err != nil {
 				return err
 			}
-			return next.Invoke(ctx, input, output)
+			err := next.Invoke(ctx, input, output)
+			// Reported before it is returned, because the middleware outside this
+			// one consumes a FLOOD_WAIT rather than passing it on.
+			gate.Report(accountID, err)
+			return err
 		}
 	})
 }
@@ -250,16 +268,24 @@ func (m *Manager) List() ([]Account, string) {
 // creation, which is deduplicated by the media identity, this had no guard at
 // all.
 func (m *Manager) StartQR() (Account, error) {
-	if existing, ok := m.pendingLogin(); ok {
-		return existing, nil
-	}
 	id, err := randomID()
 	if err != nil {
 		return Account{}, err
 	}
-	account := Account{ID: id, State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.mu.Lock()
+	// The check and the append share one acquisition of the write lock. Reading
+	// for a pending login under the read lock and appending afterwards left
+	// exactly the window the guard exists to close: two concurrent requests - a
+	// double click, a retried request, the renew flow - both saw none pending and
+	// both appended an account and started an MTProto login, which is the
+	// duplicate pair the comment above describes as fixed.
+	if existing, ok := m.pendingLoginLocked(); ok {
+		m.mu.Unlock()
+		cancel()
+		return existing, nil
+	}
+	account := Account{ID: id, State: "starting", CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	m.accounts = append(m.accounts, account)
 	m.jobs[id] = &loginJob{cancel: cancel, password: make(chan string, 1)}
 	err = m.saveLocked()
@@ -277,12 +303,11 @@ func (m *Manager) StartQR() (Account, error) {
 	return account, nil
 }
 
-// pendingLogin reports a login that has not reached a verdict yet. Those are
-// the states a second request would duplicate: 'starting' before the code is
-// issued, and 'waiting_for_qr' while it waits to be scanned or for a password.
-func (m *Manager) pendingLogin() (Account, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// pendingLoginLocked reports a login that has not reached a verdict yet, and
+// must be called with m.mu held. Those are the states a second request would
+// duplicate: 'starting' before the code is issued, and 'waiting_for_qr' while it
+// waits to be scanned or for a password.
+func (m *Manager) pendingLoginLocked() (Account, bool) {
 	for _, account := range m.accounts {
 		switch account.State {
 		case "starting", "waiting_for_qr":
@@ -371,6 +396,31 @@ func (m *Manager) Delete(id string) error {
 	delete(m.stores, id)
 	delete(m.operations, id)
 	m.mu.Unlock()
+	// The update connection belongs to the account, not to whatever subscribed
+	// to it. Removing the account has to close it, and close it before the files
+	// come off disk: the hub holds its own MTProto client and its own
+	// accountStore, and that store writes the session and state files back. A hub
+	// left running recreated the material this method had just removed, and kept
+	// an authenticated connection open for an account that no longer exists.
+	//
+	// The wait is bounded because the caller is an HTTP request: the hub normally
+	// exits as soon as its context is cancelled, and a timeout only means the
+	// files may be rewritten once more, which the cleanup error below still
+	// reports.
+	m.updatesMu.Lock()
+	hub := m.updates[id]
+	if hub != nil {
+		delete(m.updates, id)
+	}
+	m.updatesMu.Unlock()
+	if hub != nil {
+		hub.cancel()
+		select {
+		case <-hub.done:
+		case <-time.After(2 * time.Second):
+			applog.Error("telegram", "update_connection_stop_timeout", "account_id", id)
+		}
+	}
 	// The account metadata is now durably removed. Surface a private-file cleanup
 	// failure to the caller so it can be handled instead of silently leaving an
 	// orphaned Telegram session on disk.
@@ -457,6 +507,12 @@ func (m *Manager) normalizeSelfPeer(accountID string, input tg.InputPeerClass) t
 	}
 	return input
 }
+
+// savedDialogName is the display name of a Saved Messages dialog. It is one
+// definition because both the message and the reaction path have to attribute
+// the same dialog, and a second spelling would put their downloads in different
+// directories.
+const savedDialogName = "收藏消息"
 
 func (m *Manager) normalizeRawSelfPeer(accountID string, raw tg.PeerClass) tg.InputPeerClass {
 	user, ok := raw.(*tg.PeerUser)
@@ -630,7 +686,7 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 			// Telegram omits entities, normalize that raw identity as well; using
 			// user:<id> here would never match the durable self:<account> key.
 			if input := m.normalizeRawSelfPeer(accountID, message.PeerID); input != nil {
-				m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: "self:" + accountID, DialogID: 0, DialogName: "收藏消息", MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+				m.dispatchMessage(accountID, NewMessageEvent{AccountID: accountID, DialogKey: "self:" + accountID, DialogID: 0, DialogName: savedDialogName, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
 				return
 			}
 			kind, id := peerIdentity(message.PeerID)
@@ -670,7 +726,12 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 		return nil
 	})
 
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, false)
+	// The gate is installed here too. Resolving a peer for an incoming reaction
+	// or message issues the same users.getUsers / channels.getChannels /
+	// contacts.resolveUsername requests the download path does, against the same
+	// account and the same server-side window, so leaving them unpaced meant the
+	// listener and the transfers were not sharing one budget at all.
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, false, m.rpcGateMiddleware(accountID))
 	if err != nil {
 		return fmt.Errorf("创建 Telegram 更新监听连接: %w", err)
 	}
@@ -712,8 +773,12 @@ func (m *Manager) dispatchReaction(accountID string, event ReactionEvent) {
 		}
 	}
 	m.updatesMu.Unlock()
+	// The manager's own context travels with the event. A fresh background one
+	// discarded cancellation and deadlines, which made the consumers' ctx.Err()
+	// guards unreachable and left nothing able to interrupt a callback already
+	// running when the account was stopped.
 	for _, callback := range callbacks {
-		callback(context.Background(), event)
+		callback(m.ctx, event)
 	}
 }
 
@@ -728,7 +793,7 @@ func (m *Manager) dispatchMessage(accountID string, event NewMessageEvent) {
 	}
 	m.updatesMu.Unlock()
 	for _, callback := range callbacks {
-		callback(context.Background(), event)
+		callback(m.ctx, event)
 	}
 }
 
@@ -770,7 +835,7 @@ func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateT
 		return
 	}
 	applog.Info("reaction", "own_reaction_received", "account_id", accountID, "update_type", updateType, "dialog_id", event.DialogID, "message_id", event.MessageID, "emojis", emojis, "summary", reactions.Min)
-	dispatchReactionEvent(onEvent, event)
+	dispatchReactionEvent(ctx, onEvent, event)
 }
 
 // reactionEvent turns a Telegram peer into a direct-download event. A public
@@ -779,6 +844,16 @@ func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateT
 func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities tg.Entities, rawPeer tg.PeerClass, messageID int, emojis []string, client *gotd.Client) (ReactionEvent, bool) {
 	inputPeer, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(rawPeer)
 	if err != nil {
+		// Telegram omits entities from some updates while still naming the dialog,
+		// and Saved Messages are the case that matters: their peer is the current
+		// user. The new-message path has always normalized that identity rather
+		// than give up on it; reactions did not, so a reaction on a Saved Message
+		// was logged as an unresolvable peer and dropped - even though
+		// reactionFallbackURL has a dedicated tg://reaction/self/... form for it,
+		// which nothing could reach.
+		if self := m.normalizeRawSelfPeer(accountID, rawPeer); self != nil {
+			return ReactionEvent{AccountID: accountID, DialogName: savedDialogName, MessageID: messageID, SourceURL: reactionFallbackURL(self, accountID, messageID), InputPeer: self, Emojis: emojis}, true
+		}
 		peerType, peerID := peerIdentity(rawPeer)
 		applog.Error("reaction", "peer_extract_failed", "account_id", accountID, "peer_type", peerType, "dialog_id", peerID, "message_id", messageID, "error", err.Error())
 		return ReactionEvent{}, false
@@ -807,11 +882,13 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 	return ReactionEvent{AccountID: accountID, DialogID: dialogID, DialogName: dialogName, MessageID: messageID, SourceURL: sourceURL, InputPeer: inputPeer, Emojis: emojis}, true
 }
 
-func dispatchReactionEvent(onEvent func(context.Context, ReactionEvent), event ReactionEvent) {
+func dispatchReactionEvent(ctx context.Context, onEvent func(context.Context, ReactionEvent), event ReactionEvent) {
 	// The consumer owns bounded buffering. Do not create one goroutine for each
 	// update: a busy group plus a slow database write would otherwise grow memory
 	// without limit.
-	onEvent(context.Background(), event)
+	//
+	// The caller's context travels with the event; see dispatchReaction.
+	onEvent(ctx, event)
 }
 
 // logReactionEditUpdate emits a privacy-safe diagnostic only when an edited
@@ -859,7 +936,7 @@ func inputPeerID(input tg.InputPeerClass) int64 {
 func inputPeerDisplayName(input tg.InputPeerClass, entities tg.Entities) string {
 	switch peer := input.(type) {
 	case *tg.InputPeerSelf:
-		return "收藏消息"
+		return savedDialogName
 	case *tg.InputPeerUser:
 		if user, ok := entities.Users[peer.UserID]; ok {
 			return visibleUserName(user)
@@ -1142,7 +1219,7 @@ func (m *Manager) markExpired(id string) {
 func (m *Manager) runQR(ctx context.Context, id string) {
 	store := m.accountStore(id)
 	dispatcher := tg.NewUpdateDispatcher()
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true)
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true, m.rpcGateMiddleware(id))
 	if err != nil {
 		m.setError(id, fmt.Errorf("创建 Telegram 客户端失败: %w", err))
 		return

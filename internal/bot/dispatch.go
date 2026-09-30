@@ -19,10 +19,37 @@ type updateDispatch struct {
 	mu       sync.Mutex
 	running  map[int64]struct{}
 	finished map[int64]struct{}
+	// lowest is the smallest update id a getUpdates batch has returned since the
+	// stored offset last moved, or 0 when no batch has been seen since.
+	//
+	// It is the walk's starting point, and it has to come from the batch rather
+	// than from the stored offset. Telegram only returns updates at or above the
+	// offset it was given, so an id below the smallest one actually delivered
+	// does not exist and can never be finished - walking from it can only ever
+	// stop on the same missing id. A fresh install stores offset 0, which no
+	// update ever carries (update identifiers start from a positive number), so
+	// without this seed the walk never took its first step and the cursor stayed
+	// at 0 for the life of the process: nothing was ever confirmed, and the
+	// unconfirmed backlog the server keeps redelivering grew without bound.
+	lowest int64
 }
 
 func newUpdateDispatch() *updateDispatch {
 	return &updateDispatch{running: map[int64]struct{}{}, finished: map[int64]struct{}{}}
+}
+
+// noteDelivered seeds the acknowledgement walk with an id the server confirmed
+// exists. Only ids at or above the stored offset are meaningful; a lower one
+// cannot advance anything and is ignored.
+func (d *updateDispatch) noteDelivered(id int64) {
+	if id <= 0 {
+		return
+	}
+	d.mu.Lock()
+	if d.lowest == 0 || id < d.lowest {
+		d.lowest = id
+	}
+	d.mu.Unlock()
 }
 
 // claim reports whether this update should be handed to a worker now. An update
@@ -58,20 +85,59 @@ func (d *updateDispatch) finish(id int64) {
 	d.mu.Unlock()
 }
 
-// acknowledge returns the offset to store, given the current one. Telegram's
-// offset is one past the last confirmed update, so this walks forward over every
-// consecutive finished update and stops at the first gap: an update that is
-// still running, or one that failed and is being retried, holds the offset until
-// it completes.
-func (d *updateDispatch) acknowledge(after int64) int64 {
+// acknowledgeable returns the offset that may be stored now, given the current
+// one. Telegram's offset is one past the last confirmed update, so this walks
+// forward over every consecutive finished update and stops at the first gap: an
+// update that is still running, or one that failed and is being retried, holds
+// the offset until it completes.
+//
+// It changes nothing. The finished records are pruned by committed, and only
+// after the returned offset has been written durably - see that method for why
+// the order matters. Returning after unchanged means "nothing new can be
+// confirmed", which is also what the caller compares against, so a walk that
+// started at the seed rather than at the stored offset does not by itself move
+// the cursor past an update that has not been handled.
+func (d *updateDispatch) acknowledgeable(after int64) int64 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	start := after
+	if d.lowest > start {
+		start = d.lowest
+	}
+	walked := start
 	for {
-		if _, ok := d.finished[after]; !ok {
-			return after
+		if _, ok := d.finished[walked]; !ok {
+			break
 		}
-		delete(d.finished, after)
-		after++
+		walked++
+	}
+	if walked == start {
+		return after
+	}
+	return walked
+}
+
+// committed forgets the finished records the newly stored offset confirms. It
+// runs only after the offset has been written to disk.
+//
+// Doing this inside the walk was a correctness bug in the other direction: the
+// records were deleted before the write was attempted, so a write that failed
+// (a full disk, a read-only directory) left the stored offset behind while the
+// only record that those updates had already run was gone. The next poll
+// redelivered them, claim succeeded, and the command ran a second time - the
+// exact duplicate the finished set exists to prevent.
+func (d *updateDispatch) committed(next int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.lowest != 0 && d.lowest < next {
+		// The seed is consumed: the next batch establishes a new one. Keeping a
+		// stale, now-unreachable id would only pin the walk to it.
+		d.lowest = 0
+	}
+	for id := range d.finished {
+		if id < next {
+			delete(d.finished, id)
+		}
 	}
 }
 

@@ -118,31 +118,39 @@ var postgresIndexStatements = []string{
 	//
 	// Serves every per task lookup: item lists, completion counts, the
 	// per-task claim scan and the "all items completed" settle check.
-	`CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
 	// The scheduler's ready-work probe, narrowed to the one status it asks
 	// about. A queued row that later completes leaves this index entirely.
-	`CREATE INDEX IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,
 	// The bot's on demand count of files still in flight. Narrowed to the five
 	// in flight statuses so completed rows - the overwhelming majority of a
 	// permanent history - are never indexed at all.
-	`CREATE INDEX IF NOT EXISTS download_items_active_status ON download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_active_status ON download_items(status) WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')`,
 	// Interruption recovery updates exactly the running and downloaded rows.
 	// This is deliberately narrower than the active-status index: that one also
 	// contains queued and waiting, which for a stream task with millions of
 	// indexed files would make the planner scan the whole queue to find the
 	// handful of rows it is about to repair.
-	`CREATE INDEX IF NOT EXISTS download_items_recovery ON download_items(status) WHERE status IN ('running', 'downloaded')`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_recovery ON download_items(status) WHERE status IN ('running', 'downloaded')`,
 	// The waiting rotation resumes from an item id cursor; without an ordered
 	// index the reconciler would sort every waiting row on each pass.
-	`CREATE INDEX IF NOT EXISTS download_items_waiting_by_id ON download_items(id) WHERE status = 'waiting'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_waiting_by_id ON download_items(id) WHERE status = 'waiting'`,
 	// The dashboard's recent-failure figure and the failure retention sweep.
-	`CREATE INDEX IF NOT EXISTS download_items_failed_finished_at ON download_items(status, finished_at) WHERE status = 'failed'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_failed_finished_at ON download_items(status, finished_at) WHERE status = 'failed'`,
+	// The publish reconciler resumes from an item id cursor, exactly as the
+	// waiting rotation does, and needs the same shape: an id-ordered index over
+	// the one status it asks about. Without it the only candidates are the
+	// primary key (walked in id order, filtering on a status that is almost never
+	// 'downloaded') or the status index above followed by a sort of every row it
+	// returns. The cursor then buys nothing, and the pass runs on the maintenance
+	// cadence for as long as the process lives.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_published_by_id ON download_items(id) WHERE status = 'downloaded'`,
 
 	// ---- download_jobs: one row per message task ----
-	`CREATE INDEX IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
-	`CREATE INDEX IF NOT EXISTS download_jobs_visible_created_id ON download_jobs(created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
-	`CREATE INDEX IF NOT EXISTS download_jobs_visible_status_created_id ON download_jobs(status, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
-	`CREATE INDEX IF NOT EXISTS download_jobs_status_updated_id ON download_jobs(status, updated_at, id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_created_id ON download_jobs(created_at DESC, id DESC)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_visible_created_id ON download_jobs(created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_visible_status_created_id ON download_jobs(status, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_status_updated_id ON download_jobs(status, updated_at, id)`,
 	// The scheduler's ready-work probe, and the only index whose column order
 	// matches it: nextQueued reads the oldest queued task, ascending, and asks
 	// nothing about parent_chat_id, so neither half of the set above can serve
@@ -159,13 +167,19 @@ var postgresIndexStatements = []string{
 	// buffers. The queued set is not naturally small - one session scan queues a
 	// child task per media message - so this is a load-bearing index, not an
 	// optimisation for an unlikely shape.
-	`CREATE INDEX IF NOT EXISTS download_jobs_queued_created_id ON download_jobs(created_at, id) WHERE status = 'queued'`,
-	`CREATE INDEX IF NOT EXISTS download_jobs_account_visible_created_id ON download_jobs(account_id, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_queued_created_id ON download_jobs(created_at, id) WHERE status = 'queued'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_account_visible_created_id ON download_jobs(account_id, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+	// The settle pass walks queued tasks in id order from a cursor and asks only
+	// about top-level ones. download_jobs_queued_created_id carries the same
+	// status but orders by created_at, so the cursor could not seek: every pass
+	// re-read and re-sorted the whole queued set - and a session scan queues one
+	// child task per media message, so that set is not naturally small.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_settle_by_id ON download_jobs(id) WHERE status = 'queued' AND parent_chat_id = ''`,
 
 	// ---- auxiliary history ----
-	`CREATE INDEX IF NOT EXISTS download_requests_created_id ON download_requests(created_at, id)`,
-	`CREATE INDEX IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
-	`CREATE INDEX IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_requests_created_id ON download_requests(created_at, id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
 	// The event list reads the open queue newest first, and the count above it
 	// asks the same question. Narrowed to the open statuses so the index holds
 	// only events someone can still act on: a settled row is the permanent
@@ -178,19 +192,25 @@ var postgresIndexStatements = []string{
 	// quietly loses its seek and falls back to filtering - or, as happened
 	// here, how a new terminal status keeps being listed as waiting work by a
 	// predicate that was written as a negation.
-	`CREATE INDEX IF NOT EXISTS reaction_inbox_open_created_id ON reaction_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
-	`CREATE INDEX IF NOT EXISTS download_resets_created ON download_resets(created_at)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS reaction_inbox_open_created_id ON reaction_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_resets_created ON download_resets(created_at)`,
 
 	// ---- chat_download_jobs: one row per stream task ----
-	`CREATE UNIQUE INDEX IF NOT EXISTS chat_download_jobs_active_unique ON chat_download_jobs(account_id, dialog_key, start_message_id) WHERE status IN ('queued', 'scanning', 'downloading', 'listening', 'paused')`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_created_id ON chat_download_jobs(created_at DESC, id DESC)`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_visible_created_id ON chat_download_jobs(created_at DESC, id DESC) WHERE status != 'deleted'`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_account_status ON chat_download_jobs(account_id, status, updated_at)`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_scan ON chat_download_jobs(status, scan_state, created_at)`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_listener ON chat_download_jobs(account_id, dialog_key, listen_new, scan_state, status)`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status)`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_self_created ON chat_download_jobs(account_id, dialog_type, created_at DESC, id DESC) WHERE status != 'deleted'`,
-	`CREATE INDEX IF NOT EXISTS chat_download_jobs_self_listener ON chat_download_jobs(account_id, dialog_type, listen_new, start_message_id, status, updated_at DESC)`,
+	`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_active_unique ON chat_download_jobs(account_id, dialog_key, start_message_id) WHERE status IN ('queued', 'scanning', 'downloading', 'listening', 'paused')`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_created_id ON chat_download_jobs(created_at DESC, id DESC)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_visible_created_id ON chat_download_jobs(created_at DESC, id DESC) WHERE status != 'deleted'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_account_status ON chat_download_jobs(account_id, status, updated_at)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_scan ON chat_download_jobs(status, scan_state, created_at)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_listener ON chat_download_jobs(account_id, dialog_key, listen_new, scan_state, status)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_active_target ON chat_download_jobs(account_id, dialog_key, start_message_id, status)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_self_created ON chat_download_jobs(account_id, dialog_type, created_at DESC, id DESC) WHERE status != 'deleted'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_self_listener ON chat_download_jobs(account_id, dialog_type, listen_new, start_message_id, status, updated_at DESC)`,
+	// Recovering the peer for a linked-discussion update looks a task up by its
+	// discussion group, which is the hottest path a listener has: one lookup per
+	// comment received. Indexing the group rather than the dialog also covers the
+	// second and third fallbacks in recoverChatEventPeer, which reach the same
+	// rows through chat_reply_roots or the task's own dialog key.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_jobs_discussion ON chat_download_jobs(account_id, discussion_dialog_key, listen_new, scan_state, status)`,
 
 	// ---- chat_download_items: the stream task file table ----
 	//
@@ -200,25 +220,25 @@ var postgresIndexStatements = []string{
 	// cancel, resume and stalled-batch transitions, and it holds no entry for a
 	// completed or cancelled row, which is the overwhelming majority of a
 	// permanent index.
-	`CREATE INDEX IF NOT EXISTS chat_download_items_work ON chat_download_items(chat_job_id, status, message_id) WHERE status IN ('queued', 'running', 'downloaded', 'failed', 'paused')`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_items_work ON chat_download_items(chat_job_id, status, message_id) WHERE status IN ('queued', 'running', 'downloaded', 'failed', 'paused')`,
 	// The waiting rotation reads strictly in primary-key order and resumes from
 	// a (chat_job_id, dialog_key, message_id) cursor. The old index led with
 	// status and omitted dialog_key, so the planner could not use it for either
 	// the ordering or the cursor and had to sort every waiting row per pass.
-	`CREATE INDEX IF NOT EXISTS chat_download_items_waiting_rotation ON chat_download_items(chat_job_id, dialog_key, message_id) WHERE status = 'waiting'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_items_waiting_rotation ON chat_download_items(chat_job_id, dialog_key, message_id) WHERE status = 'waiting'`,
 	// Interruption recovery updates exactly the running and downloaded rows.
-	`CREATE INDEX IF NOT EXISTS chat_download_items_recovery ON chat_download_items(status) WHERE status IN ('running', 'downloaded')`,
-	`CREATE INDEX IF NOT EXISTS chat_download_items_downloaded ON chat_download_items(chat_job_id, message_id) WHERE status = 'downloaded'`,
-	`CREATE INDEX IF NOT EXISTS chat_download_items_failed_finished_at ON chat_download_items(status, finished_at) WHERE status = 'failed'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_items_recovery ON chat_download_items(status) WHERE status IN ('running', 'downloaded')`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_items_downloaded ON chat_download_items(chat_job_id, message_id) WHERE status = 'downloaded'`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_download_items_failed_finished_at ON chat_download_items(status, finished_at) WHERE status = 'failed'`,
 
-	`CREATE INDEX IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
-	`CREATE INDEX IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
 	// Counterpart of reaction_inbox_open_created_id: the message arm of the
 	// event list, restricted to the queue the list is allowed to show.
-	`CREATE INDEX IF NOT EXISTS chat_message_inbox_open_created_id ON chat_message_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
-	`CREATE INDEX IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
-	`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
-	`CREATE INDEX IF NOT EXISTS telegram_rate_limits_blocked_until ON telegram_rate_limits(blocked_until)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_open_created_id ON chat_message_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS telegram_rate_limits_blocked_until ON telegram_rate_limits(blocked_until)`,
 }
 
 type postgresMigration struct {
@@ -767,15 +787,25 @@ func (m *Manager) applyPostgresMigrations() error {
 		if migration.version <= current {
 			continue
 		}
+		// The long statements run first - version 19 needs the summary filled from
+		// the whole table before any trigger that reports deltas exists - but they
+		// run outside the migration's transaction, one autocommit statement each.
+		//
+		// Inside it they held the transaction open for as long as the backfill
+		// took: minutes on a table holding tens of millions of rows, which pins the
+		// xmin horizon and stops autovacuum from reclaiming anything anywhere in
+		// the database for that whole time. And a failure in the schema work after
+		// them rolled the backfill back too, so the next start repeated all of it.
+		// They are idempotent by construction, so committing the completed part is
+		// safe and a retry after a failure costs only the part that failed.
+		for _, statement := range migration.longStatements {
+			if _, err := m.db.ExecUnbounded(statement); err != nil {
+				return fmt.Errorf("apply PostgreSQL migration %d data backfill: %w", migration.version, err)
+			}
+		}
 		tx, err := m.db.Begin()
 		if err != nil {
 			return fmt.Errorf("start PostgreSQL migration %d: %w", migration.version, err)
-		}
-		for _, statement := range migration.longStatements {
-			if _, err := tx.ExecUnbounded(statement); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("apply PostgreSQL migration %d: %w", migration.version, err)
-			}
 		}
 		for _, statement := range migration.statements {
 			if _, err := tx.Exec(statement); err != nil {
@@ -820,12 +850,19 @@ func (m *Manager) ensurePostgresIndexes() error {
 		}
 	}
 	// Superseded indexes go last, so the replacement is always in place before
-	// the one it supersedes is removed.
+	// the one it supersedes is removed. The drop is concurrent for the same
+	// reason the builds are: a plain DROP INDEX takes an ACCESS EXCLUSIVE lock,
+	// which on a table holding tens of millions of rows blocks every read as well
+	// as every write for as long as it takes.
+	//
+	// It is safe here because DROP INDEX CONCURRENTLY only refuses indexes that
+	// back a constraint, and none of these does: every name below was created by
+	// a plain CREATE INDEX.
 	for _, name := range postgresIndexDrops {
 		if !validIndexIdentifier(name) {
 			return fmt.Errorf("ensure PostgreSQL indexes: invalid index name %q", name)
 		}
-		if _, err := m.db.ExecUnbounded(`DROP INDEX IF EXISTS ` + name); err != nil {
+		if _, err := m.db.ExecUnbounded(`DROP INDEX CONCURRENTLY IF EXISTS ` + name); err != nil {
 			return fmt.Errorf("ensure PostgreSQL indexes: drop %s: %w", name, err)
 		}
 	}
@@ -839,7 +876,7 @@ func (m *Manager) execConcurrently(statement string) error {
 			return err
 		} else if invalid {
 			applog.Info("schema", "rebuilding_invalid_index", "index", name)
-			if _, err := m.db.ExecUnbounded(`DROP INDEX IF EXISTS ` + name); err != nil {
+			if _, err := m.db.ExecUnbounded(`DROP INDEX CONCURRENTLY IF EXISTS ` + name); err != nil {
 				return fmt.Errorf("drop invalid index %s: %w", name, err)
 			}
 		}
@@ -865,21 +902,31 @@ func (m *Manager) indexInvalid(name string) (bool, error) {
 // concurrentIndexName extracts the relation name an index statement targets,
 // so an interrupted build can be detected before IF NOT EXISTS hides it. It
 // returns an empty string for anything that is not an index statement.
+//
+// Both keyword orders are accepted because both are used here: the statements in
+// postgresIndexStatements are CONCURRENTLY builds, while the ones inside versioned
+// migrations cannot be (CONCURRENTLY is illegal in a transaction block).
 func concurrentIndexName(statement string) string {
 	upper := strings.ToUpper(statement)
-	marker := "INDEX IF NOT EXISTS "
-	index := strings.Index(upper, marker)
+	index := strings.Index(upper, "INDEX ")
 	if index < 0 {
 		return ""
 	}
-	rest := statement[index+len(marker):]
-	if end := strings.IndexAny(rest, " (\"\n\t"); end >= 0 {
-		rest = rest[:end]
+	rest := statement[index+len("INDEX "):]
+	upperRest := upper[index+len("INDEX "):]
+	for _, prefix := range []string{"CONCURRENTLY IF NOT EXISTS ", "IF NOT EXISTS "} {
+		if strings.HasPrefix(upperRest, prefix) {
+			rest = rest[len(prefix):]
+			if end := strings.IndexAny(rest, " (\"\n\t"); end >= 0 {
+				rest = rest[:end]
+			}
+			if !validIndexIdentifier(rest) {
+				return ""
+			}
+			return rest
+		}
 	}
-	if !validIndexIdentifier(rest) {
-		return ""
-	}
-	return rest
+	return ""
 }
 
 // validIndexIdentifier refuses anything that is not a plain lowercase
