@@ -1540,7 +1540,7 @@ func (m *Manager) nextQueued() (Job, []source, error) {
 // overwritten with a generic message.
 func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner bool) {
 	if m.allItemsCompleted(jobID) {
-		_ = m.setJob(jobID, "completed", "")
+		_ = m.setJobWhileRunning(jobID, "completed", "")
 		// Every file is published, so this task's private temporary directory
 		// holds only leftovers. The usual case is a task that paused part-way and
 		// then found another task had completed the media: its own partial
@@ -1552,7 +1552,7 @@ func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner boo
 		return
 	}
 	if waitingForOwner || m.hasWaitingMessageItems(jobID) {
-		_ = m.setJob(jobID, "queued", "等待其他任务完成同一文件")
+		_ = m.setJobWhileRunning(jobID, "queued", "等待其他任务完成同一文件")
 		return
 	}
 	completed, err := m.completedItems(jobID)
@@ -1560,10 +1560,10 @@ func (m *Manager) finishTaskWithoutPendingWork(jobID string, waitingForOwner boo
 		return
 	}
 	if completed > 0 {
-		_ = m.setJob(jobID, "partial", "部分文件未完成，可重试失败文件")
+		_ = m.setJobWhileRunning(jobID, "partial", "部分文件未完成，可重试失败文件")
 		return
 	}
-	_ = m.setJob(jobID, "failed", "没有可继续下载的文件，请查看各文件的失败原因")
+	_ = m.setJobWhileRunning(jobID, "failed", "没有可继续下载的文件，请查看各文件的失败原因")
 }
 
 // settleQueuedJobsWithoutPendingWork repairs a task the scheduler can never
@@ -2467,7 +2467,14 @@ func (m *Manager) setMessageItemWaiting(jobID string, item source) error {
 func (m *Manager) setMessageItemsWaiting(jobID string, items []source) error {
 	err := forEachKeyChunk(mediaKeys(items), func(chunk []mediaClaimKey) error {
 		list, args := tupleInList(chunk)
-		_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND status NOT IN ('completed', 'waiting') AND (dialog_key, message_id) IN (`+list+`)`, append([]any{jobID}, args...)...)
+		// The task's own status belongs in the statement, not in a check made
+		// before it. A pause or a cancel that lands while the pending set is
+		// being assembled must not be undone by this write, and a check made a
+		// statement earlier is exactly the window that let it be: parking the
+		// files of a cancelled task as "waiting" is what made the cancel come
+		// back, because the claim reconciler promotes the waiting files of a
+		// queued task.
+		_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND status NOT IN ('completed', 'waiting') AND EXISTS (SELECT 1 FROM download_jobs j WHERE j.id = ? AND j.status IN ('queued', 'running')) AND (dialog_key, message_id) IN (`+list+`)`, append([]any{jobID, jobID}, args...)...)
 		return err
 	})
 	if err == nil {
@@ -3462,6 +3469,49 @@ func (m *Manager) setJob(id, status, message string) error {
 	}
 	m.touch()
 	m.emit(id, "", "job_status_changed", status)
+	m.signalChat()
+	return nil
+}
+
+// runningTaskStatuses are the states a task can hold while a worker is still
+// deciding how it ended. A task the user paused or cancelled has left this set,
+// and nothing a worker does afterwards may put it back.
+// An array rather than a slice: this is a fixed set, and nothing may append to
+// the condition that decides whether a task can still be settled.
+var runningTaskStatuses = [...]string{"queued", "running"}
+
+// setJobWhileRunning writes a task's status only while the task still holds a
+// state a running worker can own, and changes nothing otherwise.
+//
+// Settling a task is a decision about a task the caller believes it is running.
+// Without the condition the write lands on whatever the task has become since,
+// and the settle path is exactly where that is not cosmetic: it writes "queued"
+// for the files another task owns, the claim reconciler promotes the waiting
+// files of a queued task, and a download the user cancelled starts again by
+// itself. The same race one level down was already closed by beginItemAttempts;
+// these were the two writes it did not cover.
+func (m *Manager) setJobWhileRunning(jobID, status, message string) error {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(runningTaskStatuses)), ",")
+	args := make([]any, 0, 4+len(runningTaskStatuses))
+	args = append(args, status, message, time.Now().UTC().Format(time.RFC3339), jobID)
+	for _, allowed := range runningTaskStatuses {
+		args = append(args, allowed)
+	}
+	result, err := m.db.Exec(`UPDATE download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN (`+placeholders+`)`, args...)
+	if err != nil {
+		applog.Error("download", "task_state_save_failed", "job_id", jobID, "status", status, "error", err.Error())
+		return err
+	}
+	m.touch()
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		// Zero rows is the race this guard exists for: the task is paused or
+		// cancelled and already holds the state the user chose. Emitting a
+		// status change that did not happen would refresh a card to a state the
+		// task never entered.
+		return err
+	}
+	m.emit(jobID, "", "job_status_changed", status)
 	m.signalChat()
 	return nil
 }

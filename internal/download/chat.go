@@ -2149,6 +2149,15 @@ func (m *Manager) reconcileListenerGap(id string) error {
 			// the watermark also holds the last stretch above it, so returning
 			// first would drop exactly the messages closest to the boundary.
 			for _, message := range above {
+				// Deliberately built without a reply header, unlike the events
+				// the discussion walk rebuilds. This walk reads the task's own
+				// dialog, so the dialog key is already the whole attribution and
+				// admission matches the task on it directly. Carrying a reply
+				// header here would not add information - it would send a post
+				// that happens to answer another post down admission's
+				// comment-attribution path, which resolves a discussion origin
+				// over the network for a message this walk already knows the
+				// owner of.
 				if !m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: target.DialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: peer}) {
 					// The row was not written, so this message exists only in the
 					// retry queue. Stop the walk where it is: the watermark is not
@@ -2276,17 +2285,52 @@ func (m *Manager) reconcileDiscussionGap(ctx context.Context, target storedChatT
 	// populates it for this dialog. A walk that ran before the first comment ever
 	// arrived would otherwise be filtered away silently.
 	m.addChatWatched(target.AccountID, dialogKey)
-	offset := m.gapStreamOffset(target.ID, listenerGapDiscussionStream)
-	for page := 0; page < discussionGapPageCap; page++ {
+	return m.walkDiscussionGap(target, peer, dialogKey, boundary, func(offset int) ([]tg.MessageClass, error) {
 		pageCtx, cancelPage := context.WithTimeout(ctx, listenerGapPageTimeout)
+		defer cancelPage()
 		result, err := client.API().MessagesGetHistory(pageCtx, &tg.MessagesGetHistoryRequest{Peer: peer, OffsetID: offset, Limit: 100})
-		cancelPage()
 		if err != nil {
 			m.recordTelegramRPCError(target.AccountID, err)
+			return nil, err
+		}
+		return searchMessages(result), nil
+	})
+}
+
+// walkDiscussionGap drives one pass over a listening task's linked discussion
+// group, newest page first. fetch returns the page of that group's history
+// strictly older than the offset it is handed.
+//
+// The page loop takes a function rather than a client because the cursor rule
+// below is the part that loses messages when it is wrong, and a rule that can
+// only be exercised against a live Telegram connection is a rule nobody
+// exercises. A caller with no connection can hand it a history.
+//
+// The persisted offset is where an interrupted walk resumes, and the two ways a
+// walk can end are not the same thing:
+//
+//   - It proved there is nothing left to recover below it. It reached the
+//     boundary, or the group's history ran out. The offset returns to zero, and
+//     that is not a detail: a walk resumes downwards from its cursor, so a
+//     cursor left behind is a walk that can never look at anything new. Only a
+//     walk that starts from the newest message can see a comment published
+//     since the last one.
+//   - It ran out of page budget mid-backlog. Here the offset stays exactly
+//     where it is. This walk has already raised the inbox watermark to the
+//     newest message it admitted, and the next walk takes that watermark as its
+//     boundary - so restarting from the top would stop on its first page and
+//     strand every message below it for good. Resuming downwards is the only
+//     direction that still reaches them.
+func (m *Manager) walkDiscussionGap(target storedChatTarget, peer tg.InputPeerClass, dialogKey string, boundary int, fetch func(offset int) ([]tg.MessageClass, error)) error {
+	offset := m.gapStreamOffset(target.ID, listenerGapDiscussionStream)
+	completed := false
+	for page := 0; page < discussionGapPageCap; page++ {
+		messages, err := fetch(offset)
+		if err != nil {
 			return err
 		}
-		messages := searchMessages(result)
 		if len(messages) == 0 {
+			completed = true
 			break
 		}
 		oldest := 0
@@ -2303,19 +2347,35 @@ func (m *Manager) reconcileDiscussionGap(ctx context.Context, target storedChatT
 				reached = true
 				continue
 			}
-			if !m.enqueueChatMessage(telegram.NewMessageEvent{AccountID: target.AccountID, DialogKey: dialogKey, DialogName: target.DialogName, MessageID: message.ID, InputPeer: peer}) {
+			// Built through the one constructor that fills the reply header.
+			// Admission attributes a comment to the channel post it answers
+			// from those two fields, and drops an event without them as
+			// unattributable - silently, because a message that belongs to no
+			// task is not an error.
+			if !m.enqueueChatMessage(telegram.NewMessageEventFor(target.AccountID, dialogKey, target.DialogName, 0, message, peer)) {
 				// Only in the retry queue, so stop and keep the cursor: the next
 				// walk re-reads this stretch instead of skipping it.
 				return nil
 			}
 		}
-		if reached || oldest == 0 || oldest == offset {
+		if reached {
+			completed = true
+			break
+		}
+		if oldest == 0 || oldest == offset {
+			// The page offered no resume point: either it held no message this
+			// walk can index, or the server returned the page it was asked to
+			// move past. There is nothing to resume from, so start the next walk
+			// from the newest message rather than spinning on this page.
+			completed = true
 			break
 		}
 		offset = oldest
 		m.setGapStreamOffset(target.ID, listenerGapDiscussionStream, offset)
 	}
-	m.setGapStreamOffset(target.ID, listenerGapDiscussionStream, 0)
+	if completed {
+		m.setGapStreamOffset(target.ID, listenerGapDiscussionStream, 0)
+	}
 	return nil
 }
 

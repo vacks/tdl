@@ -87,6 +87,33 @@ type NewMessageEvent struct {
 	ReplyToTopID     int
 }
 
+// NewMessageEventFor builds the event the dispatcher would have produced for a
+// message it saw, so a caller that synthesises an event from a history page
+// offers exactly what the live path offers.
+//
+// Build events through this function rather than with a struct literal, because
+// the reply header is not decoration: it is how admission attributes a comment
+// to the channel post it answers. An event without it is not a smaller event,
+// it is one that admission discards as unattributable. The discussion walk
+// rebuilt events by hand and left both fields zero, so every message it
+// recovered was dropped in silence - a whole recovery path that could never
+// deliver anything, with no error to show for it.
+func NewMessageEventFor(accountID, dialogKey, dialogName string, dialogID int64, message *tg.Message, peer tg.InputPeerClass) NewMessageEvent {
+	event := NewMessageEvent{
+		AccountID:        accountID,
+		DialogKey:        dialogKey,
+		DialogID:         dialogID,
+		DialogName:       dialogName,
+		InputPeer:        peer,
+		ReplyToMessageID: replyMessageID(message),
+		ReplyToTopID:     replyTopID(message),
+	}
+	if message != nil {
+		event.MessageID = message.ID
+	}
+	return event
+}
+
 type persisted struct {
 	Accounts  []Account `json:"accounts"`
 	CurrentID string    `json:"currentId"`
@@ -458,14 +485,25 @@ func (m *Manager) StartQR() (Account, error) {
 }
 
 // pendingLoginLocked reports a login that has not reached a verdict yet, and
-// must be called with m.mu held. Those are the states a second request would
-// duplicate: 'starting' before the code is issued, and 'waiting_for_qr' while it
-// waits to be scanned or for a password.
+// must be called with m.mu held. A second request while one is in flight
+// duplicates it: two accounts, two MTProto logins, and a Telegram user with two
+// authorized sessions.
+//
+// The login job is the question, not the account state. A job is created with
+// the account and removed when the login ends, the account is deleted, or the
+// account is rolled back - so it is present for exactly as long as there is
+// something to duplicate. Listing states instead is what let the duplicate
+// back in: the list held 'starting' and 'waiting_for_qr', but the two-factor
+// prompt moves the account to 'waiting_for_2fa', and that step waits for a
+// person to type. A retried request or a second click during it appended a
+// second account. States also survive a restart as history (a login interrupted
+// by one is reloaded as 'stopped'), so they were never the right question.
 func (m *Manager) pendingLoginLocked() (Account, bool) {
-	for _, account := range m.accounts {
-		switch account.State {
-		case "starting", "waiting_for_qr":
-			return account, true
+	for id := range m.jobs {
+		for _, account := range m.accounts {
+			if account.ID == id {
+				return account, true
+			}
 		}
 	}
 	return Account{}, false
@@ -922,7 +960,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 			// is what left every ordinary message labelled with a placeholder.
 			dialogID := inputPeerID(input)
 			key := newMessageDialogKey(input, accountID)
-			m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: inputPeerDisplayName(input, entities), MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+			m.dispatchMessage(session, NewMessageEventFor(accountID, key, inputPeerDisplayName(input, entities), dialogID, message, input))
 			return
 		}
 		// The entity is missing from this update, so only a resolved peer can
@@ -944,17 +982,17 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 			// Telegram omits entities, normalize that raw identity as well; using
 			// user:<id> here would never match the durable self:<account> key.
 			if input := m.normalizeRawSelfPeer(accountID, message.PeerID); input != nil {
-				m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: "self:" + accountID, DialogID: 0, DialogName: savedDialogName, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+				m.dispatchMessage(session, NewMessageEventFor(accountID, "self:"+accountID, savedDialogName, 0, message, input))
 				return
 			}
 			kind, id := peerIdentity(message.PeerID)
 			key := kind + ":" + fmt.Sprint(id)
-			m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: id, DialogName: name, MessageID: message.ID, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+			m.dispatchMessage(session, NewMessageEventFor(accountID, key, name, id, message, nil))
 			return
 		}
 		dialogID := inputPeerID(input)
 		key := newMessageDialogKey(input, accountID)
-		m.dispatchMessage(session, NewMessageEvent{AccountID: accountID, DialogKey: key, DialogID: dialogID, DialogName: name, MessageID: message.ID, InputPeer: input, ReplyToMessageID: replyMessageID(message), ReplyToTopID: replyTopID(message)})
+		m.dispatchMessage(session, NewMessageEventFor(accountID, key, name, dialogID, message, input))
 	}
 	dispatcher.OnNewMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 		dispatchMessage(updateCtx, entities, update.Message)

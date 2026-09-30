@@ -45,8 +45,14 @@ type Server struct {
 	reactions *reaction.Service
 	mux       *http.ServeMux
 	sseSlots  chan struct{}
-	loginMu   sync.Mutex
-	logins    map[string]loginAttempt
+	// shutdown is closed by Stop to end the long-lived event streams. They are
+	// the one handler that outlives a request by design, so http.Server.Shutdown
+	// - which waits for active handlers but does not cancel their contexts -
+	// cannot end them on its own.
+	shutdown   chan struct{}
+	shutdownOn sync.Once
+	loginMu    sync.Mutex
+	logins     map[string]loginAttempt
 }
 
 type loginAttempt struct {
@@ -78,7 +84,7 @@ func New(cfg config.Config) (*Server, error) {
 	reactions := reaction.New(settingsStore, telegram, downloads)
 	reactions.Start()
 	systemMonitor := monitor.New(cfg.DownloadDir)
-	s := &Server{cfg: cfg, accounts: accounts, sessions: auth.NewSessions(), telegram: telegram, settings: settingsStore, downloads: downloads, monitor: systemMonitor, bot: bot.New(settingsStore, downloads, telegram, systemMonitor, cfg.DataDir), reactions: reactions, mux: http.NewServeMux(), sseSlots: make(chan struct{}, 8), logins: make(map[string]loginAttempt)}
+	s := &Server{cfg: cfg, accounts: accounts, sessions: auth.NewSessions(), telegram: telegram, settings: settingsStore, downloads: downloads, monitor: systemMonitor, bot: bot.New(settingsStore, downloads, telegram, systemMonitor, cfg.DataDir), reactions: reactions, mux: http.NewServeMux(), sseSlots: make(chan struct{}, 8), shutdown: make(chan struct{}), logins: make(map[string]loginAttempt)}
 	s.routes()
 	return s, nil
 }
@@ -97,6 +103,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Stop releases background connections and active downloads before process exit.
 func (s *Server) Stop() {
+	// Disconnect the event streams first. A stream ends only when its client
+	// goes away, and Shutdown waits for active handlers, so leaving them open
+	// makes every restart wait out the whole shutdown budget while downloads
+	// keep running behind it. Closing this is what lets the handler return.
+	s.shutdownOn.Do(func() { close(s.shutdown) })
 	s.bot.Stop()
 	s.reactions.Stop()
 	s.downloads.Stop()
@@ -561,6 +572,10 @@ func (s *Server) chatDownloadControlAPI(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// sseWriteTimeout bounds a single write to an event stream. The stream itself
+// is unbounded by design; a write is not.
+const sseWriteTimeout = 10 * time.Second
+
 // downloadProgressSSE streams in-memory progress. Download chunks never write
 // PostgreSQL; this endpoint is intentionally ephemeral and reconnect-safe.
 func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
@@ -580,22 +595,27 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "已有过多实时连接，请关闭多余页面后重试"})
 		return
 	}
-	// The server has a finite write deadline for ordinary HTTP responses. This
-	// stream is intentionally long-lived, so clear it only after authentication
-	// and the SSE connection limit have been established.
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
-		http.Error(w, "streaming unavailable", http.StatusInternalServerError)
-		return
-	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	events, unsubscribe := s.downloads.SubscribeEvents()
 	defer unsubscribe()
+	// The stream is long-lived, so the server's ordinary write deadline is
+	// replaced - but never by an unbounded one. Clearing it outright is what
+	// made a client that stopped reading (a suspended phone, a tab whose socket
+	// is gone without a reset) block forever inside Write on a full send
+	// buffer: the handler never returned, so it never released its slot, and
+	// the slot limit turned eight such clients into a permanent refusal for
+	// everyone else. Bounding each write instead turns that into an error the
+	// loop already knows how to leave on, and the browser reconnects.
+	controller := http.NewResponseController(w)
 	write := func(event *download.Event) bool {
 		data, err := json.Marshal(map[string]any{"files": s.downloads.LiveProgress(), "revision": s.downloads.Revision(), "event": event})
 		if err != nil {
+			return false
+		}
+		if err := controller.SetWriteDeadline(time.Now().Add(sseWriteTimeout)); err != nil {
 			return false
 		}
 		if _, err := w.Write([]byte("data: ")); err != nil {
@@ -617,6 +637,8 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-s.shutdown:
+			return
 		case <-r.Context().Done():
 			return
 		case event, ok := <-events:

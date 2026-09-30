@@ -318,6 +318,21 @@ const maxCommandAttempts = 8
 // leaves room for the header and footer while staying well inside that.
 const botCardItemLines = 20
 
+// botCardMessageText bounds how much of the source message's caption the card
+// repeats. A caption may itself be the full 4096 characters, and the task table
+// keeps it in one column on purpose (see the download_jobs.message_text note) -
+// so it is the one field on this card with no natural length. Bounding the file
+// list while leaving this one whole bounded the wrong half: the file list was
+// already the short part.
+const botCardMessageText = 300
+
+// botCardLimit is the longest message Telegram accepts. It applies to the
+// finished text, not to the fields composing it, so the fields are bounded
+// individually and the assembled card is checked against this as a backstop.
+// Exceeding it is not a layout problem: the send is rejected outright, so a
+// task's only progress surface stops updating and never recovers.
+const botCardLimit = 4096
+
 // runCommand handles one update, retrying in its own goroutine so a failure
 // cannot hold the poll loop. It keeps the durable-acknowledgement the loop had:
 // the update stays unfinished until it succeeds, and the stored offset cannot
@@ -2093,13 +2108,30 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 	}
 	lines = append(lines,
 		"<b>对话：</b>"+html.EscapeString(short(job.DialogName, 36)),
-		"<b>消息：</b>"+html.EscapeString(messageFullText(job.MessageText)),
+		"<b>消息：</b>"+html.EscapeString(short(messageFullText(job.MessageText), botCardMessageText)),
 		sourceLine(job),
 	)
 	if job.Error != "" {
 		lines = append(lines, "<b>说明：</b>"+html.EscapeString(short(job.Error, 100)))
 	}
-	return strings.Join(lines, "\n")
+	text := strings.Join(lines, "\n")
+	if len([]rune(text)) <= botCardLimit {
+		return text
+	}
+	// Unreachable while every field above is bounded, which is the point: it
+	// exists so that a field added later without a bound costs a shorter card
+	// rather than every card. Whole lines are dropped instead of being cut
+	// mid-string because each line is already HTML-escaped - cutting inside an
+	// escape sequence produces markup Telegram rejects, turning a card that is
+	// merely too long into no card at all. The first line is always kept, so
+	// the result still says what the task is.
+	for index := len(lines) - 1; index > 1; index-- {
+		candidate := strings.Join(lines[:index], "\n")
+		if len([]rune(candidate)) <= botCardLimit {
+			return candidate
+		}
+	}
+	return lines[0]
 }
 
 // sourceLine only emits externally usable Telegram links. The tg://reaction/*

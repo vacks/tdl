@@ -445,3 +445,45 @@ func TestWaitReadyIsWokenByTheReconnectionAfterAFailedAttempt(t *testing.T) {
 		t.Fatal("waitReady() was never woken by the connection that replaced the failed one")
 	}
 }
+
+// Starting a login while another is still waiting for its two-factor password
+// must report the one in flight rather than begin a second. The two states it
+// used to list were both about the QR code; the password step moves the account
+// to a third state, and that step waits for a person, so the window was as long
+// as someone took to type. A second login means a second account, and a
+// Telegram user with two authorized sessions is the one thing the whole guard
+// exists to prevent.
+func TestPendingLoginCoversTheTwoFactorStep(t *testing.T) {
+	// Exercised through every state a login passes through, because the
+	// question is not what the account is called but whether a login is still
+	// running - so a state added later must not reopen the window.
+	for _, state := range []string{"starting", "waiting_for_qr", "waiting_for_2fa"} {
+		m := &Manager{
+			accounts: []Account{{ID: "account-1", State: state}},
+			jobs:     map[string]*loginJob{"account-1": {}},
+		}
+		m.mu.Lock()
+		pending, ok := m.pendingLoginLocked()
+		m.mu.Unlock()
+		if !ok || pending.ID != "account-1" {
+			t.Fatalf("state %q: a login in flight was not reported, so a second one would be started", state)
+		}
+	}
+}
+
+// The other direction, and the one a state list got wrong in the opposite way:
+// an account that is merely sitting in a login-shaped state with no login
+// running is not a login in flight. A restart reloads an interrupted login as
+// 'stopped', which must not block starting a new one.
+func TestPendingLoginIgnoresAccountsWithNoLoginRunning(t *testing.T) {
+	m := &Manager{
+		accounts: []Account{{ID: "account-1", State: "waiting_for_2fa"}, {ID: "account-2", State: "stopped"}},
+		jobs:     map[string]*loginJob{},
+	}
+	m.mu.Lock()
+	_, ok := m.pendingLoginLocked()
+	m.mu.Unlock()
+	if ok {
+		t.Fatal("an account with no login job was reported as a login in flight, which would block every new login")
+	}
+}

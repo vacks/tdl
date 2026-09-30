@@ -367,3 +367,94 @@ func TestEventClearConfirmTextNamesRevivableEvents(t *testing.T) {
 		t.Fatalf("eventClearConfirmText(3, 0) must not mention a revive that cannot happen: %s", quiet)
 	}
 }
+
+// dispatchableJob builds the longest card the field bounds allow: a caption at
+// the full message limit, a dialog name at its bound, and more files than the
+// card lists.
+func dispatchableJob() download.Job {
+	items := make([]download.Item, 0, botCardItemLines+5)
+	for index := 0; index < botCardItemLines+5; index++ {
+		items = append(items, download.Item{
+			DialogKey:    "channel:1",
+			MessageID:    index + 1,
+			OriginalName: strings.Repeat("很长的文件名", 4),
+			Status:       "queued",
+		})
+	}
+	return download.Job{
+		ID:          "job",
+		Status:      "running",
+		DialogName:  strings.Repeat("频道名称", 20),
+		MessageText: strings.Repeat("正", botCardLimit),
+		TotalItems:  len(items),
+		Items:       items,
+	}
+}
+
+// Telegram rejects a message longer than its limit outright, so a card that
+// exceeds it is not a shortened card - it is no card, and the task's only
+// progress surface stops updating for as long as the task runs. The file list
+// was bounded and the caption was not, which bounded the short half: a caption
+// may itself be as long as a whole message.
+func TestTaskCardStaysWithinTelegramsLimit(t *testing.T) {
+	text := taskText(dispatchableJob(), nil)
+	if got := len([]rune(text)); got > botCardLimit {
+		t.Fatalf("card is %d characters, Telegram rejects anything over %d, so this card can never be sent", got, botCardLimit)
+	}
+	if !strings.Contains(text, "进度") {
+		t.Fatal("the card lost its header, so it no longer says which task it is")
+	}
+	if strings.Contains(text, strings.Repeat("正", botCardMessageText+1)) {
+		t.Fatal("the whole caption was rendered; a caption can be as long as a message, so the card cannot stay inside the limit")
+	}
+	// The caption is what gets shortened, not the rest of the card. Relying on
+	// the backstop alone would satisfy the check above - it drops trailing
+	// lines until the text fits - while quietly costing every task with a long
+	// caption its caption line and its source line, which is most of what the
+	// card is for.
+	if !strings.Contains(text, "消息：") {
+		t.Fatal("a long caption removed the caption line instead of being shortened on it")
+	}
+	if !strings.Contains(text, "来源：") {
+		t.Fatal("a long caption pushed the source line off the card")
+	}
+	if !strings.Contains(text, strings.Repeat("正", 50)) {
+		t.Fatal("the caption was dropped whole rather than shortened to its beginning")
+	}
+}
+
+// The backstop, reached through the one field on this card that nothing bounds.
+// The source URL is stored exactly as it was submitted, and the endpoint that
+// accepts one reads a body of up to 8 KiB - so a single link can be longer than
+// a whole Telegram message. A shortened URL would be a broken link, so the line
+// goes rather than the card.
+func TestTaskCardDropsTheSourceLineBeforeItExceedsTheLimit(t *testing.T) {
+	job := dispatchableJob()
+	job.MessageText = "短说明"
+	job.SourceURL = "https://t.me/example/1?x=" + strings.Repeat("a", 6000)
+	text := taskText(job, nil)
+	if got := len([]rune(text)); got > botCardLimit {
+		t.Fatalf("card is %d characters, over the %d Telegram accepts", got, botCardLimit)
+	}
+	if strings.Contains(text, "来源") {
+		t.Fatal("the oversized source line was kept, so the card is still over the limit")
+	}
+	if !strings.Contains(text, "短说明") {
+		t.Fatal("dropping the source line cost the card its caption as well")
+	}
+}
+
+// The bound must not cost the card its content in the ordinary case: a caption
+// short enough to fit is shown whole, and the links and counts stay.
+func TestTaskCardKeepsShortCaptionsAndFooter(t *testing.T) {
+	job := dispatchableJob()
+	job.MessageText = "一条普通说明"
+	job.SourceURL = "https://t.me/example/12"
+	text := taskText(job, nil)
+	if !strings.Contains(text, "一条普通说明") {
+		t.Fatal("a caption that fits was dropped from the card")
+	}
+	if !strings.Contains(text, "对话") || !strings.Contains(text, "进度") {
+		t.Fatal("the card lost a field it always showed")
+	}
+}
