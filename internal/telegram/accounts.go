@@ -312,12 +312,24 @@ type Manager struct {
 // RPCGate is the account-wide metadata gate.
 //
 // Acquire paces one request. Report is handed whatever that request returned,
-// and it is the only place a server-mandated wait can be observed: the
+// and it is the only place a server-mandated wait can be observed, because the
 // flood-wait middleware the upstream client installs ahead of this one sleeps
-// off a FLOOD_WAIT and retries inside the invoker, so the error never reaches
-// the caller that would otherwise record it. Reporting from here is what makes
-// the account-wide cooldown real for metadata requests rather than only for the
-// byte transfers, whose invoker has no such middleware.
+// off a FLOOD_WAIT and retries inside the invoker - the error never reaches the
+// caller that would otherwise record it.
+//
+// That applies to the download pool as much as to this gate. dl.Run builds its
+// pool with tclient.NewDefaultMiddlewares, which is recovery, retry and
+// floodwait, and gotd's SimpleWaiter retries a FLOOD_WAIT without a bound: it
+// only gives up when the request's context is done. So the transfers and the
+// upstream iterator's history reads do not merely skip the pacing - their flood
+// errors never surface here either, and this cooldown is written only by
+// metadata requests that go through this gate.
+//
+// Closing that needs the gate to travel with the pool, which is a change to the
+// vendored upstream (see patches/): the pool is built inside dl.Run, so the
+// only place to install a middleware into it is an option on its Options.
+// Passing the gate there would pace the pool's metadata requests while leaving
+// upload.getFile unpaced, since the allow-list below does not name it.
 type RPCGate interface {
 	Acquire(ctx context.Context, accountID string) error
 	Report(accountID string, err error)

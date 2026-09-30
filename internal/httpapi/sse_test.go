@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,4 +102,124 @@ func TestStopIsIdempotent(t *testing.T) {
 	server, _, _ := sseTestServer(t)
 	server.Stop()
 	server.Stop()
+}
+
+// Login is the one state-changing route that succeeds without an existing
+// cookie, so the cookie's SameSite attribute does not protect it: a cross-site
+// form can post here with the attacker's credentials and leave the victim's
+// browser holding the attacker's session. It carries the same origin check as
+// every other route.
+func TestLoginRefusesARequestFromAnotherOrigin(t *testing.T) {
+	databaseURL := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	root := t.TempDir()
+	server, err := New(config.Config{
+		DataDir:         filepath.Join(root, "data"),
+		DownloadDir:     filepath.Join(root, "downloads"),
+		AdminUsername:   "admin",
+		InitialPassword: "test-password",
+		DatabaseDSN:     databaseURL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Stop)
+	body, _ := json.Marshal(map[string]string{"username": "admin", "password": "test-password"})
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(body))
+	request.Header.Set("Origin", "https://attacker.example")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin login status=%d, want %d", response.Code, http.StatusForbidden)
+	}
+	if len(response.Result().Cookies()) != 0 {
+		t.Fatal("a cross-origin login set a session cookie")
+	}
+}
+
+// Anything under /api/ that no route claimed must answer as an API, not as the
+// single-page app. The app fallback returns 200 with an HTML body, and the
+// client parses that as a successful empty response - so a misspelled endpoint
+// looked exactly like one that returned nothing.
+func TestUnknownAPIRouteAnswersWithJSON404(t *testing.T) {
+	_, client, baseURL := sseTestServer(t)
+	response, err := client.Get(baseURL + "/api/downloadz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown api route status=%d, want %d", response.StatusCode, http.StatusNotFound)
+	}
+	if contentType := response.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+		t.Fatalf("unknown api route content type=%q, want JSON", contentType)
+	}
+}
+
+// The login limit is counted per client, and behind a reverse proxy every
+// request arrives from the proxy. Counting the peer put every client in one
+// bucket, where five wrong passwords from anywhere locked the operator out of
+// their own instance and kept re-locking it for as long as they continued. The
+// forwarded chain is read from the right, because each hop appends the address
+// it received the connection from - so the entries to the left of the last
+// untrusted hop are supplied by whoever connected to it.
+func TestLoginClientReadsTheForwardedChainOnlyFromATrustedProxy(t *testing.T) {
+	trusted := &Server{cfg: config.Config{TrustedProxies: []string{"10.0.0.1", "192.168.0.0/16"}}}
+	untrusted := &Server{}
+	request := func(remoteAddr, forwarded string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = remoteAddr
+		if forwarded != "" {
+			r.Header.Set("X-Forwarded-For", forwarded)
+		}
+		return r
+	}
+	cases := []struct {
+		name   string
+		server *Server
+		req    *http.Request
+		want   string
+	}{
+		{"direct client is its own key", untrusted, request("203.0.113.9:5555", "1.2.3.4"), "203.0.113.9"},
+		{"forwarded from a trusted proxy", trusted, request("10.0.0.1:5555", "203.0.113.9"), "203.0.113.9"},
+		{"the rightmost untrusted hop wins", trusted, request("10.0.0.1:5555", "9.9.9.9, 203.0.113.9"), "203.0.113.9"},
+		{"a trusted hop in the chain is skipped", trusted, request("10.0.0.1:5555", "203.0.113.9, 192.168.1.7"), "203.0.113.9"},
+		{"forwarded from an untrusted peer is ignored", untrusted, request("203.0.113.9:5555", "1.2.3.4"), "203.0.113.9"},
+		{"an unparsable chain falls back to the peer", trusted, request("10.0.0.1:5555", "not-an-address"), "10.0.0.1"},
+	}
+	for _, testCase := range cases {
+		if got := testCase.server.loginClient(testCase.req); got != testCase.want {
+			t.Fatalf("%s: loginClient() = %q, want %q", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+// A stream is authorized once, at the handshake, and then lives on. A session
+// expires after a day, and changing the password clears every session at once -
+// so without re-checking, a stream keeps pushing task state to a browser that
+// would already be refused the same data on any ordinary request.
+func TestEventStreamEndsWhenTheSessionIsCleared(t *testing.T) {
+	server, client, baseURL := sseTestServer(t)
+	response, err := client.Get(baseURL + "/api/downloads/progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reader := bufio.NewReader(response.Body)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("the stream produced no first frame: %v", err)
+	}
+	server.sessions.Clear()
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, reader)
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stream outlived the session it was authorized with")
+	}
 }

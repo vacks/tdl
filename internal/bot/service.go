@@ -91,6 +91,16 @@ type Service struct {
 	// on Telegram resolution, which is paced per account anyway, so a small pool
 	// removes the head-of-line wait without adding load.
 	commandSlots chan struct{}
+	// wg tracks every goroutine this service starts. Stop waits for it,
+	// because the server stops its services in order and the download manager
+	// closes the database immediately afterwards: work still running here
+	// would be querying a database that is being closed behind it.
+	wg sync.WaitGroup
+	// unsubscribe releases the domain event subscription. It is kept rather
+	// than discarded because closing the channel is what ends the event loop;
+	// without it that goroutine blocked on a range that could never finish.
+	unsubscribe  func()
+	shutdownOnce sync.Once
 	// acknowledgeMu serializes the offset file write, which several workers can
 	// otherwise attempt at the same moment.
 	acknowledgeMu sync.Mutex
@@ -185,10 +195,12 @@ func New(store *settings.Store, downloads *download.Manager, telegram *telegram.
 		}
 	}
 	applog.Info("bot", "service_started")
-	events, _ := downloads.SubscribeEvents()
-	go s.watchDownloadEvents(events)
-	go s.loop()
-	go s.refreshLoop()
+	events, unsubscribe := downloads.SubscribeEvents()
+	s.unsubscribe = unsubscribe
+	s.wg.Add(3)
+	go func() { defer s.wg.Done(); s.watchDownloadEvents(events) }()
+	go func() { defer s.wg.Done(); s.loop() }()
+	go func() { defer s.wg.Done(); s.refreshLoop() }()
 	return s
 }
 
@@ -290,7 +302,8 @@ func (s *Service) loop() {
 				// conversation's lock, so a command that is waiting for a permit or
 				// backing off holds neither the permit nor a place in the queue
 				// behind a command that is not working.
-				go s.runCommand(cfg, update)
+				s.wg.Add(1)
+				go func() { defer s.wg.Done(); s.runCommand(cfg, update) }()
 			}
 			s.acknowledgeHandled(cfg.Token)
 		} else {
@@ -505,15 +518,39 @@ func shouldLogPollFailure(failures int) bool {
 
 // Stop cancels long polling and releases idle Bot API connections.
 func (s *Service) Stop() {
-	s.cancel()
-	s.clientMu.Lock()
-	if s.client != nil {
-		if transport, ok := s.client.Transport.(*http.Transport); ok {
-			transport.CloseIdleConnections()
+	s.shutdownOnce.Do(func() {
+		s.cancel()
+		if s.unsubscribe != nil {
+			s.unsubscribe()
 		}
+		s.clientMu.Lock()
+		if s.client != nil {
+			if transport, ok := s.client.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
+		}
+		s.clientMu.Unlock()
+	})
+	// Waiting is the point of the group. The server stops its services in
+	// order and the download manager closes the database next, so a command
+	// still running here would be reading a database being closed under it -
+	// which is not a failure anyone can act on, just a burst of errors during
+	// a clean shutdown. Bounded, because a shutdown that can hang is worse
+	// than one that logs what it left behind.
+	stopped := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(botStopTimeout):
+		applog.Error("bot", "stop_timed_out", "timeout", botStopTimeout.String())
 	}
-	s.clientMu.Unlock()
 }
+
+// botStopTimeout bounds how long Stop waits for the service's own goroutines.
+const botStopTimeout = 5 * time.Second
 
 // helpRetryStep advances the startup greeting's retry state after a failed
 // send, and reports whether to try again at all.

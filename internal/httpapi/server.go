@@ -170,6 +170,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
+	// The same origin check every other state-changing route has. Login is the
+	// one route that does not need the existing cookie to succeed, so the
+	// cookie's SameSite attribute does not protect it: a cross-site form can
+	// post here with the attacker's credentials and leave the victim's browser
+	// holding the attacker's session.
+	if !s.validRequestOrigin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "请求来源无效"})
+		return
+	}
 	client := s.loginClient(r)
 	if retry := s.loginRetryAfter(client); retry > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
@@ -657,6 +666,15 @@ func (s *Server) downloadProgressSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-ticker.C:
+			// requireAuth ran once, at the handshake, and a stream can outlive
+			// what authorized it: a session expires after a day, and changing
+			// the password clears every session at once. Re-checked here so a
+			// stream stops when an ordinary request would already be refused,
+			// instead of continuing to push task state to a browser that is no
+			// longer logged in.
+			if !s.authenticated(r) {
+				return
+			}
 			if !write(nil) {
 				return
 			}
@@ -826,15 +844,18 @@ func (s *Server) requestHTTPS(r *http.Request) bool {
 // trustedProxy reports whether the peer address is one whose forwarding headers
 // the operator chose to believe. An empty list means none of them are.
 func (s *Server) trustedProxy(r *http.Request) bool {
-	if len(s.cfg.TrustedProxies) == 0 {
-		return false
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || host == "" {
 		host = r.RemoteAddr
 	}
 	peer := net.ParseIP(host)
-	if peer == nil {
+	return peer != nil && s.isTrustedProxyAddress(peer)
+}
+
+// isTrustedProxyAddress reports whether an address is one whose forwarded
+// headers the operator chose to believe. An empty list means none of them are.
+func (s *Server) isTrustedProxyAddress(peer net.IP) bool {
+	if len(s.cfg.TrustedProxies) == 0 {
 		return false
 	}
 	for _, entry := range s.cfg.TrustedProxies {
@@ -851,7 +872,43 @@ func (s *Server) trustedProxy(r *http.Request) bool {
 	return false
 }
 
+// forwardedClient returns the client address a trusted proxy reported, or the
+// empty string when there is nothing usable to report - the peer is not a
+// trusted proxy, or the header holds no address. Any direct client can assert
+// this header, so it is read only from a peer the operator named.
+//
+// The chain is read from the right. Each hop appends the address it received
+// the connection from, so the rightmost entry that is not itself a trusted
+// proxy is the closest hop the proxy can vouch for; everything to its left was
+// supplied by whoever connected to that hop.
+func (s *Server) forwardedClient(r *http.Request) string {
+	if !s.trustedProxy(r) {
+		return ""
+	}
+	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for index := len(parts) - 1; index >= 0; index-- {
+		candidate := strings.TrimSpace(parts[index])
+		ip := net.ParseIP(candidate)
+		if ip == nil || s.isTrustedProxyAddress(ip) {
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+// loginClient is the key login attempts are counted against.
+//
+// Behind a reverse proxy every request arrives from the proxy, so counting by
+// peer address put every client in one bucket: five wrong passwords from
+// anywhere locked the operator out of their own instance, and the lock renews
+// for as long as the attempts continue, so it could be held indefinitely by
+// someone who never had credentials. A trusted proxy is the only peer whose
+// forwarded address means anything, and it is used only then.
 func (s *Server) loginClient(r *http.Request) string {
+	if forwarded := s.forwardedClient(r); forwarded != "" {
+		return forwarded
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && host != "" {
 		return host
@@ -932,6 +989,16 @@ func methodNotAllowed(w http.ResponseWriter, methods string) {
 }
 
 func (s *Server) app(w http.ResponseWriter, r *http.Request) {
+	// Anything under /api/ that reached this handler is a path no route
+	// claimed - a typo, a renamed endpoint, a probe. Answering it with the
+	// single-page app means a 200 and an HTML body, and the client parses that
+	// as a successful empty response: the caller gets {} and no error, so a
+	// misspelled route is indistinguishable from an endpoint that returned
+	// nothing. A JSON 404 is the only answer the caller can act on.
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "接口不存在"})
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		methodNotAllowed(w, "GET, HEAD")
 		return

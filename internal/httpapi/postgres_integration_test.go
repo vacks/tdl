@@ -35,8 +35,12 @@ func TestPostgresHTTPAuthenticationAndTaskList(t *testing.T) {
 	t.Cleanup(server.Stop)
 
 	body, _ := json.Marshal(map[string]string{"username": "admin", "password": "test-password"})
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(body))
+	// The web client marks every state-changing request as its own; the server
+	// requires it (or a same-origin Origin) on login as well as everywhere else.
+	loginRequest.Header.Set("X-Requested-With", "TDL-Web")
 	login := httptest.NewRecorder()
-	server.ServeHTTP(login, httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(body)))
+	server.ServeHTTP(login, loginRequest)
 	if login.Code != http.StatusOK || len(login.Result().Cookies()) != 1 {
 		t.Fatalf("login status=%d cookies=%d", login.Code, len(login.Result().Cookies()))
 	}

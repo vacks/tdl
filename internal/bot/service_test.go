@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vacks/tdl/internal/download"
+	"github.com/vacks/tdl/internal/monitor"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
@@ -520,4 +521,43 @@ func TestRefreshSkipsTheReadForACardThatIsNotDue(t *testing.T) {
 	if len(s.tracked) != 0 {
 		t.Fatal("a card past its interval was not read, so the check above proves nothing")
 	}
+}
+
+// Stop has to end the service's goroutines, not just ask them to. The server
+// stops its services in order and the download manager closes the database
+// immediately after, so anything still running here goes on to query a closed
+// database - and the event loop in particular only ends when its subscription
+// is released, which is why the unsubscribe function is kept rather than
+// dropped.
+//
+// The assertion is on the time, because that is what distinguishes "every
+// goroutine exited" from "the wait gave up": a service that fails to end one of
+// them takes the whole bounded timeout.
+func TestStopEndsTheServicesGoroutines(t *testing.T) {
+	databaseURL := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	root := t.TempDir()
+	store, err := settings.Open(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := telegram.Open(filepath.Join(root, "telegram"), func() string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloads, err := download.Open(filepath.Join(root, "data"), filepath.Join(root, "downloads"), databaseURL, store, accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(downloads.Stop)
+	service := New(store, downloads, accounts, monitor.New(filepath.Join(root, "downloads")), filepath.Join(root, "data"))
+	started := time.Now()
+	service.Stop()
+	if elapsed := time.Since(started); elapsed >= botStopTimeout {
+		t.Fatalf("Stop took %s, which is the timeout: at least one goroutine did not end", elapsed)
+	}
+	// Shutdown paths overlap - a signal, a deferred call, a test cleanup.
+	service.Stop()
 }
