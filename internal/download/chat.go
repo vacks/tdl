@@ -14,6 +14,7 @@ import (
 	"time"
 
 	gotd "github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	upstreamDL "github.com/iyear/tdl/app/dl"
 	"github.com/iyear/tdl/core/storage"
@@ -354,8 +355,14 @@ func decodeChatCursor(cursor string) (string, string, error) {
 
 type storedChatTarget struct {
 	ChatJob
-	direct     directPeer
-	configJSON string
+	direct directPeer
+	// discussion is the channel's linked discussion group: the dialog a comment
+	// update arrives from, and the only dialog besides this task's own that the
+	// listener admits. discussionKey is empty until the link has been learned,
+	// either from a post's resolved thread or from one linked-chat lookup.
+	discussion    directPeer
+	discussionKey string
+	configJSON    string
 }
 
 // chatListener records the network configuration used to establish one
@@ -404,7 +411,7 @@ func (m *Manager) cancelChatExecutions(id string) {
 func (m *Manager) chatTarget(id string) (storedChatTarget, error) {
 	var target storedChatTarget
 	var listen int
-	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, listen_new, status, scan_state, error, created_at, updated_at, direct_peer_type, direct_peer_id, direct_peer_hash, config_json FROM chat_download_jobs WHERE id = ?`, id).Scan(&target.ID, &target.SourceURL, &target.DialogType, &target.DialogKey, &target.DialogID, &target.DialogName, &target.AccountID, &target.StartMessageID, &target.UpperMessageID, &listen, &target.Status, &target.ScanState, &target.Error, &target.CreatedAt, &target.UpdatedAt, &target.direct.kind, &target.direct.id, &target.direct.hash, &target.configJSON)
+	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, upper_message_id, listen_new, status, scan_state, error, created_at, updated_at, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, discussion_dialog_key, discussion_peer_type, discussion_peer_id, discussion_peer_hash FROM chat_download_jobs WHERE id = ?`, id).Scan(&target.ID, &target.SourceURL, &target.DialogType, &target.DialogKey, &target.DialogID, &target.DialogName, &target.AccountID, &target.StartMessageID, &target.UpperMessageID, &listen, &target.Status, &target.ScanState, &target.Error, &target.CreatedAt, &target.UpdatedAt, &target.direct.kind, &target.direct.id, &target.direct.hash, &target.configJSON, &target.discussionKey, &target.discussion.kind, &target.discussion.id, &target.discussion.hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storedChatTarget{}, errors.New("会话下载任务不存在")
 	}
@@ -1372,6 +1379,60 @@ func (m *Manager) publishChatItem(chatID, path string, item source, config setti
 	return m.setChatItem(chatID, item, "completed", finalPath, "")
 }
 
+// watchedDialogKeys returns the accounts that need an update connection and, per
+// account, the dialogs whose messages may be admitted.
+//
+// Exactly two kinds of dialog are watched:
+//
+//   - the listened dialog itself, whose new posts and in-group replies the user
+//     asked for;
+//   - the channel's linked discussion group, which is where its comments
+//     actually arrive - the update carries the group as its peer, not the
+//     channel.
+//
+// The group cannot be derived at admission time without a request, so it is
+// recorded on the task by whichever path resolved it (see
+// rememberDiscussionLink) and read back here.
+//
+// This used to also carry an account-level flag meaning "this account has some
+// channel listener", which admitted every reply-shaped message in every group the
+// account had joined. That is a guess about a message that cannot be validated
+// without a request, and its cost was measured: a single enable queued 24 events
+// from seven unrelated dialogs in three minutes, each one a Telegram lookup that
+// was then retried five times.
+//
+// It is a separate function because the keys can then be tested without a
+// listener connection, a Telegram account or a proxy setting.
+func (m *Manager) watchedDialogKeys() (wanted map[string]struct{}, watched map[string]map[string]struct{}, err error) {
+	rows, err := m.db.Query(`SELECT account_id, dialog_key, discussion_dialog_key FROM chat_download_jobs WHERE listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	wanted = make(map[string]struct{})
+	watched = make(map[string]map[string]struct{})
+	for rows.Next() {
+		var accountID, dialogKey, discussionKey string
+		if rows.Scan(&accountID, &dialogKey, &discussionKey) != nil || accountID == "" {
+			continue
+		}
+		for _, key := range []string{dialogKey, discussionKey} {
+			if key == "" {
+				continue
+			}
+			if watched[accountID] == nil {
+				watched[accountID] = make(map[string]struct{})
+			}
+			wanted[accountID] = struct{}{}
+			watched[accountID][key] = struct{}{}
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, nil, rowsErr
+	}
+	return wanted, watched, nil
+}
+
 func (m *Manager) reconcileChatListeners() {
 	const listenerSafetyRefresh = 5 * time.Minute
 	now := time.Now()
@@ -1383,46 +1444,14 @@ func (m *Manager) reconcileChatListeners() {
 	// this slightly older snapshot is promptly replaced instead of losing the
 	// wake-up.
 	m.listenerDirty.Store(false)
-	rows, err := m.db.Query(`SELECT account_id, dialog_key FROM chat_download_jobs WHERE listen_new = 1 AND scan_state = ? AND status IN (?, ?)
-UNION
-SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE j.listen_new = 1 AND j.scan_state = ? AND j.status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	wanted, watched, err := m.watchedDialogKeys()
 	if err != nil {
 		m.listenerDirty.Store(true)
 		return
 	}
-	defer rows.Close()
-	wanted := make(map[string]struct{})
-	watched := make(map[string]map[string]struct{})
-	potential := make(map[string]bool)
-	for rows.Next() {
-		var accountID, dialogKey string
-		if rows.Scan(&accountID, &dialogKey) == nil && accountID != "" && dialogKey != "" {
-			wanted[accountID] = struct{}{}
-			if watched[accountID] == nil {
-				watched[accountID] = make(map[string]struct{})
-			}
-			watched[accountID][dialogKey] = struct{}{}
-		}
-	}
-	// Keep the inexpensive account flag separate from the UNION above: only an
-	// original listened channel can receive a first, as-yet-unmapped reply.
-	rows2, err := m.db.Query(`SELECT DISTINCT account_id FROM chat_download_jobs WHERE dialog_type = 'channel' AND listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
-	if err != nil {
-		m.listenerDirty.Store(true)
-		return
-	}
-	for rows2.Next() {
-		var accountID string
-		if rows2.Scan(&accountID) == nil && accountID != "" {
-			potential[accountID] = true
-		}
-	}
-	_ = rows2.Close()
 	proxyURL := m.settings.ProxyURL()
 	m.mu.Lock()
 	m.chatWatched = watched
-	m.potentialDiscussion = potential
-	m.listenerSnapshotReady = true
 	for accountID := range wanted {
 		if current, exists := m.chatListeners[accountID]; exists && current.proxy == proxyURL {
 			continue
@@ -1455,12 +1484,30 @@ SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_d
 	for accountID := range wanted {
 		go m.reconcileListenerGaps(accountID)
 	}
+	// A listening task that has no linked group yet is a task whose comments
+	// cannot be admitted. State changes reach the link worker through
+	// markChatListenerDirty, but a task can also change outside this process
+	// (an operator correcting a row, a restored database), so the snapshot
+	// rebuild - which already reads the task table - is the backstop.
+	select {
+	case m.chatLinkWake <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Manager) markChatListenerDirty() {
 	m.listenerDirty.Store(true)
 	select {
 	case m.chatWake <- struct{}{}:
+	default:
+	}
+	// A state change that starts a listener is also the moment a task may need
+	// its linked discussion group learned: a channel whose history held no
+	// comments at all teaches the link to nothing, and the listener would then
+	// run without it until the next slow probe. Waking the worker here keeps
+	// that window to one query instead of a quarter of an hour.
+	select {
+	case m.chatLinkWake <- struct{}{}:
 	default:
 	}
 }
@@ -1479,6 +1526,286 @@ func (m *Manager) addChatWatched(accountID, dialogKey string) {
 	}
 	m.chatWatched[accountID][dialogKey] = struct{}{}
 	m.mu.Unlock()
+}
+
+// rememberDiscussionLink records which discussion group belongs to a listening
+// task and adds it to the in-memory watch set in the same breath.
+//
+// Persisting the link is what makes admission exact. A comment on a channel
+// post arrives in the channel's linked discussion group, so the group - not the
+// channel - is the peer the update carries; without this record the task cannot
+// tell its own comments from the chatter of every other group the account has
+// joined, and the account-wide guess that used to bridge that gap queued 24
+// unrelated events and roughly 120 doomed Telegram requests in three minutes on
+// a single enable.
+//
+// Updating chatWatched here is not an optimisation. The in-memory set is
+// rebuilt by the periodic snapshot, so between learning a link and that rebuild
+// - minutes on a quiet account - every comment would be filtered out at
+// admission, and the dispatcher's acknowledgement means Telegram never
+// redelivers it.
+func (m *Manager) rememberDiscussionLink(chatJobID, accountID, dialogKey string, peer tg.InputPeerClass) error {
+	if chatJobID == "" || accountID == "" || dialogKey == "" {
+		return nil
+	}
+	direct := makeDirectPeer(peer)
+	var err error
+	if direct.kind == "" {
+		// The group is known but its peer reference is not. Admission only needs
+		// the key; the peer is what entity-less update recovery uses, and it is
+		// filled in by whichever path resolves it first.
+		_, err = m.db.Exec(`UPDATE chat_download_jobs SET discussion_dialog_key = ? WHERE id = ? AND discussion_dialog_key IS DISTINCT FROM ?`, dialogKey, chatJobID, dialogKey)
+	} else {
+		// Guarded so a link relearned on every new post writes nothing once it is
+		// already stored: an unguarded update would leave a dead row version and a
+		// new index entry per post on a busy channel.
+		_, err = m.db.Exec(`UPDATE chat_download_jobs SET discussion_dialog_key = ?, discussion_peer_type = ?, discussion_peer_id = ?, discussion_peer_hash = ? WHERE id = ? AND (discussion_dialog_key IS DISTINCT FROM ? OR discussion_peer_type IS DISTINCT FROM ? OR discussion_peer_hash IS DISTINCT FROM ?)`,
+			dialogKey, direct.kind, direct.id, direct.hash, chatJobID, dialogKey, direct.kind, direct.hash)
+	}
+	if err != nil {
+		return err
+	}
+	m.addChatWatched(accountID, dialogKey)
+	return nil
+}
+
+// chatDiscussionProbeInterval is how often the worker looks for listening tasks
+// whose linked discussion group is unknown or whose last answer has gone stale.
+// It is slow on purpose: the answer changes only when an administrator relinks
+// a group, and a task that has just started listening is woken explicitly.
+const chatDiscussionProbeInterval = 15 * time.Minute
+
+// chatDiscussionRelinkInterval is how long an answer is trusted. A channel that
+// had no comments when it was probed, or none when it was probed as linked, is
+// asked again only after this, so a relinked group is picked up on a quiet
+// channel too - at one Telegram lookup per task per interval, never per message.
+const chatDiscussionRelinkInterval = 24 * time.Hour
+
+// chatDiscussionProbeTimeout bounds the one probe that runs inside the request
+// enabling listening. The background pass is not bounded: it delays only the
+// next task it would probe.
+const chatDiscussionProbeTimeout = 30 * time.Second
+
+// recordDiscussionProbe stores the outcome of one linked-chat lookup: the group
+// it found, if any, and the time it was asked. The timestamp is what keeps the
+// periodic pass from asking the same question on every run, so it is written
+// unconditionally - including when the answer was "no linked group" and when
+// the group is the one already recorded.
+func (m *Manager) recordDiscussionProbe(chatJobID, accountID, dialogKey string, peer tg.InputPeerClass) error {
+	if dialogKey != "" {
+		if err := m.rememberDiscussionLink(chatJobID, accountID, dialogKey, peer); err != nil {
+			return err
+		}
+	}
+	if chatJobID == "" {
+		return nil
+	}
+	_, err := m.db.Exec(`UPDATE chat_download_jobs SET discussion_probed_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339Nano), chatJobID)
+	return err
+}
+
+// probeChatDiscussionLink resolves one task's linked discussion group now rather
+// than at the next periodic pass.
+//
+// It runs when listening is enabled, before the listener connection is allowed
+// to start. Until the group is recorded, a comment arriving from it is filtered
+// out at admission, and the dispatcher acknowledges the update to Telegram, so
+// it is never redelivered. The remaining hole is a second task enabled on an
+// account whose connection is already up: a comment landing inside this one
+// request is still lost, which is why the probe is synchronous rather than
+// queued.
+func (m *Manager) probeChatDiscussionLink(id string) {
+	target, err := m.chatTarget(id)
+	if err != nil {
+		return
+	}
+	if !targetIncludesReplies(target) {
+		return
+	}
+	if target.discussionKey != "" {
+		// Already known, and the group is re-confirmed by every new post's
+		// resolution and by the periodic pass.
+		return
+	}
+	// Bounded because this one runs inside the request that enables listening: a
+	// rate-limited or unreachable account must not hold the caller open. A
+	// timeout is not recorded as an answer, so the worker retries it.
+	ctx, cancel := context.WithTimeout(context.Background(), chatDiscussionProbeTimeout)
+	defer cancel()
+	answered, dialogKey, peer, err := m.resolveChatDiscussionLink(ctx, target)
+	if err != nil {
+		applog.Error("chat_download", "discussion_link_probe_failed", "chat_job_id", id, "dialog_key", target.DialogKey, "error", err.Error())
+		return
+	}
+	if !answered {
+		return
+	}
+	if err := m.recordDiscussionProbe(id, target.AccountID, dialogKey, peer); err != nil {
+		applog.Error("chat_download", "discussion_link_probe_record_failed", "chat_job_id", id, "error", err.Error())
+	}
+}
+
+// chatDiscussionLinkWorker learns the linked discussion group of listening tasks
+// that do not know it, and re-confirms the ones that do.
+//
+// It deliberately does not ride chatWorker: that goroutine is single threaded,
+// and scanOneChat records what a long Telegram call there costs - state
+// refresh, claim reconciliation and listener upkeep all stop for its duration.
+// Nor can it ride the listener snapshot, which is built under m.mu and only
+// reads. The work is bounded by the number of listening tasks rather than by the
+// number of messages, so a goroutine with a slow timer and a wake-up is enough.
+func (m *Manager) chatDiscussionLinkWorker() {
+	for {
+		// Startup starts these goroutines before the database health probe has
+		// run, so the first pass can find the database unavailable. Waiting the
+		// full probe interval there would leave every listening task - and every
+		// comment arriving in the meantime - without a link for a quarter of an
+		// hour.
+		if !m.DatabaseAvailable() {
+			if !m.waitChatEvent(5 * time.Second) {
+				return
+			}
+			continue
+		}
+		if err := m.refreshChatDiscussionLinks(); err != nil {
+			applog.Error("chat_download", "discussion_link_refresh_failed", "error", err.Error())
+		}
+		select {
+		case <-m.stopCh:
+			return
+		case <-m.chatLinkWake:
+		case <-time.After(chatDiscussionProbeInterval):
+		}
+	}
+}
+
+// refreshChatDiscussionLinks probes every reply-enabled listening task whose
+// linked discussion group is unknown or whose last answer has gone stale.
+func (m *Manager) refreshChatDiscussionLinks() error {
+	if !m.DatabaseAvailable() {
+		return nil
+	}
+	// Task scale, not history scale: one row per listening task. The
+	// configuration snapshot is JSON, so the reply check stays in Go.
+	rows, err := m.db.Query(`SELECT id, account_id, dialog_type, dialog_key, dialog_name, start_message_id, direct_peer_type, direct_peer_id, direct_peer_hash, config_json, discussion_probed_at FROM chat_download_jobs WHERE listen_new = 1 AND scan_state = ? AND status IN (?, ?)`, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	if err != nil {
+		return err
+	}
+	targets := make([]storedChatTarget, 0, 4)
+	probedAt := make(map[string]string)
+	for rows.Next() {
+		var target storedChatTarget
+		var timestamp string
+		if err := rows.Scan(&target.ID, &target.AccountID, &target.DialogType, &target.DialogKey, &target.DialogName, &target.StartMessageID, &target.direct.kind, &target.direct.id, &target.direct.hash, &target.configJSON, &timestamp); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		targets = append(targets, target)
+		probedAt[target.ID] = timestamp
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, target := range targets {
+		if !targetIncludesReplies(target) {
+			continue
+		}
+		// An unparseable timestamp is treated as stale: asking once more is
+		// cheaper than never asking again after a hand-written value.
+		if at, parseErr := time.Parse(time.RFC3339Nano, probedAt[target.ID]); parseErr == nil && now.Sub(at) < chatDiscussionRelinkInterval {
+			continue
+		}
+		answered, dialogKey, peer, probeErr := m.resolveChatDiscussionLink(context.Background(), target)
+		if probeErr != nil {
+			applog.Error("chat_download", "discussion_link_probe_failed", "chat_job_id", target.ID, "dialog_key", target.DialogKey, "error", probeErr.Error())
+			// A failure must not look like an answer, or the retry would wait a
+			// whole interval and a transient error would read as "no discussion
+			// group" in the task row.
+			continue
+		}
+		if !answered {
+			continue
+		}
+		if err := m.recordDiscussionProbe(target.ID, target.AccountID, dialogKey, peer); err != nil {
+			applog.Error("chat_download", "discussion_link_probe_record_failed", "chat_job_id", target.ID, "error", err.Error())
+		}
+	}
+	return nil
+}
+
+// resolveChatDiscussionLink asks Telegram which discussion group is linked to a
+// listening channel.
+//
+// It is the one path that can learn the link with nothing else to learn it from:
+// a channel whose history holds no comments at all, and a task whose listening
+// was enabled after its history was indexed, have no resolved post to take it
+// from.
+//
+// answered reports whether Telegram was asked and replied. key is empty when the
+// answer was "no linked discussion group", which is not an error and must be
+// recorded so the question is not asked again immediately.
+func (m *Manager) resolveChatDiscussionLink(ctx context.Context, target storedChatTarget) (answered bool, key string, peer tg.InputPeerClass, err error) {
+	// Only a broadcast channel can have a linked discussion group: a supergroup
+	// has none, Saved Messages has none, and a linked group has no linked group
+	// of its own. dialog_type is the refined kind, so this costs nothing to ask.
+	if target.DialogType != "channel" || target.direct.kind != "channel" {
+		return true, "", nil, nil
+	}
+	channel, ok := target.inputPeer().(*tg.InputPeerChannel)
+	if !ok {
+		return true, "", nil, nil
+	}
+	runErr := m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
+		if rpcErr := m.awaitTelegramRPC(ctx, target.AccountID); rpcErr != nil {
+			return rpcErr
+		}
+		result, rpcErr := client.API().ChannelsGetFullChannel(ctx, &tg.InputChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash})
+		if rpcErr != nil {
+			m.recordTelegramRPCError(target.AccountID, rpcErr)
+			return rpcErr
+		}
+		answered = true
+		channelFull, ok := result.FullChat.(*tg.ChannelFull)
+		if !ok {
+			return nil
+		}
+		linkedID, ok := channelFull.GetLinkedChatID()
+		if !ok || linkedID <= 0 {
+			return nil
+		}
+		// The dialog key a comment update carries is derived from the peer, so
+		// the group is recorded under the same convention as everything else
+		// (see dialogIdentity); a linked group is always an InputPeerChannel.
+		key = fmt.Sprintf("channel:%d", linkedID)
+		// The group's own entity usually travels in the same response. When it
+		// does not, resolve it through the peer cache so the record carries a
+		// usable reference for entity-less update recovery instead of only a key.
+		for _, raw := range result.Chats {
+			group, isChannel := raw.(*tg.Channel)
+			if !isChannel || group.ID != linkedID {
+				continue
+			}
+			peer = &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
+			return nil
+		}
+		resolved, resolveErr := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API()).ResolvePeer(ctx, &tg.PeerChannel{ChannelID: linkedID})
+		if resolveErr != nil {
+			// The key is known even though the peer is not; the next pass records
+			// it with the peer and this request is not repeated per message.
+			return resolveErr
+		}
+		peer = resolved.InputPeer()
+		return nil
+	})
+	if runErr != nil {
+		return answered, "", nil, runErr
+	}
+	return true, key, peer, nil
 }
 
 func (m *Manager) runChatListener(ctx context.Context, accountID string, listener *chatListener) {
@@ -1811,7 +2138,14 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 					_ = originRows.Close()
 					return persistErr
 				}
-				m.addChatWatched(event.AccountID, dialogKey)
+				// The group this comment arrived from now belongs to this task.
+				// Recording it on the task row is what admission reads; the
+				// in-memory watch set is updated by the same call, so the next
+				// comment in this group is not filtered out while the snapshot is
+				// still stale.
+				if linkErr := m.rememberDiscussionLink(id, event.AccountID, dialogKey, event.InputPeer); linkErr != nil {
+					applog.Error("chat_download", "discussion_link_persist_failed", "chat_job_id", id, "dialog_key", dialogKey, "error", linkErr.Error())
+				}
 			}
 			if originErr := originRows.Err(); originErr != nil {
 				_ = originRows.Close()
@@ -1857,7 +2191,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			// A listener learns the discussion root of a newly received post
 			// even when it has no comments yet, so the first comment can be
 			// attributed without a second lookup.
-			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies, true)
+			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies, true, id)
 		}
 		if resolveErr := resolvedErr[includeReplies]; resolveErr != nil {
 			applog.Info("chat_download", "new_message_not_downloadable", "account_id", event.AccountID, "message_id", event.MessageID, "error", resolveErr.Error())
@@ -2210,7 +2544,7 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 				}
 			}
 			originID := firstMessageID(members, message.ID)
-			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.inputPeer(), target.DialogName, members, message.ID, originID, false)
+			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.inputPeer(), target.DialogName, members, message.ID, originID, false, target.ID)
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					// A rate-limited reply lookup must retry this durable history
@@ -2629,50 +2963,73 @@ func (m *Manager) CancelChat(id string) error {
 // SetChatListening changes only whether new messages are accepted after the
 // historical range has been indexed. Enabling it never scans history again.
 func (m *Manager) SetChatListening(id string, enabled bool) error {
-	lock := m.chatLock(id)
-	lock.Lock()
-	defer lock.Unlock()
-	target, err := m.chatTarget(id)
+	changed, err := m.setChatListening(id, enabled)
 	if err != nil {
 		return err
 	}
-	if target.ScanState != chatScanCompleted {
-		return errors.New("历史下载尚未完成索引，暂时不能修改消息监听")
+	if !changed {
+		return nil
 	}
 	if enabled {
-		if target.ListenNew {
-			return nil
-		}
-		if target.Status != ChatStatusCompleted && target.Status != ChatStatusPartial && target.Status != ChatStatusFailed {
-			return errors.New("当前会话任务不能开启消息监听")
-		}
-		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 1, status = ?, error = '', updated_at = ? WHERE id = ?`, ChatStatusListening, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-	} else {
-		if !target.ListenNew {
-			return nil
-		}
-		next := target.Status
-		if target.Status == ChatStatusListening {
-			var failed int
-			if err := m.db.QueryRow(`SELECT COALESCE(failed, 0) FROM chat_download_stats WHERE chat_job_id = ?`, id).Scan(&failed); err != nil {
-				return err
-			}
-			if failed > 0 {
-				next = ChatStatusPartial
-			} else {
-				next = ChatStatusCompleted
-			}
-		}
-		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 0, status = ?, error = '', updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
+		// Learn which discussion group this channel's comments arrive in before
+		// the listener connection is allowed to start. Until it is recorded, a
+		// comment from that group is filtered out at admission, and the
+		// dispatcher acknowledges the update to Telegram, so it is never
+		// redelivered. The probe is a Telegram request, so it runs outside the
+		// task lock this function's state change took.
+		m.probeChatDiscussionLink(id)
 	}
 	m.touch()
 	m.markChatListenerDirty()
 	m.signalChat()
 	return nil
+}
+
+// setChatListening applies the state change under the task lock and reports
+// whether it changed anything, so a no-op request does not rebuild the listener
+// snapshot or wake the workers.
+func (m *Manager) setChatListening(id string, enabled bool) (bool, error) {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	target, err := m.chatTarget(id)
+	if err != nil {
+		return false, err
+	}
+	if target.ScanState != chatScanCompleted {
+		return false, errors.New("历史下载尚未完成索引，暂时不能修改消息监听")
+	}
+	if enabled {
+		if target.ListenNew {
+			return false, nil
+		}
+		if target.Status != ChatStatusCompleted && target.Status != ChatStatusPartial && target.Status != ChatStatusFailed {
+			return false, errors.New("当前会话任务不能开启消息监听")
+		}
+		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 1, status = ?, error = '', updated_at = ? WHERE id = ?`, ChatStatusListening, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if !target.ListenNew {
+		return false, nil
+	}
+	next := target.Status
+	if target.Status == ChatStatusListening {
+		var failed int
+		if err := m.db.QueryRow(`SELECT COALESCE(failed, 0) FROM chat_download_stats WHERE chat_job_id = ?`, id).Scan(&failed); err != nil {
+			return false, err
+		}
+		if failed > 0 {
+			next = ChatStatusPartial
+		} else {
+			next = ChatStatusCompleted
+		}
+	}
+	if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 0, status = ?, error = '', updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // transitionChatItems makes a chat parent and its indexed media change state

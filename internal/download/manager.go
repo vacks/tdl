@@ -307,14 +307,13 @@ type Manager struct {
 	chatEventWake    chan struct{}
 	chatListeners    map[string]*chatListener
 	chatWatched      map[string]map[string]struct{}
-	// potentialDiscussion is an account-level fast path for first replies to
-	// historical channel posts. It is derived together with chatWatched, so an
-	// unrelated discussion update never needs a database query.
-	potentialDiscussion   map[string]bool
-	listenerSnapshotReady bool
-	listenerDirty         atomic.Bool
-	listenerSnapshotAt    atomic.Int64
-	slotWake              chan struct{}
+	// chatLinkWake asks the discussion-link worker to probe now: a task whose
+	// listener is about to start must learn its linked group before the first
+	// comment can arrive, because a filtered update is never redelivered.
+	chatLinkWake       chan struct{}
+	listenerDirty      atomic.Bool
+	listenerSnapshotAt atomic.Int64
+	slotWake           chan struct{}
 	// reconcileWake is deliberately separate from wake. The claim reconciler is
 	// an additional consumer of its own signal, and sharing wake would let it
 	// take the token a download worker needs, delaying a newly queued task by a
@@ -375,7 +374,7 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 	for i := range chatDownloadWake {
 		chatDownloadWake[i] = make(chan struct{}, 1)
 	}
-	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatDownloadWake: chatDownloadWake, chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), potentialDiscussion: make(map[string]bool), slotWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1), stopCh: make(chan struct{}), inboxRetry: make(chan inboxRetry, inboxRetryQueueSize), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
+	m := &Manager{db: db, downloadDir: downloadDir, settings: store, accounts: accounts, cancels: make(map[string]context.CancelFunc), chatCancels: make(map[string]map[uint64]context.CancelFunc), chatActive: make(map[string]struct{}), wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1), chatDownloadWake: chatDownloadWake, chatEventWake: make(chan struct{}, 1), chatListeners: make(map[string]*chatListener), chatWatched: make(map[string]map[string]struct{}), chatLinkWake: make(chan struct{}, 1), slotWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1), stopCh: make(chan struct{}), inboxRetry: make(chan inboxRetry, inboxRetryQueueSize), rpcState: make(map[string]*telegramRPCState), progress: newProgressStore(), events: newEventBus()}
 	// The first worker pass constructs the listener snapshot before accepting
 	// updates. Subsequent rebuilds are only needed after state changes.
 	m.listenerDirty.Store(true)
@@ -437,6 +436,11 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 		go m.worker()
 	}
 	go m.chatWorker()
+	// Learning a listening channel's linked discussion group is a Telegram
+	// request, so it runs here and not on the chat worker: that goroutine is
+	// single threaded and a long call in it stops state refresh, claim
+	// reconciliation and listener upkeep for its duration.
+	go m.chatDiscussionLinkWorker()
 	for worker := 0; worker < chatDownloadWorkerCount; worker++ {
 		go m.chatDownloadWorker(m.chatDownloadWake[worker])
 	}
@@ -2543,7 +2547,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 		result = setOrigin(result, peer.VisibleName(), originID, false)
 		result = setSourcePeer(result, peer.InputPeer())
 		if m.settings.Get().Download.IncludeReplies {
-			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID, false)
+			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID, false, "")
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					return relatedErr
@@ -2559,7 +2563,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 }
 
 func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string) ([]source, error) {
-	return m.resolvePeerWithReplies(ctx, accountID, inputPeer, dialogID, messageID, dialogName, m.settings.Get().Download.IncludeReplies, false)
+	return m.resolvePeerWithReplies(ctx, accountID, inputPeer, dialogID, messageID, dialogName, m.settings.Get().Download.IncludeReplies, false, "")
 }
 
 // resolvePeerWithReplies is the shared listener/reaction resolver. Chat
@@ -2568,7 +2572,11 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 //
 // learnRoot is set only by the listener path, which resolves a new post even
 // with an empty comment section in order to record its discussion root.
-func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool) ([]source, error) {
+//
+// chatJobID is the session task a resolved discussion group should be recorded
+// on, or empty for a plain message task that has no session task to record it
+// on. See relatedSources.
+func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool, chatJobID string) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
 		if err := m.awaitTelegramRPC(ctx, accountID); err != nil {
@@ -2597,7 +2605,9 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		// Direct peers originate from reactions and listener updates. Resolve them
 		// once here so a supergroup does not inherit the generic channel label.
 		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+		var resolved peers.Peer
 		if peer, resolveErr := manager.FromInputPeer(ctx, inputPeer); resolveErr == nil {
+			resolved = peer
 			dialogType, dialogKey, resolvedDialogID = dialogIdentityForPeer(peer, accountID)
 			// An event queued before its name could be resolved carries an empty
 			// name. Fill it from the authoritative peer here so the name is
@@ -2620,7 +2630,7 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		result = setOrigin(result, dialogName, originID, false)
 		result = setSourcePeer(result, inputPeer)
 		if includeReplies {
-			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID, learnRoot)
+			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID, eagerDiscussionRoot(learnRoot, broadcastOf(resolved)), chatJobID)
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					return relatedErr

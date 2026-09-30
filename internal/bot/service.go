@@ -1761,8 +1761,12 @@ func (s *Service) statusText() string {
 		// An event that stopped being retried is a download the user asked for
 		// and did not get, so it is reported next to the download counts rather
 		// than only appearing in the service log.
-		if pending, stopped, err := s.downloads.ListenerInboxCounts(); err == nil {
-			counts += fmt.Sprintf("\n监听事件：%d 处理中", pending)
+		// Work in progress and work waiting to be retried are reported apart: an
+		// event that failed and is backing off can sit for an hour between
+		// attempts, and counting it as "处理中" hid a stuck event behind what
+		// looked like activity.
+		if processing, waiting, stopped, err := s.downloads.ListenerInboxCounts(); err == nil {
+			counts += fmt.Sprintf("\n监听事件：%d 处理中 · %d 等待重试", processing, waiting)
 			if stopped > 0 {
 				counts += fmt.Sprintf(" · %d 已停止重试", stopped)
 			}

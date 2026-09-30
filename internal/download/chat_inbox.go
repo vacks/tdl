@@ -3,9 +3,11 @@ package download
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/telegram"
 )
@@ -64,17 +66,23 @@ func (m *Manager) admitChatMessage(event telegram.NewMessageEvent) error {
 	}
 	m.mu.Lock()
 	_, watched := m.chatWatched[event.AccountID][key]
-	potential := m.potentialDiscussion[event.AccountID]
-	snapshotReady := m.listenerSnapshotReady
 	m.mu.Unlock()
 	if !watched {
-		// The first reply under an old channel post has no stored discussion
-		// mapping yet, so its discussion group is not in chatWatched. Admit only
-		// reply-shaped channel events while this account has an eligible channel
-		// listener; the durable worker will then either map it or discard it.
-		if event.InputPeer == nil || (event.ReplyToTopID <= 0 && event.ReplyToMessageID <= 0) || !m.hasPotentialDiscussionListener(event.AccountID, potential, snapshotReady) {
-			return nil
-		}
+		// Only the dialogs a task is responsible for are admitted: the listened
+		// dialog itself, and the channel's linked discussion group, where its
+		// comments arrive. Everything else the account has joined is filtered
+		// here, in memory, with no database query and no request.
+		//
+		// This used to admit any reply-shaped message whenever the account had a
+		// channel listener at all, because the first comment of a thread whose
+		// discussion group was not yet mapped would otherwise be lost for good:
+		// the dispatcher acknowledges the update, so Telegram never redelivers
+		// it. That group is now recorded on the task before comments can arrive -
+		// resolved when listening is enabled, and by every post that is indexed
+		// or received - so the guess is gone. It was expensive: one enable
+		// queued 24 events from seven dialogs that had no task at all, each one
+		// a Telegram lookup retried five times.
+		return nil
 	}
 	if event.InputPeer == nil {
 		// The peer could not be resolved. That is a database failure rather than a
@@ -104,34 +112,24 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?) ON CONFLICT(account
 func (m *Manager) recoverChatEventPeer(accountID, dialogKey string) tg.InputPeerClass {
 	var kind string
 	var id, hash int64
-	err := m.db.QueryRow(`SELECT direct_peer_type, direct_peer_id, direct_peer_hash FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) ORDER BY updated_at DESC LIMIT 1`, accountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
+	// A discussion-group update carries the group's key, not its channel's, so
+	// the task that owns this dialog is the one whose linked group it is. The
+	// group's peer is stored beside that link for exactly this case: an update
+	// that omitted its entities still has to be attributed.
+	err := m.db.QueryRow(`SELECT discussion_peer_type, discussion_peer_id, discussion_peer_hash FROM chat_download_jobs WHERE account_id = ? AND discussion_dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) AND discussion_peer_type <> '' ORDER BY updated_at DESC LIMIT 1`, accountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
 	if err != nil {
-		// A discussion-group update has a different dialog key from its channel
-		// task. Its persisted root mapping contains the authoritative peer.
+		// A listened dialog itself has a task keyed on its own dialog key.
+		err = m.db.QueryRow(`SELECT direct_peer_type, direct_peer_id, direct_peer_hash FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) ORDER BY updated_at DESC LIMIT 1`, accountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
+	}
+	if err != nil {
+		// Threads mapped before the task learned its group carry the same peer,
+		// per root.
 		err = m.db.QueryRow(`SELECT r.discussion_peer_type, r.discussion_peer_id, r.discussion_peer_hash FROM chat_reply_roots r JOIN chat_download_jobs j ON j.id = r.chat_job_id WHERE r.account_id = ? AND r.discussion_dialog_key = ? AND j.listen_new = 1 AND j.scan_state = ? AND j.status IN (?, ?) AND r.discussion_peer_type <> '' ORDER BY j.updated_at DESC LIMIT 1`, accountID, dialogKey, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&kind, &id, &hash)
 	}
 	if err != nil {
 		return nil
 	}
 	return chatInboxPeer(kind, id, hash)
-}
-
-func (m *Manager) hasPotentialDiscussionListener(accountID string, potential, snapshotReady bool) bool {
-	// A positive snapshot is safe even while a newer rebuild is pending: it can
-	// only admit a reply for later durable validation. A negative snapshot is
-	// trusted only once it is current; otherwise fall back to the old query so a
-	// just-enabled listener can never lose its first reply.
-	if potential {
-		return true
-	}
-	if snapshotReady && !m.listenerDirty.Load() {
-		return false
-	}
-	var exists bool
-	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'channel' AND listen_new = 1 AND scan_state = ? AND status IN (?, ?))`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening).Scan(&exists); err != nil {
-		return false
-	}
-	return exists
 }
 
 func (m *Manager) claimChatMessageInbox(limit int) ([]chatMessageInboxEvent, error) {
@@ -240,18 +238,73 @@ func (m *Manager) completeChatMessageInbox(id int64) error {
 // is recovered, and one that can never succeed stops for good with its error
 // recorded and counted.
 func (m *Manager) retryChatMessageInbox(id int64, attempts int, cause error) error {
+	now := time.Now().UTC()
+	if permanentInboxError(cause) {
+		// Telegram rejected the request itself, so no later attempt can succeed.
+		// Spend the whole attempt budget at once: reviveExhaustedInboxEvents only
+		// offers rows below that limit, which is what keeps a rejected event from
+		// coming back every hour to spend another request and to keep showing up
+		// as waiting work.
+		if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'failed', attempts = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, inboxAttemptLimit, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
+			return err
+		}
+		applog.Error("chat_download", "new_message_event_rejected", "inbox_id", id, "attempts", attempts, "error", cause.Error())
+		return nil
+	}
 	status := "pending"
 	if attempts >= inboxFastAttempts {
 		status = "failed"
 	}
 	delay := time.Duration(1<<min(attempts, 6)) * time.Second
-	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), now.Add(delay).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
 		return err
 	}
 	if status == "failed" {
 		applog.Error("chat_download", "new_message_event_gave_up", "inbox_id", id, "attempts", attempts, "error", cause.Error())
 	}
 	return nil
+}
+
+// retryableTelegram400Types are the answers in Telegram's 400 family that are
+// about timing or a momentarily unusable peer rather than about the request
+// itself. Matched as substrings because the wait errors carry their argument in
+// the type (FLOOD_WAIT_42).
+var retryableTelegram400Types = []string{
+	"FLOOD_WAIT",    // the account is throttled; usually 420, listed for the variants
+	"SLOWMODE_WAIT", // the group's slow mode is on
+	"PEER_FLOOD",    // the account is flagged; the block is temporary
+	"MSG_WAIT_FAILED",
+	"HISTORY_GET_FAILED",
+	"RPC_CALL_FAIL",
+	"TIMEOUT",
+}
+
+// permanentInboxError reports whether Telegram rejected the request itself,
+// which no later attempt can change.
+//
+// A 400 is a statement about the request: the dialog is gone (CHANNEL_INVALID,
+// PEER_ID_INVALID), the message is gone (MSG_ID_INVALID), the account may not
+// reference it (CHAT_WRITE_FORBIDDEN). The retry budget exists for the other
+// class - a closed connection, a dialog that was briefly unreachable - and
+// spending it on a rejection buys nothing and costs requests. The incident that
+// motivated this: 24 events, every one rejected on its first attempt, each
+// retried five times and then revived hourly for a day.
+//
+// The allowlist is deliberately short. A 400 that is not in it stops on the
+// first attempt with its error recorded and visible, which is the same place a
+// fully retried event ends up, only sooner and without the requests.
+func permanentInboxError(err error) bool {
+	rpcErr, ok := tgerr.As(err)
+	if !ok || rpcErr.Code != 400 {
+		return false
+	}
+	upper := strings.ToUpper(rpcErr.Type)
+	for _, retryable := range retryableTelegram400Types {
+		if strings.Contains(upper, retryable) {
+			return false
+		}
+	}
+	return true
 }
 
 // inboxFastAttempts is when an event stops being retried every few seconds and
@@ -293,19 +346,28 @@ WHERE status = 'failed' AND attempts < ? AND updated_at::timestamptz < ?::timest
 	return nil
 }
 
-// ListenerInboxCounts reports how many listener events are queued and how many
-// have stopped being retried. They are shown where a person can see them,
-// because an event that gives up is a download request that will not happen.
-func (m *Manager) ListenerInboxCounts() (pending, stopped int, err error) {
+// ListenerInboxCounts reports how many listener events are being handled, how
+// many are waiting, and how many have stopped being retried. They are shown
+// where a person can see them, because an event that gives up is a download
+// request that will not happen.
+//
+// Waiting is counted apart from in-flight work. A pending row is one that is
+// queued or backing off, and after a failure an event can wait an hour at a
+// time, so folding the two together reported an event that was doing nothing as
+// work in progress - which is exactly how an event that can never succeed stayed
+// invisible in the count while it was being retried.
+func (m *Manager) ListenerInboxCounts() (processing, waiting, stopped int, err error) {
 	err = m.db.QueryRow(`SELECT
- (SELECT COUNT(1) FROM chat_message_inbox WHERE status IN ('pending', 'processing')) +
- (SELECT COUNT(1) FROM reaction_inbox WHERE status IN ('pending', 'processing')),
+ (SELECT COUNT(1) FROM chat_message_inbox WHERE status = 'processing') +
+ (SELECT COUNT(1) FROM reaction_inbox WHERE status = 'processing'),
+ (SELECT COUNT(1) FROM chat_message_inbox WHERE status = 'pending') +
+ (SELECT COUNT(1) FROM reaction_inbox WHERE status = 'pending'),
  (SELECT COUNT(1) FROM chat_message_inbox WHERE status = 'failed') +
- (SELECT COUNT(1) FROM reaction_inbox WHERE status = 'failed')`).Scan(&pending, &stopped)
+ (SELECT COUNT(1) FROM reaction_inbox WHERE status = 'failed')`).Scan(&processing, &waiting, &stopped)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return pending, stopped, nil
+	return processing, waiting, stopped, nil
 }
 
 // waitChatEvent pauses an inbox worker between attempts. It reports false when

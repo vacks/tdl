@@ -173,13 +173,25 @@ func (m *Manager) CompleteReactionInbox(id int64, jobID string) error {
 // have a redelivery path - a later reaction on the same message reopens it -
 // but that depends on the user reacting again, which is not something a lost
 // download should require.
+//
+// A rejection from Telegram is the exception to that rule, exactly as in the
+// message inbox: it cannot succeed on a later attempt, so it stops now and
+// spends the attempt budget at once instead of being revived every hour.
 func (m *Manager) RetryReactionInbox(id int64, attempts int, cause error) error {
+	now := time.Now().UTC()
+	if permanentInboxError(cause) {
+		if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'failed', attempts = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, inboxAttemptLimit, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
+			return err
+		}
+		applog.Error("reaction", "reaction_event_rejected", "inbox_id", id, "attempts", attempts, "error", cause.Error())
+		return nil
+	}
 	status := "pending"
 	if attempts >= inboxFastAttempts {
 		status = "failed"
 	}
 	delay := time.Duration(1<<min(attempts, 6)) * time.Second
-	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), now.Add(delay).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
 		return err
 	}
 	if status == "failed" {

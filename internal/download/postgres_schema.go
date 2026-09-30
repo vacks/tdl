@@ -43,7 +43,7 @@ func (m *Manager) migratePostgres() error {
  id BIGSERIAL PRIMARY KEY, account_id TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_name TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, message_id INTEGER NOT NULL, source_url TEXT NOT NULL DEFAULT '', peer_type TEXT NOT NULL, peer_id BIGINT NOT NULL DEFAULT 0, peer_hash BIGINT NOT NULL DEFAULT 0, emoji TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', job_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(account_id, dialog_key, message_id, emoji)
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_download_jobs (
- id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_id BIGINT NOT NULL, dialog_name TEXT NOT NULL, account_id TEXT NOT NULL, direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id BIGINT NOT NULL DEFAULT 0, direct_peer_hash BIGINT NOT NULL DEFAULT 0, start_message_id INTEGER NOT NULL DEFAULT 0, upper_message_id INTEGER NOT NULL DEFAULT 0, listen_new SMALLINT NOT NULL DEFAULT 0, status TEXT NOT NULL, scan_state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ id TEXT PRIMARY KEY, source_url TEXT NOT NULL, dialog_type TEXT NOT NULL, dialog_key TEXT NOT NULL, dialog_id BIGINT NOT NULL, dialog_name TEXT NOT NULL, account_id TEXT NOT NULL, direct_peer_type TEXT NOT NULL DEFAULT '', direct_peer_id BIGINT NOT NULL DEFAULT 0, direct_peer_hash BIGINT NOT NULL DEFAULT 0, discussion_dialog_key TEXT NOT NULL DEFAULT '', discussion_peer_type TEXT NOT NULL DEFAULT '', discussion_peer_id BIGINT NOT NULL DEFAULT 0, discussion_peer_hash BIGINT NOT NULL DEFAULT 0, discussion_probed_at TEXT NOT NULL DEFAULT '', start_message_id INTEGER NOT NULL DEFAULT 0, upper_message_id INTEGER NOT NULL DEFAULT 0, listen_new SMALLINT NOT NULL DEFAULT 0, status TEXT NOT NULL, scan_state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 )`,
 		`CREATE TABLE IF NOT EXISTS chat_download_items (
  chat_job_id TEXT NOT NULL, dialog_key TEXT NOT NULL, message_id INTEGER NOT NULL, child_job_id TEXT NOT NULL DEFAULT '', dialog_type TEXT NOT NULL DEFAULT '', dialog_id BIGINT NOT NULL DEFAULT 0, grouped_id BIGINT NOT NULL DEFAULT 0, message_text TEXT NOT NULL DEFAULT '', origin_dialog_name TEXT NOT NULL DEFAULT '', origin_message_id INTEGER NOT NULL DEFAULT 0, is_comment SMALLINT NOT NULL DEFAULT 0, source_peer_type TEXT NOT NULL DEFAULT '', source_peer_id BIGINT NOT NULL DEFAULT 0, source_peer_hash BIGINT NOT NULL DEFAULT 0, original_name TEXT NOT NULL DEFAULT '', size BIGINT NOT NULL DEFAULT 0, final_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '', elapsed_ms BIGINT NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'queued', error TEXT NOT NULL DEFAULT '', discovered_at TEXT NOT NULL, PRIMARY KEY(chat_job_id, dialog_key, message_id), FOREIGN KEY(chat_job_id) REFERENCES chat_download_jobs(id) ON DELETE CASCADE
@@ -609,6 +609,51 @@ END $$`,
 			`CREATE TRIGGER tdl_item_stats_insert_trigger AFTER INSERT ON download_items REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION tdl_item_stats_insert()`,
 			`CREATE TRIGGER tdl_item_stats_delete_trigger AFTER DELETE ON download_items REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION tdl_item_stats_delete()`,
 			`CREATE TRIGGER tdl_item_stats_update_trigger AFTER UPDATE ON download_items REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION tdl_item_stats_update()`,
+		},
+	},
+	{
+		// A listening task has to answer one question for every incoming update:
+		// does this dialog belong to a conversation being listened to? Comments on
+		// a channel post arrive in the channel's linked discussion group, so the
+		// group - not the channel - is the peer the update carries, and a task can
+		// only answer for its own posts if it records which group that is.
+		//
+		// It is a column on the task rather than a table of its own because it is
+		// one fact per task: no join in the listener snapshot, no rows to reap
+		// when a task is purged (the task row is the link), and no growth with the
+		// media index. The key is the dialog key the update carries
+		// (channel:<id>, see dialogIdentity); the peer travels with it so an
+		// update that omitted its entities can still be recovered.
+		//
+		// discussion_probed_at separates "not learned yet" from "asked, this
+		// dialog has no linked discussion group". A group task, a Saved Messages
+		// task and a channel with comments disabled can never learn one, and
+		// without that distinction every periodic pass would ask Telegram again
+		// forever.
+		//
+		// The five ALTERs are in longStatements rather than statements on purpose:
+		// longStatements run first inside the same transaction (see
+		// postgresMigration), and the backfill below must not run before the
+		// columns exist.
+		version: 20,
+		longStatements: []string{
+			`ALTER TABLE chat_download_jobs ADD COLUMN IF NOT EXISTS discussion_dialog_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_jobs ADD COLUMN IF NOT EXISTS discussion_peer_type TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE chat_download_jobs ADD COLUMN IF NOT EXISTS discussion_peer_id BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_jobs ADD COLUMN IF NOT EXISTS discussion_peer_hash BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE chat_download_jobs ADD COLUMN IF NOT EXISTS discussion_probed_at TEXT NOT NULL DEFAULT ''`,
+			// A task that was listening before these columns existed already knew
+			// its discussion group, but recorded it per thread in chat_reply_roots.
+			// Admission stops reading that table, so without this backfill such a
+			// task silently stops receiving comments on its posts. One row per
+			// task, preferring a thread that recorded the group's peer; the probe
+			// timestamp is set so the periodic resolver does not ask again
+			// immediately.
+			`UPDATE chat_download_jobs j SET discussion_dialog_key = s.discussion_dialog_key, discussion_peer_type = s.discussion_peer_type, discussion_peer_id = s.discussion_peer_id, discussion_peer_hash = s.discussion_peer_hash, discussion_probed_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+ FROM (SELECT DISTINCT ON (chat_job_id) chat_job_id, discussion_dialog_key, discussion_peer_type, discussion_peer_id, discussion_peer_hash
+        FROM chat_reply_roots WHERE discussion_dialog_key <> ''
+        ORDER BY chat_job_id, (discussion_peer_type <> '') DESC) s
+ WHERE s.chat_job_id = j.id AND j.discussion_dialog_key = ''`,
 		},
 	},
 }

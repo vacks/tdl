@@ -82,7 +82,7 @@ func TestDiscussionRootIndexesFallsBackFromLastMessage(t *testing.T) {
 func TestRelatedSourcesSkipsPostThatDeclaresNoComments(t *testing.T) {
 	post := &tg.Message{ID: 100}
 	peer := &tg.InputPeerChannel{ChannelID: 5, AccessHash: 7}
-	items, err := relatedSources(&Manager{}, context.Background(), nil, "acct", peer, "频道", []*tg.Message{post}, 100, 100, false)
+	items, err := relatedSources(&Manager{}, context.Background(), nil, "acct", peer, "频道", []*tg.Message{post}, 100, 100, false, "")
 	if err != nil {
 		t.Fatalf("a post with no comment section must resolve without an error: %v", err)
 	}
@@ -114,6 +114,34 @@ func TestShouldReadDiscussionOnlySkipsSilentPosts(t *testing.T) {
 		}
 	}
 }
+
+// The eager lookup is what costs one request per newly received message, so it
+// must apply only where a linked discussion group can exist at all. A supergroup
+// keeps its replies in-dialog and Telegram marks comments only on channel posts,
+// which makes the same request there a guaranteed miss; an unresolved peer is
+// not assumed to be a channel, because the periodic resolver covers it.
+func TestEagerDiscussionRootOnlyForResolvedBroadcastChannels(t *testing.T) {
+	cases := []struct {
+		name      string
+		learnRoot bool
+		peer      broadcastPeer
+		want      bool
+	}{
+		{"listener on a broadcast channel", true, stubBroadcastPeer{true}, true},
+		{"listener on a supergroup", true, stubBroadcastPeer{false}, false},
+		{"listener on an unresolved peer", true, nil, false},
+		{"non-listener on a broadcast channel", false, stubBroadcastPeer{true}, false},
+	}
+	for _, testCase := range cases {
+		if got := eagerDiscussionRoot(testCase.learnRoot, testCase.peer); got != testCase.want {
+			t.Fatalf("%s: got %v, want %v", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+type stubBroadcastPeer struct{ broadcast bool }
+
+func (p stubBroadcastPeer) IsBroadcast() bool { return p.broadcast }
 
 // The gap walk re-reads history from the newest message backwards until it
 // meets the watermark. Only the page that meets it licenses advancing that

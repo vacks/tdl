@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gotd/td/telegram/message/peer"
+	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/iyear/tdl/core/util/tutil"
@@ -46,7 +47,13 @@ func firstMessageID(messages []*tg.Message, fallback int) int {
 // newly received post even when its comment section is empty so a comment
 // arriving later can be attributed without a second lookup. Every other caller
 // spends a request only when the post says there is something to read.
-func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, originName string, originMessages []*tg.Message, rootMessageID, originMessageID int, learnRoot bool) ([]source, error) {
+//
+// chatJobID names the session task this post belongs to, and is empty for a
+// plain message task. It is passed down so a resolved discussion group can be
+// recorded on that task: the group is the peer a comment update arrives from,
+// and the task's record of it is what lets the listener admit its own comments
+// without admitting the whole account's.
+func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID string, originPeer tg.InputPeerClass, originName string, originMessages []*tg.Message, rootMessageID, originMessageID int, learnRoot bool, chatJobID string) ([]source, error) {
 	if len(originMessages) == 0 || originPeer == nil || rootMessageID <= 0 || originMessageID <= 0 {
 		return nil, nil
 	}
@@ -81,6 +88,13 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 		// Linked discussions are Telegram supergroups, represented as an
 		// InputPeerChannel on the wire.
 		dialogType = "chat"
+		// Record which group this task's comments arrive from. The peer is
+		// already in hand, so this costs no request. A failure is logged rather
+		// than fatal: the media this call was asked for is still downloadable,
+		// and the periodic resolver retries the link from the task row.
+		if err := m.rememberDiscussionLink(chatJobID, accountID, dialogKey, threadPeer); err != nil {
+			applog.Error("chat_download", "discussion_link_persist_failed", "chat_job_id", chatJobID, "dialog_key", dialogKey, "error", err.Error())
+		}
 	}
 	seen := make(map[int]struct{})
 	items := make([]source, 0)
@@ -225,6 +239,45 @@ func channelDiscussionExpectation(messages []*tg.Message) discussionExpectation 
 // can be attributed without a second lookup.
 func shouldReadDiscussion(expectation discussionExpectation, learnRoot bool) bool {
 	return learnRoot || expectation.replyCount > 0 || expectation.dialogID != 0
+}
+
+// broadcastPeer is the single fact this decision needs from a resolved peer. It
+// is an interface rather than peers.Peer so the rule can be tested without a
+// Telegram client standing behind the peer.
+type broadcastPeer interface {
+	IsBroadcast() bool
+}
+
+// broadcastOf reports the broadcast classification of a resolved peer. Only a
+// peers.Channel carries it: a user and a basic group are not candidates, and a
+// peer that could not be resolved is nil rather than assumed.
+func broadcastOf(peer peers.Peer) broadcastPeer {
+	if channel, ok := peer.(peers.Channel); ok {
+		return channel
+	}
+	return nil
+}
+
+// eagerDiscussionRoot narrows learnRoot to the only dialog that can have a
+// linked discussion group.
+//
+// learnRoot exists so a newly received post resolves its discussion root before
+// its first comment arrives. Only a broadcast channel has one: Telegram marks
+// comments only on channel posts, which channelDiscussionExpectation already
+// enforces, while a supergroup and a channel are both an InputPeerChannel on the
+// wire and a supergroup keeps its replies in-dialog. Without this narrowing a
+// listening supergroup spends one messages.getDiscussionMessage per new message
+// on a question whose answer is always "no", out of the same rate limit the
+// downloads use.
+//
+// A peer that could not be resolved is not assumed to be a channel: the periodic
+// link resolver covers that case, and assuming would restore the per-message
+// request this exists to remove.
+func eagerDiscussionRoot(learnRoot bool, peer broadcastPeer) bool {
+	if !learnRoot {
+		return false
+	}
+	return peer != nil && peer.IsBroadcast()
 }
 
 func replyPageNextOffset(page []tg.MessageClass, previous int) int {

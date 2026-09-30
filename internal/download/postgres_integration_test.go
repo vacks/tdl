@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
@@ -1334,7 +1335,6 @@ func TestPostgresChatInboxReopensFailedEventOnRedelivery(t *testing.T) {
 	_, key, _ := dialogIdentity(peer, "account")
 	// The message is a watched dialog, so admission reaches the insert.
 	m.chatWatched["account"] = map[string]struct{}{key: {}}
-	m.listenerSnapshotReady = true
 	event := telegram.NewMessageEvent{AccountID: "account", DialogID: 77, MessageID: 500, InputPeer: peer}
 
 	if err := m.admitChatMessage(event); err != nil {
@@ -2489,5 +2489,309 @@ func TestPostgresChatInboxAdmissionDistinguishesFailureFromFiltered(t *testing.T
 	// a failure would retry it five times and then log a spurious loss.
 	if err := m.admitChatMessage(event); err != nil {
 		t.Fatalf("admitChatMessage()=%v for an unwatched dialog; want nil so it is not retried", err)
+	}
+}
+
+// A listening task admits its own dialog and its linked discussion group, and
+// nothing else - not even a reply-shaped message in another group the account
+// has joined.
+//
+// The watch set is built by the production snapshot query, so this fails if the
+// discussion arm is dropped from it (the comment would never be admitted) or if
+// an account-wide rule is allowed back in (the unrelated reply would be). The
+// unrelated message is deliberately shaped like a comment: reply_to set, from a
+// channel the account is in, with no task of its own.
+func TestPostgresAdmitsOnlyListenedDialogAndItsDiscussionGroup(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), chatEventWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	m.updateDatabaseHealth()
+	if !m.DatabaseAvailable() {
+		t.Fatal("test requires a reachable database")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, discussion_dialog_key, discussion_peer_type, discussion_peer_id, discussion_peer_hash, listen_new, status, scan_state, config_json, created_at, updated_at) VALUES ('link-chat','tg://chat','channel','channel:100',100,'频道','account','channel',100,11,'channel:200','channel',200,22,1,?,'completed','{}',?,?)`, ChatStatusListening, now, now); err != nil {
+		t.Fatal(err)
+	}
+	wanted, watched, err := m.watchedDialogKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wanted["account"]; !ok {
+		t.Fatal("an account with a listening task needs an update connection")
+	}
+	m.chatWatched = watched
+
+	// A comment on one of the channel's posts arrives in the discussion group.
+	comment := telegram.NewMessageEvent{AccountID: "account", DialogID: 200, MessageID: 5, ReplyToMessageID: 4, InputPeer: &tg.InputPeerChannel{ChannelID: 200, AccessHash: 22}}
+	if err := m.admitChatMessage(comment); err != nil {
+		t.Fatalf("admitChatMessage()=%v for the task's own discussion group", err)
+	}
+	// An ordinary reply in a group the account has joined but no task listens to.
+	// This is the shape that used to be admitted account-wide, and each one cost a
+	// doomed Telegram lookup retried five times.
+	unrelated := telegram.NewMessageEvent{AccountID: "account", DialogID: 300, MessageID: 6, ReplyToMessageID: 1, InputPeer: &tg.InputPeerChannel{ChannelID: 300, AccessHash: 33}}
+	if err := m.admitChatMessage(unrelated); err != nil {
+		t.Fatalf("admitChatMessage()=%v for an unwatched dialog; want nil so it is not retried", err)
+	}
+
+	var groupRows, unrelatedRows int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_message_inbox WHERE dialog_key = 'channel:200'`).Scan(&groupRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_message_inbox WHERE dialog_key = 'channel:300'`).Scan(&unrelatedRows); err != nil {
+		t.Fatal(err)
+	}
+	if groupRows != 1 || unrelatedRows != 0 {
+		t.Fatalf("discussion group rows=%d unrelated rows=%d, want 1 and 0", groupRows, unrelatedRows)
+	}
+}
+
+// Remembering a link has to update the in-memory watch set in the same call.
+// The set is otherwise rebuilt only by the periodic snapshot, so a comment
+// arriving in that interval - up to five minutes - would be filtered out at
+// admission, and the dispatcher acknowledges the update, which means Telegram
+// never sends it again.
+func TestPostgresRememberDiscussionLinkUpdatesWatchSet(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), chatWatched: make(map[string]map[string]struct{})}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, listen_new, status, scan_state, config_json, created_at, updated_at) VALUES ('learn-chat','tg://chat','channel','channel:100',100,'频道','account',1,?,'completed','{}',?,?)`, ChatStatusListening, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rememberDiscussionLink("learn-chat", "account", "channel:200", &tg.InputPeerChannel{ChannelID: 200, AccessHash: 22}); err != nil {
+		t.Fatal(err)
+	}
+	var key, kind string
+	var id, hash int64
+	if err := db.QueryRow(`SELECT discussion_dialog_key, discussion_peer_type, discussion_peer_id, discussion_peer_hash FROM chat_download_jobs WHERE id = 'learn-chat'`).Scan(&key, &kind, &id, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if key != "channel:200" || kind != "channel" || id != 200 || hash != 22 {
+		t.Fatalf("recorded link=%q peer=%s/%d/%d, want channel:200 channel/200/22", key, kind, id, hash)
+	}
+	if _, ok := m.chatWatched["account"]["channel:200"]; !ok {
+		t.Fatal("the learned group must be watched immediately, not at the next snapshot rebuild")
+	}
+
+	// An empty peer is still a usable record: admission matches on the dialog
+	// key alone, and the peer is only what entity-less update recovery uses.
+	if err := m.rememberDiscussionLink("learn-chat", "account", "channel:201", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT discussion_dialog_key FROM chat_download_jobs WHERE id = 'learn-chat'`).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	if key != "channel:201" {
+		t.Fatalf("key-only link recorded as %q, want channel:201", key)
+	}
+}
+
+// Version 20 backfills the recorded group from the per-thread mapping that older
+// tasks wrote, because admission no longer reads that table. Without the
+// backfill such a task silently stops receiving comments on its posts.
+func TestPostgresDiscussionLinkBackfillFromReplyRoots(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, listen_new, status, scan_state, config_json, created_at, updated_at) VALUES ('legacy-chat','tg://chat','channel','channel:100',100,'频道','account',1,?,'completed','{}',?,?)`, ChatStatusListening, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_reply_roots(chat_job_id, account_id, discussion_dialog_key, root_message_id, origin_message_id, discussion_peer_type, discussion_peer_id, discussion_peer_hash) VALUES ('legacy-chat','account','channel:200',7,11,'channel',200,22), ('legacy-chat','account','channel:200',9,11,'',0,0)`); err != nil {
+		t.Fatal(err)
+	}
+	// Replay the upgrade: the columns exist and are empty, and version 20 has not
+	// run yet.
+	if _, err := db.Exec(`DELETE FROM schema_migrations WHERE version >= 20`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	var key, kind, probedAt string
+	var id, hash int64
+	if err := db.QueryRow(`SELECT discussion_dialog_key, discussion_peer_type, discussion_peer_id, discussion_peer_hash, discussion_probed_at FROM chat_download_jobs WHERE id = 'legacy-chat'`).Scan(&key, &kind, &id, &hash, &probedAt); err != nil {
+		t.Fatal(err)
+	}
+	if key != "channel:200" || kind != "channel" || id != 200 || hash != 22 {
+		t.Fatalf("backfilled link=%q peer=%s/%d/%d, want channel:200 channel/200/22", key, kind, id, hash)
+	}
+	// The timestamp is what stops the periodic resolver from asking Telegram the
+	// same question again on the next pass.
+	if probedAt == "" {
+		t.Fatal("a backfilled link must carry a probe timestamp")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, probedAt); err != nil {
+		t.Fatalf("backfilled probe timestamp %q is not readable by the resolver: %v", probedAt, err)
+	}
+}
+
+// A request Telegram rejected cannot succeed later, so it stops on the first
+// attempt and spends the whole attempt budget at once. The budget is what the
+// hourly revive reads, so this is also the assertion that a rejected event does
+// not come back to spend a request every hour for a day: the control row beside
+// it has the same age and the same status and is revived, which is what makes
+// the difference the classification rather than the clock.
+func TestPostgresRejectedInboxEventStopsAndIsNotRevived(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',1,'channel',100,1,'processing',1,?,?,?), ('account','channel:100',2,'channel',100,1,'processing',1,?,?,?)`, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[int]int64{}
+	rows, err := db.Query(`SELECT message_id, id FROM chat_message_inbox`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var messageID int
+		var id int64
+		if err := rows.Scan(&messageID, &id); err != nil {
+			t.Fatal(err)
+		}
+		ids[messageID] = id
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.retryChatMessageInbox(ids[1], 1, tgerr.New(400, "CHANNEL_INVALID")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.retryChatMessageInbox(ids[2], 1, errors.New("connection reset by peer")); err != nil {
+		t.Fatal(err)
+	}
+
+	var status string
+	var attempts int
+	if err := db.QueryRow(`SELECT status, attempts FROM chat_message_inbox WHERE id = ?`, ids[1]).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || attempts != inboxAttemptLimit {
+		t.Fatalf("rejected event: status=%q attempts=%d, want failed/%d", status, attempts, inboxAttemptLimit)
+	}
+	if err := db.QueryRow(`SELECT status, attempts FROM chat_message_inbox WHERE id = ?`, ids[2]).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || attempts != 1 {
+		t.Fatalf("transient event: status=%q attempts=%d, want pending/1", status, attempts)
+	}
+
+	// Age both rows past the revive window. The transient one comes back; the
+	// rejected one must not.
+	old := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`UPDATE chat_message_inbox SET updated_at = ? WHERE id IN (?, ?)`, old, ids[1], ids[2]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE chat_message_inbox SET status = 'failed', attempts = 5 WHERE id = ?`, ids[2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reviveExhaustedInboxEvents(); err != nil {
+		t.Fatal(err)
+	}
+	var rejectedStatus, revivedStatus string
+	if err := db.QueryRow(`SELECT status FROM chat_message_inbox WHERE id = ?`, ids[1]).Scan(&rejectedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM chat_message_inbox WHERE id = ?`, ids[2]).Scan(&revivedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedStatus != "failed" {
+		t.Fatalf("rejected event was revived as %q; a rejection must not be retried", rejectedStatus)
+	}
+	if revivedStatus != "pending" {
+		t.Fatalf("a failed event below the attempt limit was not revived (status %q)", revivedStatus)
+	}
+}
+
+// The status line reports waiting apart from in-flight work, because a pending
+// row can sit out an hour-long backoff and counting it as work in progress hid
+// an event that was doing nothing behind what looked like activity.
+func TestPostgresListenerInboxCountsSeparateWaitingFromStopped(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_message_inbox(account_id, dialog_key, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',1,'channel',100,1,'processing',1,?,?,?), ('account','channel:100',2,'channel',100,1,'pending',0,?,?,?), ('account','channel:100',3,'channel',100,1,'failed',20,?,?,?)`, now, now, now, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO reaction_inbox(account_id, dialog_key, message_id, peer_type, emoji, status, next_attempt_at, created_at, updated_at) VALUES ('account','channel:100',4,'channel','👍','pending',?,?,?)`, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	processing, waiting, stopped, err := m.ListenerInboxCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processing != 1 || waiting != 2 || stopped != 1 {
+		t.Fatalf("counts=%d processing/%d waiting/%d stopped, want 1/2/1", processing, waiting, stopped)
 	}
 }
