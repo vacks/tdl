@@ -82,6 +82,19 @@ func (d *database) Exec(query string, args ...any) (sql.Result, error) {
 	return d.db.ExecContext(ctx, d.bind(query), args...)
 }
 
+// ExecUnbounded runs one statement with no client side deadline.
+//
+// It exists for DDL whose duration is proportional to the size of a table
+// rather than to the work the statement describes. Building an index on a table
+// holding tens of millions of rows legitimately takes minutes, so the general
+// per-statement timeout would cancel it part way through, and a cancelled
+// CREATE INDEX CONCURRENTLY leaves an INVALID index behind instead of simply
+// doing nothing. Only schema maintenance belongs here; nothing on a request or
+// worker path may use it.
+func (d *database) ExecUnbounded(query string, args ...any) (sql.Result, error) {
+	return d.db.ExecContext(context.Background(), bindSQL(query), args...)
+}
+
 func (d *database) Query(query string, args ...any) (*databaseRows, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
 	rows, err := d.db.QueryContext(ctx, d.bind(query), args...)
@@ -112,6 +125,16 @@ func (tx *databaseTx) Exec(query string, args ...any) (sql.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), databaseOperationTimeout)
 	defer cancel()
 	return tx.tx.ExecContext(ctx, bindSQL(query), args...)
+}
+
+// ExecUnbounded runs one statement inside this transaction with no client side
+// deadline. It is for a schema migration that deliberately touches every row of
+// a permanent history: the general per-statement timeout would cancel a backfill
+// part way through once that table holds tens of millions of rows, and the
+// migration would then fail on every subsequent start instead of completing.
+// Nothing on a request or worker path may use it.
+func (tx *databaseTx) ExecUnbounded(query string, args ...any) (sql.Result, error) {
+	return tx.tx.ExecContext(context.Background(), bindSQL(query), args...)
 }
 
 func (tx *databaseTx) Query(query string, args ...any) (*databaseRows, error) {

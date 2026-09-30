@@ -54,7 +54,19 @@ docker compose down
 
 ## HTTPS 反向代理
 
-公网部署时由你自己的 HTTPS 反向代理转发至 `127.0.0.1:8080` 即可，无需额外设置环境变量。反向代理应保留原始 `Host`，并传递 `X-Forwarded-Proto`；Caddy、Nginx 和 Traefik 的标准反代配置都会自动处理。
+公网部署时由你自己的 HTTPS 反向代理转发至 `127.0.0.1:8080`。反向代理应保留原始 `Host`，并传递 `X-Forwarded-Proto`；Caddy、Nginx 和 Traefik 的标准反代配置都会自动处理。
+
+`X-Forwarded-Proto` 只在请求来自受信任地址时才被采信，因此使用反向代理时需要在 `compose.yaml` 中设置 `TDL_TRUSTED_PROXIES`，列出代理的地址（单个 IP 或 CIDR，逗号分隔），例如 `TDL_TRUSTED_PROXIES: 127.0.0.1` 或 `172.16.0.0/12`。不设置时该头被忽略，这是安全默认值——任何客户端都能伪造这个头，而它决定会话 Cookie 是否标记为 Secure。直接暴露 8080 时不需要设置。
+
+## 备份
+
+`postgres/` 是永久下载历史，也是去重的唯一依据：文件记录不会被保留策略清理，删库会同时失去"哪些文件已经下过"的判断，重新下载时全部文件都会被当作新文件。请定期备份，不要只备份 `downloads/`：
+
+```bash
+docker compose exec postgres pg_dump -U tdl -d tdl | gzip > tdl-$(date +%F).sql.gz
+```
+
+数据量大时建议改用 `pg_dump -Fc`（自定义格式，可选表恢复、并行恢复），并配合宿主机层面的快照。`data/` 存放管理账号和 Telegram 会话，同样需要备份；`downloads/` 是已下载文件本身，可按需取舍。
 
 ## 许可证
 

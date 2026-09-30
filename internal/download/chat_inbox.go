@@ -143,7 +143,7 @@ func (m *Manager) claimChatMessageInbox(limit int) ([]chatMessageInboxEvent, err
 	// a timer, and BEGIN + SELECT + COMMIT costs three statements on the common
 	// empty case where a single index probe answers the same question.
 	var pending bool
-	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ?)`, now).Scan(&pending); err != nil {
+	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at::timestamptz <= ?::timestamptz)`, now).Scan(&pending); err != nil {
 		return nil, err
 	}
 	if !pending {
@@ -155,7 +155,7 @@ func (m *Manager) claimChatMessageInbox(limit int) ([]chatMessageInboxEvent, err
 	}
 	defer tx.Rollback()
 	rows, err := tx.Query(`SELECT id, account_id, dialog_name, dialog_id, message_id, reply_to_message_id, reply_to_top_id, peer_type, peer_id, peer_hash, attempts
-FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?`, now, limit)
+FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at::timestamptz <= ?::timestamptz ORDER BY next_attempt_at, id LIMIT ?`, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -223,20 +223,89 @@ func (m *Manager) completeChatMessageInbox(id int64) error {
 	return err
 }
 
-// retryChatMessageInbox backs an event off after a failure and gives up after
-// five attempts. Giving up is not a permanent loss: the claim query only ever
-// reads 'pending' rows, so the terminal state has to have a way back in. Being
-// told about the same message again is that way in — see the conflict clause in
-// the insert above, which reopens a failed row and starts a fresh attempt set.
-// The reaction inbox has the same rule for the same reason.
+// retryChatMessageInbox backs an event off after a failure and stops the fast
+// retries after five attempts.
+//
+// Stopping used to be the end of the road for a live event, and the comment
+// here claimed otherwise: the claim query only reads 'pending' rows, so the way
+// back in was said to be the conflict clause in the insert, which reopens a
+// failed row when the same message arrives again. That path cannot fire. The
+// update dispatcher returns nil to gotd, which advances Telegram's update state,
+// so the same new message is never delivered twice. A group task had no gap walk
+// either. The row was therefore dropped silently, with nothing in the UI or the
+// logs to say a download had been requested and lost.
+//
+// The way back in is now explicit: reviveExhaustedInboxEvents returns these rows
+// to the queue periodically, up to a total attempt budget. A transient failure
+// is recovered, and one that can never succeed stops for good with its error
+// recorded and counted.
 func (m *Manager) retryChatMessageInbox(id int64, attempts int, cause error) error {
 	status := "pending"
-	if attempts >= 5 {
+	if attempts >= inboxFastAttempts {
 		status = "failed"
 	}
 	delay := time.Duration(1<<min(attempts, 6)) * time.Second
-	_, err := m.db.Exec(`UPDATE chat_message_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id)
-	return err
+	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+		return err
+	}
+	if status == "failed" {
+		applog.Error("chat_download", "new_message_event_gave_up", "inbox_id", id, "attempts", attempts, "error", cause.Error())
+	}
+	return nil
+}
+
+// inboxFastAttempts is when an event stops being retried every few seconds and
+// waits for the periodic revive, which retries it far more slowly.
+const inboxFastAttempts = 5
+
+// inboxReviveInterval is how often an event that used up its fast attempts is
+// offered to a worker again.
+const inboxReviveInterval = time.Hour
+
+// inboxAttemptLimit is the total number of attempts an event gets before it is
+// left failed for good. Combined with the revive interval this is a long, slow
+// tail rather than either a permanent loss or an unbounded retry: an event that
+// cannot succeed - the message was deleted, the dialog is gone - stops, and its
+// recorded error stays visible until retention removes the row.
+const inboxAttemptLimit = 20
+
+// reviveExhaustedInboxEvents returns events that used up their fast attempts to
+// the queue, on the far slower revive cadence.
+//
+// The alternative was to drop them: nothing else selects a failed row, and for a
+// live update there is no redelivery to reopen it. These are download requests
+// the user made, so a slow retry is the right default and a permanent, silent
+// loss is not. Errors are returned rather than swallowed so the sweep's own
+// failures are visible too.
+func (m *Manager) reviveExhaustedInboxEvents() error {
+	now := time.Now().UTC()
+	retryAt := now.Add(inboxReviveInterval).Format(time.RFC3339Nano)
+	nowText := now.Format(time.RFC3339Nano)
+	cutoff := now.Add(-inboxReviveInterval).Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ?
+WHERE status = 'failed' AND attempts < ? AND updated_at::timestamptz < ?::timestamptz`, retryAt, nowText, inboxAttemptLimit, cutoff); err != nil {
+		return err
+	}
+	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'pending', next_attempt_at = ?, updated_at = ?
+WHERE status = 'failed' AND attempts < ? AND updated_at::timestamptz < ?::timestamptz`, retryAt, nowText, inboxAttemptLimit, cutoff); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListenerInboxCounts reports how many listener events are queued and how many
+// have stopped being retried. They are shown where a person can see them,
+// because an event that gives up is a download request that will not happen.
+func (m *Manager) ListenerInboxCounts() (pending, stopped int, err error) {
+	err = m.db.QueryRow(`SELECT
+ (SELECT COUNT(1) FROM chat_message_inbox WHERE status IN ('pending', 'processing')) +
+ (SELECT COUNT(1) FROM reaction_inbox WHERE status IN ('pending', 'processing')),
+ (SELECT COUNT(1) FROM chat_message_inbox WHERE status = 'failed') +
+ (SELECT COUNT(1) FROM reaction_inbox WHERE status = 'failed')`).Scan(&pending, &stopped)
+	if err != nil {
+		return 0, 0, err
+	}
+	return pending, stopped, nil
 }
 
 // waitChatEvent pauses an inbox worker between attempts. It reports false when

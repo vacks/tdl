@@ -55,6 +55,11 @@ func TestTransferPermitsUseOnlyGlobalLimit(t *testing.T) {
 	releaseB()
 }
 
+// The chat share must never round down to zero at a limit that allows one
+// transfer. At the default concurrency of one it used to: halving reserved the
+// only slot for messages, so session downloads could not start while any
+// message task was queued or transferring. Reserving a class's share to nothing
+// is not a share.
 func TestChatTransferCapacityYieldsOnlyWhileMessageWaits(t *testing.T) {
 	for _, test := range []struct {
 		global  int
@@ -62,7 +67,7 @@ func TestChatTransferCapacityYieldsOnlyWhileMessageWaits(t *testing.T) {
 		wantMax int
 	}{
 		{global: 1, queued: false, wantMax: 1},
-		{global: 1, queued: true, wantMax: 0},
+		{global: 1, queued: true, wantMax: 1},
 		{global: 2, queued: false, wantMax: 2},
 		{global: 2, queued: true, wantMax: 1},
 		{global: 3, queued: true, wantMax: 1},
@@ -71,6 +76,36 @@ func TestChatTransferCapacityYieldsOnlyWhileMessageWaits(t *testing.T) {
 		if got := chatTransferLimit(test.global, test.queued); got != test.wantMax {
 			t.Fatalf("chatTransferLimit(%d, %t) = %d, want %d", test.global, test.queued, got, test.wantMax)
 		}
+	}
+}
+
+// At the default concurrency a session task and a queued message task both aim
+// at the single slot, so neither may be excluded from it. Whichever acquires
+// first proceeds and the other waits for the release, which is what "one at a
+// time" has to mean when the two classes share one permit.
+func TestSingleSlotIsSharedBetweenMessagesAndChat(t *testing.T) {
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := store.Get()
+	values.Download.ConcurrentJobs = 1
+	if err := store.Update(values); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{settings: store, slotWake: make(chan struct{}, 1)}
+	release, ok := m.tryAcquireTransfer(transferChat, true)
+	if !ok {
+		t.Fatal("a session task was excluded from the only slot while a message task waited")
+	}
+	if _, ok := m.tryAcquireTransfer(transferMessage, true); ok {
+		t.Fatal("two transfers were admitted under a global limit of one")
+	}
+	release()
+	if releaseMessage, ok := m.tryAcquireTransfer(transferMessage, true); !ok {
+		t.Fatal("the message task did not receive the released slot")
+	} else {
+		releaseMessage()
 	}
 }
 

@@ -75,10 +75,6 @@ const (
 	// filteredCountTTL bounds how stale a status-filtered task total may be. It
 	// only affects a displayed number, never pagination.
 	filteredCountTTL = 5 * time.Second
-	// summaryCacheTTL bounds how stale the dashboard's seven day failure count
-	// can become on an installation where nothing is happening. The active
-	// count is revision gated and needs no expiry.
-	summaryCacheTTL = time.Minute
 	// queuedCandidateWindow bounds how far the scheduler looks ahead for a task
 	// whose account is not inside a Telegram cooldown. A handful of rows is
 	// enough to step over a blocked account without scanning permanent history.
@@ -346,14 +342,6 @@ type Manager struct {
 	// Lazily initialized so a zero-value Manager stays usable.
 	filteredCountsMu sync.Mutex
 	filteredCounts   map[string]filteredJobCount
-	// summaryMu guards the memoized dashboard figures, which the Web UI asks for
-	// every three seconds.
-	summaryMu       sync.Mutex
-	summaryValid    bool
-	summaryRevision uint64
-	summaryExpires  time.Time
-	summaryActive   int
-	summaryFailed   int
 	// stopCh is closed once by Stop so the worker loops can exit. A nil channel
 	// (a Manager built without New, as tests do) never fires in a select, so the
 	// loops stay correct without a nil guard.
@@ -361,6 +349,9 @@ type Manager struct {
 	stopOnce sync.Once
 	// lastInboxReap throttles the inbox lease safety net (unix nanoseconds).
 	lastInboxReap atomic.Int64
+	// lastJobLeaseSweep throttles recovery of tasks stranded in 'running'
+	// (unix nanoseconds).
+	lastJobLeaseSweep atomic.Int64
 	// inboxRetry carries inbox writes that failed, to a single bounded worker.
 	inboxRetry     chan inboxRetry
 	inboxRetryStop context.CancelFunc
@@ -416,7 +407,7 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 		_ = db.Close()
 		return nil, fmt.Errorf("recover message tasks: %w", err)
 	}
-	if err := m.reconcileChatPublishedItems(); err != nil {
+	if err := m.reconcileChatPublishedItems(nil); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("reconcile published chat files: %w", err)
 	}
@@ -535,7 +526,7 @@ func (m *Manager) recoverAfterDatabaseOutage() error {
 	if err := m.reconcilePublishedItems(); err != nil {
 		return err
 	}
-	if err := m.reconcileChatPublishedItems(); err != nil {
+	if err := m.reconcileChatPublishedItems(nil); err != nil {
 		return err
 	}
 	if err := m.recoverInterruptedMessageTasks("数据库连接恢复，任务等待继续"); err != nil {
@@ -659,10 +650,112 @@ func (m *Manager) reapStaleInboxLeases() error {
 	return nil
 }
 
-// reapStaleInboxLeasesIfDue runs the sweep at most once per inboxReapInterval,
-// from the existing maintenance goroutine, so the safety net does not add
-// another resident database poller.
-func (m *Manager) reapStaleInboxLeasesIfDue() {
+// jobLeaseTimeout is how long a task may stay in 'running' with no worker
+// attached before it is returned to the queue.
+//
+// A live task keeps an entry in m.cancels for its whole life, so its age is
+// never what this sweep reacts to - the sweep only ever sees a task no worker
+// in this process owns. The window exists to cover the gap between claiming a
+// task (which is what sets 'running') and registering its cancel function, and
+// to stay well clear of a slow but healthy transfer when a task was orphaned by
+// a process that is still running.
+const jobLeaseTimeout = 10 * time.Minute
+
+// jobLeaseInterval throttles the sweep. It is a safety net for a state that
+// should not occur, not a periodic poll of a healthy system, so it is coarse.
+const jobLeaseInterval = 2 * time.Minute
+
+// recoverStrandedRunningJobs returns tasks left in 'running' by a worker that
+// did not finish with them, so they can be claimed again.
+//
+// Startup recovery and database-outage recovery both cover the case where the
+// whole process went away. This covers the one they cannot: a worker that gave
+// up on its task while the process kept running. Nothing else ever looks at a
+// task in 'running' - the scheduler selects 'queued', and the claim reconciler
+// selects waiting items under queued, partial or failed tasks - so such a task
+// could never move again, and its files stayed queued behind it forever.
+//
+// Only tasks with no live worker in this process are considered. The application
+// is single instance by design; running a second copy would need the executors
+// to be identified per process, which is a separate change.
+func (m *Manager) recoverStrandedRunningJobs() error {
+	m.mu.Lock()
+	active := make(map[string]struct{}, len(m.cancels))
+	for id := range m.cancels {
+		active[id] = struct{}{}
+	}
+	m.mu.Unlock()
+	now := time.Now().UTC()
+	rows, err := m.db.Query(`SELECT id, updated_at FROM download_jobs WHERE status = 'running'`)
+	if err != nil {
+		return err
+	}
+	type stranded struct{ id, updatedAt string }
+	found := make([]stranded, 0)
+	for rows.Next() {
+		var candidate stranded
+		if err := rows.Scan(&candidate.id, &candidate.updatedAt); err != nil {
+			continue
+		}
+		if _, live := active[candidate.id]; live {
+			continue
+		}
+		// Timestamps are TEXT holding RFC3339Nano, whose trailing-zero trimming
+		// makes lexicographic comparison wrong, so parse rather than compare.
+		updated, parseErr := time.Parse(time.RFC3339Nano, candidate.updatedAt)
+		if parseErr != nil {
+			continue
+		}
+		if now.Sub(updated) < jobLeaseTimeout {
+			continue
+		}
+		found = append(found, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	for _, candidate := range found {
+		applog.Info("download", "stranded_task_requeued", "job_id", candidate.id, "idle_since", candidate.updatedAt)
+		// The same item transition the stall watchdog performs, so a task
+		// recovered here resumes exactly where a recovered task would: completed
+		// files are kept, and the upstream temporary files and resume keys are
+		// left in place for the next attempt.
+		err := m.transitionItems(candidate.id, "running", "queued", "任务长时间没有工作线程处理，已自动恢复",
+			`UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('running', 'downloaded')`, candidate.id)
+		if err != nil {
+			applog.Error("download", "stranded_task_requeue_failed", "job_id", candidate.id, "error", err.Error())
+			continue
+		}
+		m.signal()
+	}
+	return nil
+}
+
+// recoverStrandedRunningJobsIfDue runs the sweep at most once per
+// jobLeaseInterval.
+func (m *Manager) recoverStrandedRunningJobsIfDue() {
+	now := time.Now().UnixNano()
+	last := m.lastJobLeaseSweep.Load()
+	if now-last < int64(jobLeaseInterval) {
+		return
+	}
+	if !m.lastJobLeaseSweep.CompareAndSwap(last, now) {
+		return
+	}
+	if err := m.recoverStrandedRunningJobs(); err != nil {
+		applog.Error("download", "stranded_task_recovery_failed", "error", err.Error())
+	}
+}
+
+// runMaintenanceSweepsIfDue runs the sweeps that belong to no single task, at
+// most once per inboxReapInterval, from the existing maintenance goroutine, so
+// the safety nets do not add another resident database poller. Each one repairs
+// a state that no other pass looks at: an expired inbox lease, a media claim
+// whose owner cannot transfer, a listener event that stopped being retried, and
+// a file moved but never recorded.
+func (m *Manager) runMaintenanceSweepsIfDue() {
 	now := time.Now().UnixNano()
 	last := m.lastInboxReap.Load()
 	if now-last < int64(inboxReapInterval) {
@@ -673,6 +766,28 @@ func (m *Manager) reapStaleInboxLeasesIfDue() {
 	}
 	if err := m.reapStaleInboxLeases(); err != nil {
 		applog.Error("download", "inbox_lease_reap_failed", "error", err.Error())
+	}
+	// A claim whose owner cannot transfer blocks every other task that wants
+	// that file, so it is invisible to whoever is affected and permanent until
+	// something releases it. This sweep is that something.
+	if err := m.orphanedMediaClaims(); err != nil {
+		applog.Error("download", "media_claim_reap_failed", "error", err.Error())
+	}
+	// A listener event that used up its fast attempts is a download request the
+	// user made and nothing else will pick up, because Telegram does not redeliver
+	// an update the dispatcher acknowledged. Offering it again slowly is the
+	// difference between a lost download and a late one.
+	if err := m.reviveExhaustedInboxEvents(); err != nil {
+		applog.Error("download", "inbox_event_revive_failed", "error", err.Error())
+	}
+	// The chat side reconciles files left mid-publish on every worker pass; the
+	// message side only did it at startup and after a database outage, so a write
+	// failure that did not take the process down left a file that was downloaded
+	// and moved but never recorded - the task reported failure, and retrying it
+	// then refused the destination as already occupied. Running the same
+	// reconciler here closes that window without another resident poller.
+	if err := m.reconcilePublishedItems(); err != nil {
+		applog.Error("download", "published_file_reconcile_failed", "error", err.Error())
 	}
 }
 
@@ -785,7 +900,7 @@ func (m *Manager) BotLifecycleMessages(jobID string) ([]BotMessageRef, error) {
 // refresh one displayed task without repeatedly loading unrelated task pages.
 func (m *Manager) Get(id string) (Job, error) {
 	var job Job
-	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, attempts, status, error, created_at, updated_at FROM download_jobs WHERE id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+	err := m.db.QueryRow(`SELECT id, source_url, dialog_type, dialog_key, dialog_name, account_id, attempts, status, error, created_at, updated_at, message_text FROM download_jobs WHERE id = ?`, id).Scan(&job.ID, &job.SourceURL, &job.DialogType, &job.DialogKey, &job.DialogName, &job.AccountID, &job.Attempts, &job.Status, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.MessageText)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, errors.New("下载任务不存在")
 	}
@@ -798,10 +913,10 @@ func (m *Manager) Get(id string) (Job, error) {
 		return Job{}, err
 	}
 	job.Items, job.TotalItems = items, len(items)
+	// The counts come from the rows already in hand rather than from the
+	// maintained summary, so this single-task view stays exact even if a summary
+	// row were ever missing.
 	for _, item := range items {
-		if job.MessageText == "" && item.MessageText != "" {
-			job.MessageText = item.MessageText
-		}
 		if item.Status == "completed" {
 			job.CompletedItems++
 		}
@@ -913,13 +1028,18 @@ func (m *Manager) visibleJobTotal(status string) (int, error) {
 }
 
 func (m *Manager) listSummaries(where, pagination string, args []any, total int) ([]Job, int, error) {
-	// Select one page of parent jobs before aggregating their files. Applying
-	// LIMIT after a joined GROUP BY can otherwise touch the entire permanent
-	// file history merely to render a small task page.
+	// A page of tasks is read from two small tables only. The file counts come
+	// from download_item_stats, which the triggers on download_items maintain,
+	// and the display text lives on the task itself; neither requires reading a
+	// single download_items row. That matters because a task's file count is not
+	// bounded: with linked comments and replies enabled - the default - one
+	// channel post's task holds a row per media comment, so even a page of fifty
+	// tasks could previously cost the union of their file histories, on a list
+	// the Web UI re-reads while anything is downloading.
 	query := `SELECT j.id, j.source_url, j.dialog_type, j.dialog_key, j.dialog_name, j.account_id, j.attempts, j.status, j.error, j.created_at, j.updated_at,
-	 COALESCE(summary.total_items, 0), COALESCE(summary.completed_items, 0), COALESCE(summary.message_text, '')
+	 COALESCE(summary.total_items, 0), COALESCE(summary.completed_items, 0), j.message_text
  FROM (SELECT * FROM download_jobs j ` + where + ` ` + pagination + `) j
- LEFT JOIN LATERAL (SELECT COUNT(id) AS total_items, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_items, MAX(NULLIF(message_text, '')) AS message_text FROM download_items WHERE job_id = j.id) summary ON true
+ LEFT JOIN download_item_stats summary ON summary.job_id = j.id
  ORDER BY j.created_at DESC, j.id DESC`
 	rows, err := m.db.Query(query, args...)
 	if err != nil {
@@ -963,37 +1083,37 @@ func decodeJobCursor(cursor string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
-// Summary reports the dashboard's two figures. Do not aggregate permanent
-// completed history here: at multi-million scale that would force repeated
-// scans. A chat task owns an indexed file queue rather than child jobs, so
-// include both queue types or the dashboard would incorrectly show zero while a
-// session download is active.
+// downloadCountsWindow is how far back the recent-failure figure reaches.
+const downloadCountsWindow = 30 * 24 * time.Hour
+
+// DownloadCounts reports how many files are still in flight and how many failed
+// within the last 30 days, counting both ordinary message tasks and session
+// (chat) tasks.
 //
-// The dashboard polls every three seconds, so both figures are answered from
-// one statement and then memoized. The revision gate covers the active count,
-// which only moves when something was written; the expiry covers the failure
-// count, whose seven day window keeps moving even while nothing happens, so a
-// quiet installation still lets old failures age out instead of pinning the
-// figure at whatever it was when the last task ran.
-func (m *Manager) Summary() (active, failedItems int) {
-	revision := m.Revision()
-	now := time.Now()
-	m.summaryMu.Lock()
-	defer m.summaryMu.Unlock()
-	if m.summaryValid && now.Before(m.summaryExpires) && m.summaryRevision == revision {
-		return m.summaryActive, m.summaryFailed
-	}
-	sevenDaysAgo := now.UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
-	_ = m.db.QueryRow(`SELECT
+// It is asked for on demand - the Bot's /status command is the only caller -
+// and deliberately not polled. A message task owns a file row per message or
+// per linked comment, and a session task owns one per indexed media message, so
+// neither count can be answered from a fixed amount of work: the active figure
+// is an index-only scan over the rows still in flight plus a sum over the
+// per-task summaries, and the failure figure is an index range scan over the
+// last 30 days of failures. Both are cheap when little is happening and grow
+// with how much is, which is exactly the shape of work that must not sit behind
+// a three second poll on a dashboard nobody is reading.
+//
+// Errors are returned rather than swallowed. The figures are shown to a person
+// who asked for them, so an unavailable database must say so instead of
+// reporting a confident zero.
+func (m *Manager) DownloadCounts() (active, recentFailures int, err error) {
+	cutoff := time.Now().UTC().Add(-downloadCountsWindow).Format(time.RFC3339Nano)
+	err = m.db.QueryRow(`SELECT
  (SELECT COUNT(1) FROM download_items WHERE status IN ('queued', 'waiting', 'running', 'downloaded', 'paused')) +
  (SELECT COALESCE(SUM(queued + waiting + running + downloaded + paused), 0) FROM chat_download_stats),
  (SELECT COUNT(1) FROM download_items WHERE status = 'failed' AND finished_at >= ?) +
- (SELECT COUNT(1) FROM chat_download_items WHERE status = 'failed' AND finished_at >= ?)`, sevenDaysAgo, sevenDaysAgo).Scan(&active, &failedItems)
-	m.summaryValid = true
-	m.summaryRevision = revision
-	m.summaryExpires = now.Add(summaryCacheTTL)
-	m.summaryActive, m.summaryFailed = active, failedItems
-	return active, failedItems
+ (SELECT COUNT(1) FROM chat_download_items WHERE status = 'failed' AND finished_at >= ?)`, cutoff, cutoff).Scan(&active, &recentFailures)
+	if err != nil {
+		return 0, 0, err
+	}
+	return active, recentFailures, nil
 }
 
 // ActiveAccountJobs reports every non-terminal message or chat task that would
@@ -1033,15 +1153,11 @@ func (m *Manager) Stop() {
 	if m.inboxRetryStop != nil {
 		m.inboxRetryStop()
 	}
-	m.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(m.cancels))
-	for _, cancel := range m.cancels {
-		cancels = append(cancels, cancel)
-	}
-	m.mu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
+	// Every in-flight transfer is cancelled before the database closes, message
+	// and session alike. Session batches were left out, so shutdown cut them off
+	// mid-write against a pool that was closing underneath them; the same map is
+	// cancelled for a database outage, where the reasoning is identical.
+	m.cancelTransfersForDatabaseOutage()
 	m.mu.Lock()
 	listeners := make([]context.CancelFunc, 0, len(m.chatListeners))
 	for _, listener := range m.chatListeners {
@@ -1071,6 +1187,18 @@ func taskLogFiles(sources []source) []string {
 		names = append(names, item.OriginalName)
 	}
 	return names
+}
+
+// taskMessageText picks the text shown for a whole task. Every file of one
+// message or album carries the same caption, and a first file without one must
+// not hide a caption that a later file of the same group has.
+func taskMessageText(sources []source) string {
+	for _, item := range sources {
+		if item.MessageText != "" {
+			return item.MessageText
+		}
+	}
+	return ""
 }
 
 func (m *Manager) enqueueIntent(intent DownloadIntent, sources []source, direct directPeer) (Submission, error) {
@@ -1232,7 +1360,11 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 		m.emit(existingID, requestID, "request_attached", job.Status)
 		return Submission{RequestID: requestID, Job: job, Duplicate: true}, false, nil
 	}
-	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, parent_chat_id, config_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, parentChatID, configJSON, now, now); err != nil {
+	// The task's display text is one message's caption and is identical for every
+	// file of the task, so it is stored once on the task rather than repeated on
+	// every file row. The task list then never has to read download_items for it.
+	messageText := taskMessageText(sources)
+	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, parent_chat_id, config_json, message_text, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, parentChatID, configJSON, messageText, now, now); err != nil {
 		return Submission{}, false, err
 	}
 	for _, item := range sources {
@@ -1256,7 +1388,7 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	}
 	m.jobBecameVisible(parentChatID)
 	m.touch()
-	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, MessageText: sources[0].MessageText, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, MessageText: messageText, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
 	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
 	// Message tasks are interactive work. Wake chat workers so their next
@@ -1447,7 +1579,7 @@ func (m *Manager) run(job Job, sources []source) {
 	pending := make([]source, 0, len(sources))
 	waitingForOwner := false
 	for _, item := range sources {
-		if ctx.Err() != nil || m.status(job.ID) != "running" {
+		if ctx.Err() != nil || !m.runningOrUnknown(job.ID) {
 			return
 		}
 		if item.Status == "completed" || (item.Status == "downloaded" && regularFileExists(item.FinalPath)) {
@@ -1499,7 +1631,7 @@ func (m *Manager) run(job Job, sources []source) {
 		m.finishTaskWithoutPendingWork(job.ID, waitingForOwner)
 		return
 	}
-	if ctx.Err() != nil || m.status(job.ID) != "running" {
+	if ctx.Err() != nil || !m.runningOrUnknown(job.ID) {
 		return
 	}
 	// A media transfer must not fail merely because it is slow. Cancellation is
@@ -1517,7 +1649,9 @@ func (m *Manager) run(job Job, sources []source) {
 		if m.stopForInactiveParent(job.ID) {
 			return false
 		}
-		return m.status(job.ID) == "running"
+		// An unreadable status must not be mistaken for a stopped task: the
+		// watchdog would abort a healthy transfer.
+		return m.runningOrUnknown(job.ID)
 	}, func(timeout time.Duration) {
 		applog.Info("download", "task_no_progress_timeout", "job_id", job.ID, "timeout", timeout.String())
 	})
@@ -1587,7 +1721,7 @@ func (m *Manager) run(job Job, sources []source) {
 				messageIDs = append(messageIDs, item.MessageID)
 			}
 			opts := upstreamDL.Options{Dir: tmpDir, Template: temporaryFilenameTemplate, Group: true, Continue: true, Restart: restart && groupNumber == 0, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
-				if m.status(job.ID) != "running" {
+				if !m.runningOrUnknown(job.ID) {
 					return
 				}
 				watchdog.Touch()
@@ -1599,7 +1733,7 @@ func (m *Manager) run(job Job, sources []source) {
 					recordStateErr(m.markItemStarted(item))
 				}
 			}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
-				if m.status(job.ID) != "running" {
+				if !m.runningOrUnknown(job.ID) {
 					return
 				}
 				watchdog.Touch()
@@ -1654,7 +1788,7 @@ func (m *Manager) run(job Job, sources []source) {
 		// A database outage cancels the upstream context. Recovery may already
 		// have returned this job to the queue by the time this callback exits;
 		// never overwrite that recovery state with a transfer failure.
-		if m.status(job.ID) != "running" {
+		if !m.runningOrUnknown(job.ID) {
 			return
 		}
 		// Upstream can return an error while persisting resume metadata after all
@@ -1675,7 +1809,9 @@ func (m *Manager) run(job Job, sources []source) {
 	// A cancellation can race with the upstream call finishing. Never publish a
 	// completed temporary file after the user has paused or cancelled its job.
 	// The temporary file and upstream resume state stay intact for a later resume.
-	if status := m.status(job.ID); status != "running" {
+	// A status that cannot be read is not a cancellation: returning here would
+	// abandon the task in 下载中 with its files already on disk.
+	if status, ok := m.jobStatus(job.ID); ok && status != "running" {
 		if status == "paused" {
 			for _, item := range pending {
 				m.pauseItem(item)
@@ -1747,6 +1883,17 @@ func (m *Manager) stopForInactiveParent(jobID string) bool {
 // requeueStalledJob preserves completed media and upstream resume data while
 // releasing a task whose upstream call stopped making observable progress.
 func (m *Manager) requeueStalledJob(id string) error {
+	// Bounded exactly like the flood path. Without this a file the source never
+	// delivers restarts the task forever: each cycle reopens a Telegram client,
+	// rewinds the visible progress and never produces a terminal state, so the
+	// task can never be retried or diagnosed by the user either.
+	var attempts int
+	if err := m.db.QueryRow(`SELECT attempts FROM download_jobs WHERE id = ?`, id).Scan(&attempts); err != nil {
+		return err
+	}
+	if attempts >= maxStalledAttempts {
+		return errors.New("连续多次长时间无进度，已停止自动重试，请稍后手动重试")
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return m.transitionItems(id, "running", "queued", "下载长时间无进度，已自动重试未完成文件", `UPDATE download_items
 SET status = 'queued', error = '下载长时间无进度，已自动重试',
@@ -2085,6 +2232,10 @@ func (m *Manager) reconcileWorker(ctx context.Context) {
 			if err := m.settleQueuedJobsWithoutPendingWork(); err != nil {
 				applog.Error("download", "queued_job_settle_failed", "error", err.Error())
 			}
+			// A task stranded in 'running' is the mirror image of that one: it
+			// has pending files, but no pass selects a task in that state, so
+			// without this it waits for a restart that may never come.
+			m.recoverStrandedRunningJobsIfDue()
 		}
 		select {
 		case <-ctx.Done():
@@ -2248,7 +2399,29 @@ func (m *Manager) reconcilePublishedItems() error {
 		}
 	}
 	if len(items) > 0 {
-		_, err = m.db.Exec(`UPDATE download_jobs SET status = 'completed', error = '', updated_at = ? WHERE status IN ('queued', 'running', 'failed', 'partial') AND NOT EXISTS (SELECT 1 FROM download_items WHERE download_items.job_id = download_jobs.id AND download_items.status != 'completed')`, time.Now().UTC().Format(time.RFC3339Nano))
+		// Scoped to the tasks whose files were just published. Without the id
+		// filter this statement swept every task in a non-terminal state, and
+		// 'failed' and 'partial' are permanent: it re-examined a task's entire
+		// history on every pass, on a table that holds one row per task ever
+		// created. The work here is always about the tasks the loop above
+		// touched, and the settle pass covers a task stranded with nothing
+		// queued and nothing waiting.
+		ids := make([]string, 0, len(items))
+		seen := make(map[string]struct{}, len(items))
+		for _, item := range items {
+			if _, exists := seen[item.jobID]; exists {
+				continue
+			}
+			seen[item.jobID] = struct{}{}
+			ids = append(ids, item.jobID)
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, time.Now().UTC().Format(time.RFC3339Nano))
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		_, err = m.db.Exec(`UPDATE download_jobs SET status = 'completed', error = '', updated_at = ? WHERE id IN (`+placeholders+`) AND status IN ('queued', 'running', 'failed', 'partial') AND NOT EXISTS (SELECT 1 FROM download_items WHERE download_items.job_id = download_jobs.id AND download_items.status != 'completed')`, args...)
 	}
 	return err
 }
@@ -2277,7 +2450,7 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 	lock := m.jobLock(jobID)
 	lock.Lock()
 	defer lock.Unlock()
-	if m.status(jobID) != "running" {
+	if !m.runningOrUnknown(jobID) {
 		return nil
 	}
 	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
@@ -2566,9 +2739,35 @@ func (m *Manager) signalChatDownload() {
 	}
 }
 func (m *Manager) status(id string) string {
-	var status string
-	_ = m.db.QueryRow(`SELECT status FROM download_jobs WHERE id = ?`, id).Scan(&status)
+	status, _ := m.jobStatus(id)
 	return status
+}
+
+// jobStatus reports a task's durable status and whether the read succeeded.
+// A worker deciding its own fate must never confuse "the database could not
+// answer" with "the task is no longer running".
+func (m *Manager) jobStatus(id string) (string, bool) {
+	var status string
+	if err := m.db.QueryRow(`SELECT status FROM download_jobs WHERE id = ?`, id).Scan(&status); err != nil {
+		return "", false
+	}
+	return status, true
+}
+
+// runningOrUnknown reports whether a worker should keep working on its task.
+//
+// A status read that fails is treated as "still running". The alternative was
+// the cause of a task that could never finish: one transient database error -
+// a pool timeout, a momentary blip too short for the health monitor to notice -
+// made the worker read an empty status, conclude the task had been taken away
+// from it, and return. The task stayed in 下载中 with its files queued, and
+// nothing would ever look at it again, because every other pass selects either
+// queued tasks or waiting items. Continuing is safe: if the outage is real the
+// next write fails loudly and the task is failed with a reason, which is a
+// state the user can act on.
+func (m *Manager) runningOrUnknown(id string) bool {
+	status, ok := m.jobStatus(id)
+	return !ok || status == "running"
 }
 func (m *Manager) itemStatus(dialogKey string, messageID int) string {
 	var status string
@@ -2614,9 +2813,10 @@ func (m *Manager) Resume(id string) error {
 	if m.status(id) != "paused" {
 		return errors.New("当前任务不能恢复")
 	}
-	if err := m.transitionItems(id, "paused", "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
+	if err := m.transitionItems(id, "paused", "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
 		return fmt.Errorf("恢复任务: %w", err)
 	}
+	m.resetAttempts(id)
 	m.signal()
 	return nil
 }
@@ -2635,13 +2835,25 @@ func (m *Manager) Retry(id string) error {
 	if accountID == "" {
 		return errors.New("该任务创建于账户绑定功能启用前，无法安全重试，请重新创建下载任务")
 	}
-	// Attempts count real worker runs, not clicks. The worker increments it only
-	// after atomically claiming this queued task.
-	if err := m.transitionItems(id, status, "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
+	// attempts bounds automatic retries. It is not reset by the automatic paths,
+	// which is the point, but a click is a new budget: leaving the counter at the
+	// cap made the next flood or stall fail the task on its first recurrence with
+	// "已停止自动重试", so the retry the user asked for changed nothing.
+	if err := m.transitionItems(id, status, "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
 		return fmt.Errorf("重试任务: %w", err)
 	}
+	m.resetAttempts(id)
 	m.signal()
 	return nil
+}
+
+// resetAttempts gives a task the full automatic-retry budget again, for the
+// paths a person triggered. Those are the only ones allowed to do it: an
+// automatic path resetting the counter would remove the bound it exists for.
+func (m *Manager) resetAttempts(id string) {
+	if _, err := m.db.Exec(`UPDATE download_jobs SET attempts = 0 WHERE id = ?`, id); err != nil {
+		applog.Error("download", "attempt_budget_reset_failed", "job_id", id, "error", err.Error())
+	}
 }
 func (m *Manager) Cancel(id string) error {
 	lock := m.jobLock(id)

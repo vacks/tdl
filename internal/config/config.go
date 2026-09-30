@@ -14,6 +14,13 @@ type Config struct {
 	AdminUsername   string
 	InitialPassword string
 	DatabaseDSN     string
+	// TrustedProxies lists the addresses whose forwarding headers are believed.
+	// The headers are never trusted from anyone else: behind the reverse proxy
+	// the README recommends, every request - an attacker's and the
+	// administrator's alike - arrives from the proxy, so believing them
+	// unconditionally would let any visitor forge the scheme the session cookie
+	// and the same-origin check are derived from.
+	TrustedProxies []string
 }
 
 func Load() (Config, error) {
@@ -24,6 +31,11 @@ func Load() (Config, error) {
 		AdminUsername:   value("TDL_ADMIN_USERNAME", "admin"),
 		InitialPassword: value("TDL_ADMIN_INITIAL_PASSWORD", "admin"),
 		DatabaseDSN: strings.TrimSpace(os.Getenv("TDL_DATABASE_URL")),
+	}
+	for _, entry := range strings.Split(os.Getenv("TDL_TRUSTED_PROXIES"), ",") {
+		if trimmed := strings.TrimSpace(entry); trimmed != "" {
+			cfg.TrustedProxies = append(cfg.TrustedProxies, trimmed)
+		}
 	}
 	if cfg.DatabaseDSN == "" {
 		return Config{}, fmt.Errorf("TDL_DATABASE_URL is required")

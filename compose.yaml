@@ -5,8 +5,35 @@ services:
       POSTGRES_DB: tdl
       POSTGRES_USER: tdl
       POSTGRES_PASSWORD: tdl-postgres-7rQ4mX9pL2vN8kD6
+      # This database is the permanent download history and the only
+      # de-duplication record, and it is expected to hold tens of millions of
+      # rows. PostgreSQL's defaults are sized for a small database: with the
+      # stock 128MB shared_buffers and 4MB work_mem, the sorts and index scans
+      # the larger queries need spill to disk long before the queries themselves
+      # are the problem. Raise these together with the container memory limit;
+      # shared_buffers is commonly 25% of it, effective_cache_size about 50-75%,
+      # and work_mem is per sort node, not per connection.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - random_page_cost=1.1
     volumes:
       - ./postgres:/var/lib/postgresql/data
+    # Parallel query and large sorts use shared memory. Docker defaults it to
+    # 64MB, which is small enough that PostgreSQL can fail a query outright
+    # rather than fall back.
+    shm_size: 256mb
     networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
@@ -16,7 +43,7 @@ services:
     restart: unless-stopped
 
   app:
-    image: ghcr.io/vacks/tdl:1.4.1
+    image: ghcr.io/vacks/tdl:1.5.0
     ports:
       - "127.0.0.1:8080:8080"
     environment:
@@ -24,8 +51,18 @@ services:
       TDL_DOWNLOAD_DIR: /downloads
       TDL_LISTEN_ADDR: :8080
       TDL_ADMIN_USERNAME: admin
+      # Change this before the service is reachable from anywhere but this
+      # machine. It is the password the administrator account is created with,
+      # and it is also printed in the README, so leaving it here means the
+      # documented deployment ships a publicly known administrator login.
       TDL_ADMIN_INITIAL_PASSWORD: admin
       TDL_DATABASE_URL: postgres://tdl:tdl-postgres-7rQ4mX9pL2vN8kD6@postgres:5432/tdl?sslmode=disable
+      # When a reverse proxy sits in front of this service, list the addresses
+      # whose X-Forwarded-Proto header may be believed, for example
+      # "127.0.0.1" or "172.16.0.0/12". Without it the header is ignored, which
+      # is the safe default: any client can send it, and it decides whether the
+      # session cookie is marked Secure.
+      # TDL_TRUSTED_PROXIES: 127.0.0.1
     volumes:
       - ./data:/data
       - ./downloads:/downloads

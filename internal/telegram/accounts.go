@@ -157,7 +157,19 @@ func (m *Manager) List() ([]Account, string) {
 	return accounts, m.current
 }
 
+// StartQR begins a QR login and returns the account record it created.
+//
+// A login already waiting for its code is returned as it is rather than being
+// duplicated. Every call otherwise creates another account record, another
+// persisted login job and another background QR goroutine holding its own
+// MTProto connection, so a double click, a retried request or the renew flow in
+// the accounts view left two half-authenticated accounts behind. Unlike task
+// creation, which is deduplicated by the media identity, this had no guard at
+// all.
 func (m *Manager) StartQR() (Account, error) {
+	if existing, ok := m.pendingLogin(); ok {
+		return existing, nil
+	}
 	id, err := randomID()
 	if err != nil {
 		return Account{}, err
@@ -180,6 +192,21 @@ func (m *Manager) StartQR() (Account, error) {
 	applog.Info("telegram", "login_started", "account_id", id)
 	go m.runQR(ctx, id)
 	return account, nil
+}
+
+// pendingLogin reports a login that has not reached a verdict yet. Those are
+// the states a second request would duplicate: 'starting' before the code is
+// issued, and 'waiting_for_qr' while it waits to be scanned or for a password.
+func (m *Manager) pendingLogin() (Account, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, account := range m.accounts {
+		switch account.State {
+		case "starting", "waiting_for_qr":
+			return account, true
+		}
+	}
+	return Account{}, false
 }
 
 func (m *Manager) SubmitPassword(id, password string) error {
@@ -453,14 +480,6 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 	dispatchReaction := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass, updateType string) {
 		m.dispatchEditedReaction(updateCtx, accountID, updateType, entities, raw, client, func(_ context.Context, event ReactionEvent) { m.dispatchReaction(accountID, event) })
 	}
-	dispatcher.OnEditMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditMessage) error {
-		dispatchReaction(updateCtx, entities, update.Message, "edit_message")
-		return nil
-	})
-	dispatcher.OnEditChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditChannelMessage) error {
-		dispatchReaction(updateCtx, entities, update.Message, "edit_channel_message")
-		return nil
-	})
 	dispatcher.OnMessageReactions(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateMessageReactions) error {
 		reactions := &update.Reactions
 		emojis := ownReactionEmojis(reactions)
@@ -528,6 +547,25 @@ func (m *Manager) runUpdateConnection(ctx context.Context, accountID string, hub
 		return nil
 	})
 	dispatcher.OnNewChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateNewChannelMessage) error {
+		dispatchMessage(updateCtx, entities, update.Message)
+		return nil
+	})
+	// An edited message is also offered to the download path. Telegram only
+	// reports the new state, so a message edited to attach media - or one whose
+	// media was replaced - was previously never considered: the task's range is
+	// fixed by its watermark and nothing rewound it.
+	//
+	// Reusing the new-message admission is safe and cheap. The inbox is unique
+	// per (account, dialog, message) and an item the task already holds is left
+	// alone, so an edit that only changed a caption or the reaction bookkeeping
+	// costs one filtered lookup and downloads nothing twice.
+	dispatcher.OnEditMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditMessage) error {
+		dispatchReaction(updateCtx, entities, update.Message, "edit_message")
+		dispatchMessage(updateCtx, entities, update.Message)
+		return nil
+	})
+	dispatcher.OnEditChannelMessage(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateEditChannelMessage) error {
+		dispatchReaction(updateCtx, entities, update.Message, "edit_channel_message")
 		dispatchMessage(updateCtx, entities, update.Message)
 		return nil
 	})

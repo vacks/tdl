@@ -131,6 +131,69 @@ func TestPostgresVisibleTaskCountsUseStartupCache(t *testing.T) {
 	}
 }
 
+// The task list has to answer from the maintained summary and the task's own
+// row, never from the file rows. That is the whole point of the summary: a task
+// holds one file row per message or per linked comment, which is unbounded, so
+// reading them made a page cost the union of its tasks' file histories. The
+// second half of this test is what pins it - the figures follow the summary even
+// when the rows disagree with it, which cannot happen if the query still
+// aggregates download_items.
+func TestPostgresTaskListReadsTheSummaryNotTheFileRows(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, message_text, created_at, updated_at) VALUES ('list-job','tg://message','channel','channel:list','名字','account','queued','一条说明',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, message_text, status) VALUES
+ ('list-job','channel','channel:list',1,1,'a.bin','一条说明','completed'),
+ ('list-job','channel','channel:list',1,2,'b.bin','一条说明','completed'),
+ ('list-job','channel','channel:list',1,3,'c.bin','一条说明','queued')`); err != nil {
+		t.Fatal(err)
+	}
+	jobs, _, _, err := m.ListCursor("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("list returned %d tasks; want 1", len(jobs))
+	}
+	if jobs[0].TotalItems != 3 || jobs[0].CompletedItems != 2 {
+		t.Fatalf("list reported %d/%d files; want 3 total with 2 completed", jobs[0].TotalItems, jobs[0].CompletedItems)
+	}
+	if jobs[0].MessageText != "一条说明" {
+		t.Fatalf("list reported message text %q; want it taken from the task row", jobs[0].MessageText)
+	}
+
+	// Diverging the summary from the rows is impossible through the application,
+	// which is exactly why it isolates the query: only a list that reads the
+	// summary can report these figures.
+	if _, err := db.Exec(`UPDATE download_item_stats SET total_items = 99, completed_items = 7 WHERE job_id = 'list-job'`); err != nil {
+		t.Fatal(err)
+	}
+	jobs, _, _, err = m.ListCursor("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].TotalItems != 99 || jobs[0].CompletedItems != 7 {
+		t.Fatalf("list still reads the file rows: got %+v; want the summary's 99/7", jobs)
+	}
+}
+
 func TestPostgresChatControlsUpdateOnlyMediaIndex(t *testing.T) {
 	url := os.Getenv("TDL_TEST_POSTGRES_URL")
 	if url == "" {
@@ -534,7 +597,7 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, final_path, status, discovered_at) VALUES ('reconcile-chat','channel:reconcile',7,'published.bin',?,'downloaded',?)`, path, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.reconcileChatPublishedItems(); err != nil {
+	if err := m.reconcileChatPublishedItems(nil); err != nil {
 		t.Fatal(err)
 	}
 	var itemStatus, mediaStatus, finalPath string
@@ -546,7 +609,10 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	}
 }
 
-func TestPostgresSummaryIncludesChatDownloadItems(t *testing.T) {
+// The counts a person asks for through the Bot must cover both queue types: a
+// session task owns an indexed file queue rather than child jobs, so counting
+// only message items would report zero while a session download is running.
+func TestPostgresDownloadCountsIncludeChatDownloadItems(t *testing.T) {
 	url := os.Getenv("TDL_TEST_POSTGRES_URL")
 	if url == "" {
 		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
@@ -564,21 +630,24 @@ func TestPostgresSummaryIncludesChatDownloadItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES ('summary-message','tg://message','queued',?,?)`, now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES ('counts-message','tg://message','queued',?,?)`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status, finished_at) VALUES ('summary-message','channel:summary',1,1,'message.bin','queued',''), ('summary-message','channel:summary',1,2,'failed.bin','failed',?)`, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status, finished_at) VALUES ('counts-message','channel:counts',1,1,'message.bin','queued',''), ('counts-message','channel:counts',1,2,'failed.bin','failed',?)`, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('summary-chat','tg://chat','channel','channel:chat-summary',2,'test','account','downloading','completed','{}',?,?)`, now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('counts-chat','tg://chat','channel','channel:chat-counts',2,'test','account','downloading','completed','{}',?,?)`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, status, finished_at, discovered_at) VALUES ('summary-chat','channel:chat-summary',1,'chat.bin','running','',?), ('summary-chat','channel:chat-summary',2,'chat-failed.bin','failed',?,?)`, now, now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, status, finished_at, discovered_at) VALUES ('counts-chat','channel:chat-counts',1,'chat.bin','running','',?), ('counts-chat','channel:chat-counts',2,'chat-failed.bin','failed',?,?)`, now, now, now); err != nil {
 		t.Fatal(err)
 	}
-	active, failed := m.Summary()
-	if active != 2 || failed != 2 {
-		t.Fatalf("Summary()=%d active, %d failed; want 2, 2", active, failed)
+	active, recentFailures, err := m.DownloadCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != 2 || recentFailures != 2 {
+		t.Fatalf("DownloadCounts() = %d active, %d recent failures; want 2, 2", active, recentFailures)
 	}
 }
 
@@ -668,6 +737,134 @@ func TestPostgresPausingChatReleasesClaimsSoWaitingMessageTaskProceeds(t *testin
 	}
 }
 
+// A media claim exists to stop another task downloading the same file, so a
+// claim held by a task that cannot transfer protects nothing and blocks
+// everyone. Deleting or purging a session task removes its ability to run while
+// leaving the claim behind, and the affected message task then waits forever on
+// an owner that no longer exists - a state the user cannot clear by retrying,
+// because retrying returns to the same wait. The orphan sweep is the backstop
+// for claims stranded before these releases existed.
+func TestPostgresRemovingChatTaskReleasesItsMediaClaims(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seedChatJob := func(id, status string) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES (?, 'tg://chat','channel',? ,1,'test','account',?,'completed',?,?)`, id, "channel:"+id, status, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedBlockedMessage := func(jobID string, messageID int) source {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES (?,'tg://message','channel',?,'test','account','queued',?,?)`, jobID, "channel:"+jobID, now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES (?, 'channel', ?, 1, ?, 'media.bin', 'queued')`, jobID, "channel:"+jobID, messageID); err != nil {
+			t.Fatal(err)
+		}
+		return source{Item: Item{DialogKey: "channel:" + jobID, MessageID: messageID}}
+	}
+	wantsMedia := func(t *testing.T, ownerID string, messageID int) bool {
+		t.Helper()
+		item := source{Item: Item{DialogKey: "channel:" + ownerID, MessageID: messageID}}
+		if _, err := db.Exec(`UPDATE downloaded_media SET dialog_key = ? WHERE owner_id = ?`, item.DialogKey, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		claim, _, err := m.claimMessageMedia("message-blocked", item)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claim == "waiting"
+	}
+
+	// Deleting keeps the task row for history, so only the release inside the
+	// delete can tell that the claim is dead.
+	seedChatJob("chat-del", ChatStatusCompleted)
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:chat-del',11,'claimed','chat','chat-del',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	seedBlockedMessage("message-del", 11)
+	if !wantsMedia(t, "chat-del", 11) {
+		t.Fatal("a claim held by an active-looking chat task must make the message task wait")
+	}
+	if err := m.DeleteChat("chat-del"); err != nil {
+		t.Fatalf("DeleteChat(): %v", err)
+	}
+	var claims int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_id = 'chat-del'`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Fatalf("deleted chat task still owns %d claim(s); want 0", claims)
+	}
+
+	// Purging removes the task row, which would leave a claim pointing at an id
+	// nothing can ever match.
+	seedChatJob("chat-purge", ChatStatusCancelled)
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:chat-purge',12,'claimed','chat','chat-purge',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PurgeChat("chat-purge"); err != nil {
+		t.Fatalf("PurgeChat(): %v", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_id = 'chat-purge'`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Fatalf("purged chat task still owns %d claim(s); want 0", claims)
+	}
+
+	// The backstop: a claim stranded before those releases existed, whose owner
+	// cannot transfer any more.
+	seedChatJob("chat-stale", ChatStatusFailed)
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:chat-stale',13,'claimed','chat','chat-stale',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:chat-gone',14,'claimed','chat','chat-deleted-long-ago',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.orphanedMediaClaims(); err != nil {
+		t.Fatalf("orphanedMediaClaims(): %v", err)
+	}
+	for _, owner := range []string{"chat-stale", "chat-deleted-long-ago"} {
+		if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_id = ?`, owner).Scan(&claims); err != nil {
+			t.Fatal(err)
+		}
+		if claims != 0 {
+			t.Fatalf("orphan sweep left %d claim(s) owned by %s; want 0", claims, owner)
+		}
+	}
+	// A claim held by a task that can still run must survive the sweep: removing
+	// it would let a second task download the same file.
+	seedChatJob("chat-live", ChatStatusDownloading)
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES ('channel:chat-live',15,'claimed','chat','chat-live',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.orphanedMediaClaims(); err != nil {
+		t.Fatalf("orphanedMediaClaims(): %v", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_id = 'chat-live'`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 1 {
+		t.Fatalf("orphan sweep removed a claim held by a runnable task; want it kept")
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -701,6 +898,127 @@ func seedWaitingItem(t *testing.T, db *database, jobID, dialogKey string, messag
 	}
 	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?,?,'claimed','chat',?,?)`, dialogKey, messageID, chatOwner, now); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A task in 'running' is selected by nothing: the scheduler wants 'queued' and
+// the claim reconciler wants waiting items under queued, partial or failed
+// tasks. So a worker that gave up on its task while the process stayed up left
+// it in 下载中 with its files queued, and only a restart would ever move it.
+// This drives the sweep the maintenance loop actually calls, and checks the two
+// things that make it safe: it recovers that task, and it leaves alone a task
+// that some worker in this process still owns.
+func TestPostgresStrandedRunningTaskIsRecoveredWithoutARestart(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	// A task whose worker vanished: no entry in m.cancels, and old enough that
+	// the claim-to-registration gap cannot explain it.
+	seedReconcileJob(t, db, "stranded-job", "channel:stranded", "running")
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, started_at) VALUES ('stranded-job','channel','channel:stranded',1,1,'stranded.bin','running',?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE download_jobs SET updated_at = ? WHERE id = 'stranded-job'`, time.Now().UTC().Add(-2*jobLeaseTimeout).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	// A task this process still owns must be untouched, however long it has been
+	// silent: a slow but healthy transfer writes no progress to the database.
+	seedReconcileJob(t, db, "live-job", "channel:live", "running")
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, started_at) VALUES ('live-job','channel','channel:live',1,1,'live.bin','running',?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE download_jobs SET updated_at = ? WHERE id = 'live-job'`, time.Now().UTC().Add(-2*jobLeaseTimeout).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	_, liveCancel := context.WithCancel(context.Background())
+	defer liveCancel()
+	m.mu.Lock()
+	m.cancels = map[string]context.CancelFunc{"live-job": liveCancel}
+	m.mu.Unlock()
+
+	m.recoverStrandedRunningJobsIfDue()
+
+	var jobStatus string
+	if err := db.QueryRow(`SELECT status FROM download_jobs WHERE id = 'stranded-job'`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "queued" {
+		t.Fatalf("stranded task status = %q; want queued so a worker can claim it again", jobStatus)
+	}
+	wantDownloadItemStatus(t, db, "stranded-job", "queued")
+	if err := db.QueryRow(`SELECT status FROM download_jobs WHERE id = 'live-job'`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "running" {
+		t.Fatalf("task with a live worker was requeued to %q; want it left running", jobStatus)
+	}
+	wantDownloadItemStatus(t, db, "live-job", "running")
+}
+
+// A listener event that used up its five fast attempts is a download request the
+// user made. It has no other way back into the queue: the dispatcher returns nil
+// to gotd, which advances Telegram's update state, so the same update is never
+// delivered again, and a group task had no gap walk either. It was therefore
+// dropped silently. This drives the maintenance sweep the worker loop calls and
+// checks both halves of the replacement: a recoverable event is offered again,
+// and one that has exhausted the total budget is left alone with its error kept.
+func TestPostgresExhaustedListenerEventIsRetriedNotDropped(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), chatEventWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-2 * inboxReviveInterval).Format(time.RFC3339Nano)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seed := func(id int64, attempts int) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO chat_message_inbox(id, account_id, dialog_key, dialog_name, dialog_id, message_id, peer_type, peer_id, peer_hash, status, attempts, next_attempt_at, error, created_at, updated_at)
+ VALUES (?, 'account', ?, 'test', 1, ?, 'channel', 1, 0, 'failed', ?, ?, 'boom', ?, ?)`, id, "channel:revive", id, attempts, now, now, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(1, inboxFastAttempts+1)
+	seed(2, inboxAttemptLimit)
+
+	m.runMaintenanceSweepsIfDue()
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM chat_message_inbox WHERE id = 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("an event with %d attempts stayed %q; want pending so it is retried", inboxFastAttempts+1, status)
+	}
+	var errorText string
+	if err := db.QueryRow(`SELECT status, error FROM chat_message_inbox WHERE id = 2`).Scan(&status, &errorText); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || errorText != "boom" {
+		t.Fatalf("an event at the attempt limit is %q/%q; want it left failed with its error kept", status, errorText)
 	}
 }
 
@@ -1173,6 +1491,13 @@ func TestPostgresListenerGapCandidatesCoverChannels(t *testing.T) {
 		{"gap-channel", "channel", 1000, 1, chatScanCompleted, ChatStatusListening, true},
 		{"gap-channel-downloading", "channel", 1000, 1, chatScanCompleted, ChatStatusDownloading, true},
 		{"gap-saved", "self", -1, 1, chatScanCompleted, ChatStatusListening, true},
+		// A supergroup is identified as 'chat'. Leaving it out meant a group's
+		// task showed 监听中 while recovering nothing published during downtime,
+		// because the live stream is the only other source and it was not
+		// connected then.
+		{"gap-group", "chat", 1000, 1, chatScanCompleted, ChatStatusListening, true},
+		{"gap-group-downloading", "chat", 1000, 1, chatScanCompleted, ChatStatusDownloading, true},
+		{"gap-group-not-listening", "chat", 1000, 0, chatScanCompleted, ChatStatusDownloading, false},
 		{"gap-channel-not-listening", "channel", 1000, 0, chatScanCompleted, ChatStatusDownloading, false},
 		{"gap-channel-scanning", "channel", 1000, 1, chatScanIndexing, ChatStatusScanning, false},
 		{"gap-channel-completed", "channel", 1000, 1, chatScanCompleted, ChatStatusCompleted, false},
@@ -1199,11 +1524,12 @@ func TestPostgresListenerGapCandidatesCoverChannels(t *testing.T) {
 	}
 }
 
-// The dashboard figures come from one statement holding four subqueries, two
-// per figure. Column order is the whole contract there, so this pins both
-// numbers against data that reaches them from different tables, and checks that
-// the memoized answer only moves once the revision does.
-func TestPostgresSummaryCountsBothQueuesAndRecentFailures(t *testing.T) {
+// The requested counts come from one statement holding four subqueries, two per
+// figure. Column order is the whole contract there, so this pins both numbers
+// against data that reaches them from different tables, and checks that the
+// answer is recomputed rather than cached: the Bot asks for it once, and a
+// stale answer would be wrong exactly when somebody is looking.
+func TestPostgresDownloadCountsCountBothQueuesAndRecentFailures(t *testing.T) {
 	url := os.Getenv("TDL_TEST_POSTGRES_URL")
 	if url == "" {
 		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
@@ -1221,35 +1547,44 @@ func TestPostgresSummaryCountsBothQueuesAndRecentFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	seedReconcileJob(t, db, "summary-job", "channel:summary", "running")
-	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, finished_at) VALUES ('summary-job','channel','channel:summary',1,1,'queued.bin','queued',''), ('summary-job','channel','channel:summary',1,2,'failed.bin','failed',?)`, now); err != nil {
+	seedReconcileJob(t, db, "counts-job", "channel:counts", "running")
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, finished_at) VALUES ('counts-job','channel','channel:counts',1,1,'queued.bin','queued',''), ('counts-job','channel','channel:counts',1,2,'failed.bin','failed',?)`, now); err != nil {
 		t.Fatal(err)
 	}
 	// A session task contributes through its trigger-maintained counters rather
 	// than a direct count, which is the branch a column swap would break.
-	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('summary-chat','tg://chat','channel','channel:summary-chat',1,'test','account','downloading','completed',?,?)`, now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('counts-chat','tg://chat','channel','channel:counts-chat',1,'test','account','downloading','completed',?,?)`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, status, discovered_at) VALUES ('summary-chat','channel:summary-chat',1,'channel',1,'queued',?)`, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, status, discovered_at) VALUES ('counts-chat','channel:counts-chat',1,'channel',1,'queued',?)`, now); err != nil {
 		t.Fatal(err)
 	}
 
-	active, failedItems := m.Summary()
-	if active != 2 || failedItems != 1 {
-		t.Fatalf("Summary() = (%d, %d), want (2, 1)", active, failedItems)
-	}
-
-	// A write that bypasses the manager leaves the revision alone, so the
-	// memoized figures stand.
-	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('summary-job','channel','channel:summary',1,3,'late.bin','queued')`); err != nil {
+	active, recentFailures, err := m.DownloadCounts()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if active, failedItems = m.Summary(); active != 2 || failedItems != 1 {
-		t.Fatalf("Summary() before the revision moved = (%d, %d), want the memoized (2, 1)", active, failedItems)
+	if active != 2 || recentFailures != 1 {
+		t.Fatalf("DownloadCounts() = (%d, %d), want (2, 1)", active, recentFailures)
 	}
-	m.touch()
-	if active, failedItems = m.Summary(); active != 3 || failedItems != 1 {
-		t.Fatalf("Summary() after the revision moved = (%d, %d), want (3, 1)", active, failedItems)
+
+	// The count is answered when it is asked for, so a write that the manager
+	// never saw must still be reflected.
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status) VALUES ('counts-job','channel','channel:counts',1,3,'late.bin','queued')`); err != nil {
+		t.Fatal(err)
+	}
+	if active, recentFailures, err = m.DownloadCounts(); err != nil || active != 3 || recentFailures != 1 {
+		t.Fatalf("DownloadCounts() after an external write = (%d, %d, %v), want (3, 1, nil)", active, recentFailures, err)
+	}
+
+	// A failure older than the window ages out of the recent figure instead of
+	// pinning it for as long as the row is retained.
+	old := time.Now().UTC().Add(-40 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`UPDATE download_items SET finished_at = ? WHERE original_name = 'failed.bin'`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, recentFailures, err = m.DownloadCounts(); err != nil || recentFailures != 0 {
+		t.Fatalf("DownloadCounts() recent failures = (%d, %v), want (0, nil)", recentFailures, err)
 	}
 }
 

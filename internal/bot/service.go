@@ -84,6 +84,21 @@ type Service struct {
 	// downloadWake receives coalesced domain events. It shortens lifecycle
 	// updates without making the Bot poll the task table more aggressively.
 	downloadWake chan struct{}
+	// dispatch hands commands to workers and tracks which of them the stored
+	// offset may move past. See updateDispatch.
+	dispatch *updateDispatch
+	// commandSlots bounds how many commands run at once. A command waits mostly
+	// on Telegram resolution, which is paced per account anyway, so a small pool
+	// removes the head-of-line wait without adding load.
+	commandSlots chan struct{}
+	// acknowledgeMu serializes the offset file write, which several workers can
+	// otherwise attempt at the same moment.
+	acknowledgeMu sync.Mutex
+	// chatLocks keep the commands of one conversation in submission order. The
+	// slot is chosen by chat id, so two unrelated chats occasionally share one;
+	// that only costs them a little concurrency, and it avoids a map of locks
+	// that would have to be evicted.
+	chatLocks [16]sync.Mutex
 }
 
 type updateCursor struct {
@@ -138,7 +153,7 @@ const (
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1)}
+	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]struct{}{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1), dispatch: newUpdateDispatch(), commandSlots: make(chan struct{}, commandWorkers)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -198,6 +213,10 @@ func (s *Service) loop() {
 			s.known, s.tracked, s.lifecycle, s.deleted, s.dirty, s.suppressedStatus, s.ready, s.helpSent, s.helpRetry, s.lastLiveEdit, s.liveRendered, s.retryUpdates, s.nextLiveEdit = map[string]string{}, map[string]trackedRef{}, map[string]map[int64]messageRef{}, map[string]struct{}{}, map[string]struct{}{}, map[string]string{}, true, map[int64]bool{}, map[int64]helpRetry{}, map[string]time.Time{}, map[string]string{}, map[int64]int{}, time.Time{}
 			s.chatTracked = map[string]chatTrackedRef{}
 			s.listPages = map[string]listPageState{}
+			// A different Bot identity starts from its own offset. Workers still
+			// finishing for the previous token must not be able to acknowledge
+			// into this one, so the tracking starts empty.
+			s.dispatch = newUpdateDispatch()
 			commandsChanged = true
 		}
 		s.mu.Unlock()
@@ -214,23 +233,27 @@ func (s *Service) loop() {
 		if err == nil {
 			failures = 0
 			for _, update := range updates {
-				if !s.handle(cfg, update) {
-					// Keep this update (and every later one) visible to getUpdates.
-					// Advancing beyond a transient submission failure would lose a
-					// user command permanently.
-					if !waitContext(s.ctx, s.retryDelay(update.UpdateID)) {
-						return
-					}
-					break
+				s.mu.Lock()
+				acknowledged := s.offset
+				s.mu.Unlock()
+				if update.UpdateID < acknowledged {
+					continue
 				}
-				s.clearRetry(update.UpdateID)
-				// Do not accept another update until this one has been durably
-				// acknowledged. Advancing only in memory would lose a successfully
-				// handled command if the process crashes after a filesystem failure.
-				if !s.advanceOffset(cfg.Token, update.UpdateID+1) {
-					return
+				// All workers busy: leave the update unclaimed rather than queue
+				// behind them. Telegram redelivers everything at or above the
+				// stored offset, so offering it again later loses nothing.
+				select {
+				case s.commandSlots <- struct{}{}:
+				default:
+					continue
 				}
+				if !s.dispatch.claim(update.UpdateID) {
+					<-s.commandSlots
+					continue
+				}
+				go s.runCommand(cfg, update)
 			}
+			s.acknowledgeHandled(cfg.Token)
 		} else {
 			failures++
 			delay := pollRetryDelay(failures)
@@ -242,6 +265,61 @@ func (s *Service) loop() {
 			}
 			continue
 		}
+	}
+}
+
+// commandWorkers bounds how many commands are handled at once. Commands do
+// Telegram resolution and outbound Bot API calls, both already paced, so the
+// pool exists to stop one slow command delaying the others rather than to add
+// throughput.
+const commandWorkers = 4
+
+// runCommand handles one update, retrying in its own goroutine so a failure
+// cannot hold the poll loop. It keeps the durable-acknowledgement the loop had:
+// the update stays unfinished until it succeeds, and the stored offset cannot
+// pass an unfinished update, so a crash during the backoff still leaves the
+// command to be redelivered.
+func (s *Service) runCommand(cfg settings.Bot, update update) {
+	defer func() { <-s.commandSlots }()
+	lock := s.commandLock(update)
+	lock.Lock()
+	defer lock.Unlock()
+	for {
+		if s.handle(cfg, update) {
+			s.clearRetry(update.UpdateID)
+			s.dispatch.finish(update.UpdateID)
+			s.acknowledgeHandled(cfg.Token)
+			return
+		}
+		if !waitContext(s.ctx, s.retryDelay(update.UpdateID)) {
+			return
+		}
+	}
+}
+
+// commandLock returns the mutex that keeps one conversation's commands in
+// submission order, whichever worker picked them up.
+func (s *Service) commandLock(update update) *sync.Mutex {
+	var chatID int64
+	if update.Message != nil {
+		chatID = update.Message.Chat.ID
+	} else if update.CallbackQuery != nil {
+		chatID = update.CallbackQuery.From.ID
+	}
+	return &s.chatLocks[uint64(chatID)%uint64(len(s.chatLocks))]
+}
+
+// acknowledgeHandled stores the highest offset that every finished command
+// below it allows, and nothing more: a gap keeps the later updates visible to
+// getUpdates so they are redelivered rather than lost.
+func (s *Service) acknowledgeHandled(token string) {
+	s.acknowledgeMu.Lock()
+	defer s.acknowledgeMu.Unlock()
+	s.mu.Lock()
+	current := s.offset
+	s.mu.Unlock()
+	if next := s.dispatch.acknowledge(current); next > current {
+		s.advanceOffset(token, next)
 	}
 }
 
@@ -1671,7 +1749,26 @@ func (s *Service) statusText() string {
 		}
 		receive, transmit = sample.ReceiveBPS, sample.TransmitBPS
 	}
-	return fmt.Sprintf("<b>当前状态</b>\n版本：TDL 管理 %s · 上游 TDL %s\n登录账号：%s\nCPU：%.1f%%\n内存：%.1f%%\n网络：↓ %s/s · ↑ %s/s", buildinfo.Version, upstream.Version, html.EscapeString(accountName), cpu, memory, bytesLabel(int64(receive)), bytesLabel(int64(transmit)))
+	// Both figures are counted when this command is sent and never polled. They
+	// are left out entirely, rather than shown as zero, when the database cannot
+	// answer: a person reading "0 个下载中" would otherwise be told the opposite
+	// of what is happening.
+	counts := "下载中文件：暂时无法读取\n最近 30 天失败：暂时无法读取\n监听事件：暂时无法读取"
+	if s.downloads != nil {
+		if active, recentFailures, err := s.downloads.DownloadCounts(); err == nil {
+			counts = fmt.Sprintf("下载中文件：%d\n最近 30 天失败：%d", active, recentFailures)
+		}
+		// An event that stopped being retried is a download the user asked for
+		// and did not get, so it is reported next to the download counts rather
+		// than only appearing in the service log.
+		if pending, stopped, err := s.downloads.ListenerInboxCounts(); err == nil {
+			counts += fmt.Sprintf("\n监听事件：%d 处理中", pending)
+			if stopped > 0 {
+				counts += fmt.Sprintf(" · %d 已停止重试", stopped)
+			}
+		}
+	}
+	return fmt.Sprintf("<b>当前状态</b>\n版本：TDL 管理 %s · 上游 TDL %s\n登录账号：%s\n%s\nCPU：%.1f%%\n内存：%.1f%%\n网络：↓ %s/s · ↑ %s/s", buildinfo.Version, upstream.Version, html.EscapeString(accountName), counts, cpu, memory, bytesLabel(int64(receive)), bytesLabel(int64(transmit)))
 }
 
 func configText(cfg settings.Values) string {

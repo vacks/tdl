@@ -41,7 +41,12 @@ func telegramWaitDuration(err error) time.Duration {
 }
 
 func (m *Manager) loadTelegramRateLimits() error {
-	rows, err := m.db.Query(`SELECT account_id, blocked_until FROM telegram_rate_limits WHERE blocked_until > ?`, time.Now().UTC().Format(time.RFC3339Nano))
+	// Compared as timestamptz, not as text. The stored values are RFC3339Nano,
+	// whose trailing-zero trimming makes two timestamps disagree with their
+	// lexical order whenever their fractional parts have different widths. The
+	// table holds one row per account, so losing index support on this range is
+	// irrelevant and being wrong about whether an account is blocked is not.
+	rows, err := m.db.Query(`SELECT account_id, blocked_until FROM telegram_rate_limits WHERE blocked_until::timestamptz > ?::timestamptz`, time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return err
 	}
@@ -167,11 +172,21 @@ const (
 // tasks only while such tasks are waiting. With no queued message work, chat
 // tasks can use the full configured concurrency. For an odd limit, the extra
 // slot is reserved for messages: e.g. 3 becomes 1 chat + 2 message slots.
+//
+// The share never rounds down to nothing. At the default concurrency of one,
+// halving reserves the only slot for messages, so session downloads could not
+// start while any message task was queued or transferring - for a large task
+// that is hours. Reserving a class's share to zero is not a share; whoever
+// acquires the slot first gets it, and the message class still keeps the whole
+// reservation at every limit where a share exists.
 func chatTransferLimit(global int, messageQueued bool) int {
 	if !messageQueued {
 		return global
 	}
-	return global / 2
+	if share := global / 2; share > 0 {
+		return share
+	}
+	return global
 }
 
 // transferPermit is shared by ordinary links and chat batches. The configured

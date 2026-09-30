@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
+	"github.com/vacks/tdl/internal/applog"
 )
 
 // ReactionInboxEvent is a durable, pre-resolution record of a reaction
@@ -90,7 +91,7 @@ func (m *Manager) ClaimReactionInbox(limit int) ([]ReactionInboxEvent, error) {
 	// question. The poll stays short because a reaction is interactive work and
 	// has no wake channel of its own.
 	var pending bool
-	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at <= ?)`, now.Format(time.RFC3339Nano)).Scan(&pending); err != nil {
+	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at::timestamptz <= ?::timestamptz)`, now.Format(time.RFC3339Nano)).Scan(&pending); err != nil {
 		return nil, err
 	}
 	if !pending {
@@ -102,7 +103,7 @@ func (m *Manager) ClaimReactionInbox(limit int) ([]ReactionInboxEvent, error) {
 	}
 	defer tx.Rollback()
 	rows, err := tx.Query(`SELECT id, account_id, dialog_name, dialog_id, message_id, source_url, peer_type, peer_id, peer_hash, emoji, attempts
-FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?`, now.Format(time.RFC3339Nano), limit)
+FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at::timestamptz <= ?::timestamptz ORDER BY next_attempt_at, id LIMIT ?`, now.Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -166,14 +167,25 @@ func (m *Manager) CompleteReactionInbox(id int64, jobID string) error {
 	return err
 }
 
+// RetryReactionInbox follows the same rule as the message inbox: fast attempts
+// stop at inboxFastAttempts, and a row that stops is offered again by
+// reviveExhaustedInboxEvents rather than being left behind. A reaction row does
+// have a redelivery path - a later reaction on the same message reopens it -
+// but that depends on the user reacting again, which is not something a lost
+// download should require.
 func (m *Manager) RetryReactionInbox(id int64, attempts int, cause error) error {
 	status := "pending"
-	if attempts >= 5 {
+	if attempts >= inboxFastAttempts {
 		status = "failed"
 	}
 	delay := time.Duration(1<<min(attempts, 6)) * time.Second
-	_, err := m.db.Exec(`UPDATE reaction_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id)
-	return err
+	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+		return err
+	}
+	if status == "failed" {
+		applog.Error("reaction", "reaction_event_gave_up", "inbox_id", id, "attempts", attempts, "error", cause.Error())
+	}
+	return nil
 }
 
 func min(a, b int) int {

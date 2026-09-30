@@ -83,6 +83,12 @@ const (
 	chatScanIndexing  = "indexing"
 	chatScanCompleted = "completed"
 	chatBatchSize     = 64
+	// listenerGapBudget bounds one whole gap walk, and listenerGapPageTimeout one
+	// history request inside it. The split matters: the walk persists its
+	// position per page, so a long backlog is recoverable across attempts, while
+	// a single request must not be allowed to hang the account lease.
+	listenerGapBudget      = 5 * time.Minute
+	listenerGapPageTimeout = 30 * time.Second
 	// chatDownloadIdleInterval is the fallback only. Every transition that
 	// queues media signals this worker class directly, and a filled claim
 	// window continues without waiting at all, so this bounds how long a missed
@@ -195,7 +201,11 @@ func (m *Manager) createChatJob(job ChatJob, direct directPeer, configJSON strin
 		}
 		return ChatJob{}, err
 	}
-	if _, err := tx.Exec(`INSERT INTO chat_download_stats(chat_job_id, updated_at) VALUES (?, ?)`, job.ID, now); err != nil {
+	// updated_at is deliberately left to the triggers. One column written by
+	// both Go's RFC3339Nano and PostgreSQL's now()::text holds two different
+	// textual layouts, which no comparison can order reliably; nothing reads
+	// this column, and leaving it to a single writer keeps that true.
+	if _, err := tx.Exec(`INSERT INTO chat_download_stats(chat_job_id) VALUES (?)`, job.ID); err != nil {
 		return ChatJob{}, err
 	}
 	for _, kind := range chatStreamKinds {
@@ -589,7 +599,7 @@ func (m *Manager) chatWorker() {
 		// database state update. Reconcile on the regular worker cadence, not
 		// only during restart/database recovery, so such a row cannot leave its
 		// session task permanently in "下载中".
-		if err := m.reconcileChatPublishedItems(); err != nil {
+		if err := m.reconcileChatPublishedItems(nil); err != nil {
 			applog.Error("chat_download", "published_file_reconcile_failed", "error", err.Error())
 		}
 		claimCursor = m.reconcileChatClaims(claimCursor)
@@ -597,7 +607,7 @@ func (m *Manager) chatWorker() {
 		m.reconcileChatListeners()
 		// Neither inbox has a maintenance loop of its own, so their lease safety
 		// net rides along here. It is self-throttled to stay off the hot path.
-		m.reapStaleInboxLeasesIfDue()
+		m.runMaintenanceSweepsIfDue()
 		select {
 		case <-m.stopCh:
 			return
@@ -1041,7 +1051,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		return upstreamDL.Run(runCtx, client, kvd, opts)
 	})
 	publishWG.Wait()
-	if reconcileErr := m.reconcileChatPublishedItems(); reconcileErr != nil {
+	if reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch)); reconcileErr != nil {
 		return false, fmt.Errorf("核对已移动文件: %w", reconcileErr)
 	}
 	publishMu.Lock()
@@ -1230,8 +1240,54 @@ func (m *Manager) setChatItem(chatID string, item source, status, path, message 
 
 // reconcileChatPublishedItems closes the crash window after a final file move
 // but before the media index and global ownership record were committed.
-func (m *Manager) reconcileChatPublishedItems() error {
-	rows, err := m.db.Query(`SELECT chat_job_id, dialog_key, message_id, final_path FROM chat_download_items WHERE status = 'downloaded' AND final_path <> ''`)
+//
+// scope, when non-nil, limits the pass to the media a caller already knows it
+// may have left mid-publish. Every batch used to run the unrestricted query, so
+// finishing one batch of sixty-four files scanned the global set of
+// published-but-unrecorded rows on a table holding one row per indexed message
+// - work proportional to the whole index rather than to the batch that had just
+// run. The nil scope keeps the periodic and startup passes, which are the ones
+// that must be able to find a row no caller knows about.
+// chatItemIndexed reports whether a session task has already been told about
+// the media at this identity. It is a primary key probe, so it costs one index
+// lookup and saves a Telegram round trip.
+func (m *Manager) chatItemIndexed(chatID, dialogKey string, messageID int) bool {
+	var indexed bool
+	if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chat_download_items WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ?)`, chatID, dialogKey, messageID).Scan(&indexed); err != nil {
+		return false
+	}
+	return indexed
+}
+
+// mediaKey identifies one downloadable media item of one session task.
+type mediaKey struct {
+	chatID    string
+	dialogKey string
+	messageID int
+}
+
+// batchKeys names the media one batch claimed, so the reconcile pass that
+// follows it examines exactly the work it just did and nothing else.
+func batchKeys(chatID string, batch []source) map[mediaKey]struct{} {
+	keys := make(map[mediaKey]struct{}, len(batch))
+	for _, item := range batch {
+		keys[mediaKey{chatID: chatID, dialogKey: item.DialogKey, messageID: item.MessageID}] = struct{}{}
+	}
+	return keys
+}
+
+func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error {
+	query := `SELECT chat_job_id, dialog_key, message_id, final_path FROM chat_download_items WHERE status = 'downloaded' AND final_path <> ''`
+	args := []any{}
+	if len(scope) > 0 {
+		keys := make([]any, 0, len(scope))
+		for key := range scope {
+			keys = append(keys, key.chatID, key.dialogKey, key.messageID)
+		}
+		query += ` AND (chat_job_id, dialog_key, message_id) IN (` + strings.TrimSuffix(strings.Repeat("(?,?,?),", len(scope)), ",") + `)`
+		args = keys
+	}
+	rows, err := m.db.Query(query, args...)
 	if err != nil {
 		return err
 	}
@@ -1388,6 +1444,17 @@ SELECT r.account_id, r.discussion_dialog_key FROM chat_reply_roots r JOIN chat_d
 	}
 	m.mu.Unlock()
 	m.listenerSnapshotAt.Store(now.UnixNano())
+	// The gap walk's only other trigger is a listener becoming ready, and that
+	// does not happen again while the listener stays up. A walk that was cut off
+	// by a timeout, a flood wait or a restart therefore had nothing left to
+	// retry it: the messages it had not reached stayed undownloaded until the
+	// next reconnect, which on a healthy installation is the next deployment.
+	// Riding this refresh makes every one of those cases self-healing within one
+	// interval. On a task that is already up to date the walk costs a single
+	// history page before it recognises the watermark.
+	for accountID := range wanted {
+		go m.reconcileListenerGaps(accountID)
+	}
 }
 
 func (m *Manager) markChatListenerDirty() {
@@ -1444,11 +1511,20 @@ func listensForNewMedia(job ChatJob) bool {
 }
 
 // listenerGapCandidateIDs names the tasks an account's gap walk covers: every
-// listened channel, plus the listen-only Saved Messages form. A listened
-// discussion group is reached through its parent channel task, so matching on
-// dialog_type would only duplicate its work.
+// listened dialog that has a real persisted peer, which is every channel, every
+// supergroup the user created a task for, and the listen-only Saved Messages
+// form.
+//
+// A supergroup is identified as 'chat', not 'channel': a channel and a
+// supergroup are both an InputPeerChannel on the wire, and the kind is refined
+// from the resolved peer's broadcast flag. Matching only on 'channel' therefore
+// excluded every group, and a group's task had no gap walk at all - media
+// posted while the process was down was never recovered, while the task went on
+// showing 监听中. A linked discussion group is still reached through its parent
+// channel task, but that only covers the groups this service created implicitly;
+// it never covered one the user asked for.
 func (m *Manager) listenerGapCandidateIDs(accountID string) ([]string, error) {
-	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) AND (dialog_type = 'channel' OR (dialog_type = 'self' AND start_message_id < 0))`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) AND (dialog_type IN ('channel', 'chat') OR (dialog_type = 'self' AND start_message_id < 0))`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 	if err != nil {
 		return nil, err
 	}
@@ -1533,16 +1609,34 @@ func (m *Manager) reconcileListenerGap(id string) error {
 	// admitted by the live path too. The overlap costs one duplicate inbox row
 	// at most, because the insert ignores a message it already has.
 	m.addChatWatched(target.AccountID, target.DialogKey)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// One walk is no longer limited to a single short deadline. The position is
+	// persisted page by page, so an interrupted walk resumes where it stopped;
+	// before that, a backlog larger than one short pass was simply never
+	// recovered, because every retry restarted from the newest message and the
+	// union of the retries never grew. The outer bound now only stops a walk that
+	// cannot make progress at all.
+	ctx, cancel := context.WithTimeout(context.Background(), listenerGapBudget)
 	defer cancel()
 	return m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
 		boundary := target.UpperMessageID
 		watermark := boundary
-		offset := 0
+		offset := m.listenerGapOffset(id)
 		reachedBoundary := false
 		for {
-			result, err := client.API().MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: peer, OffsetID: offset, Limit: 100})
+			// Reading history is an ordinary Telegram request and is paced like
+			// every other one. It was the only call in the repository that was
+			// not, which made the moment a backlog is largest - a reconnect or a
+			// restart, with every listened dialog walking at once - the moment the
+			// account was most likely to be put into a flood wait, and a flood
+			// wait recorded nowhere, so the scheduler kept feeding it.
+			if err := m.awaitTelegramRPC(ctx, target.AccountID); err != nil {
+				return err
+			}
+			pageCtx, cancelPage := context.WithTimeout(ctx, listenerGapPageTimeout)
+			result, err := client.API().MessagesGetHistory(pageCtx, &tg.MessagesGetHistoryRequest{Peer: peer, OffsetID: offset, Limit: 100})
+			cancelPage()
 			if err != nil {
+				m.recordTelegramRPCError(target.AccountID, err)
 				return err
 			}
 			above, oldest, reached := gapBatch(searchMessages(result), boundary)
@@ -1559,8 +1653,16 @@ func (m *Manager) reconcileListenerGap(id string) error {
 				reachedBoundary = true
 				break
 			}
+			if oldest == 0 || oldest == offset {
+				// The server returned a page already walked. Spinning on it would
+				// consume the whole budget against the rate limiter, so stop and
+				// keep the cursor for a later attempt.
+				return nil
+			}
 			offset = oldest
+			m.setListenerGapOffset(id, offset)
 		}
+		m.setListenerGapOffset(id, 0)
 		// Advance the watermark only once the walk actually reached the previous
 		// one. Writing it after every page looks harmless because the walk runs
 		// newest to oldest, but it makes an interrupted walk unrecoverable: the
@@ -1573,6 +1675,24 @@ func (m *Manager) reconcileListenerGap(id string) error {
 		_, err := m.db.Exec(`UPDATE chat_download_jobs SET upper_message_id = ?, updated_at = ? WHERE id = ? AND upper_message_id < ?`, watermark, time.Now().UTC().Format(time.RFC3339Nano), id, watermark)
 		return err
 	})
+}
+
+// listenerGapStream is the resumable position of the gap walk, kept in the same
+// per-task stream table the history scan uses. offset_message_id is the page
+// offset to resume from, and zero means no walk is in progress: the next one
+// starts from the newest message.
+const listenerGapStream = "listener_gap"
+
+func (m *Manager) listenerGapOffset(id string) int {
+	var offset int
+	if err := m.db.QueryRow(`SELECT offset_message_id FROM chat_download_streams WHERE chat_job_id = ? AND stream_kind = ?`, id, listenerGapStream).Scan(&offset); err != nil {
+		return 0
+	}
+	return offset
+}
+
+func (m *Manager) setListenerGapOffset(id string, offset int) {
+	_, _ = m.db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind, offset_message_id) VALUES (?, ?, ?) ON CONFLICT(chat_job_id, stream_kind) DO UPDATE SET offset_message_id = EXCLUDED.offset_message_id`, id, listenerGapStream, offset)
 }
 
 func (m *Manager) chatEventWorker() {
@@ -1708,6 +1828,15 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 	resolved := make(map[bool][]source, 2)
 	resolvedErr := make(map[bool]error, 2)
 	for _, id := range ids {
+		// An album is delivered as one update per member, and resolving any one
+		// member returns the whole group - so a ten photo album cost ten
+		// identical Telegram lookups and ten database passes to download the
+		// same ten files once. After the first member is registered the others
+		// are already indexed and are skipped here. A member the task's file
+		// filter rejected is not indexed, so it is still resolved and judged.
+		if m.chatItemIndexed(id, dialogKey, event.MessageID) {
+			continue
+		}
 		target, targetErr := m.chatTarget(id)
 		if targetErr != nil {
 			return targetErr
@@ -1769,8 +1898,15 @@ func (m *Manager) discoverDiscussionOrigin(event telegram.NewMessageEvent, rootI
 }
 
 func (m *Manager) scanOneChat() error {
+	// An account inside a Telegram cooldown is skipped here, not only inside the
+	// API await. History scanning is the one long-running Telegram call owned by
+	// a single goroutine, so waiting out a flood window inside it stopped every
+	// other thing that goroutine does - state refresh, claim reconciliation and
+	// listener upkeep - for as long as the window lasted.
 	var id string
-	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE status = 'queued' AND scan_state != 'completed' ORDER BY created_at LIMIT 1`).Scan(&id)
+	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs j WHERE status = 'queued' AND scan_state != 'completed'
+ AND NOT EXISTS (SELECT 1 FROM telegram_rate_limits l WHERE l.account_id = j.account_id AND l.blocked_until::timestamptz > ?::timestamptz)
+ ORDER BY created_at LIMIT 1`, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1852,9 +1988,7 @@ func (m *Manager) scanOneChat() error {
 		// history scanning ran in parallel. Leaving them alive would expose a
 		// failed parent whose child files are still downloading.
 		m.cancelChatExecutions(id)
-		_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, ChatStatusFailed, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning)
-		m.touch()
-		m.markChatListenerDirty()
+		m.failChatScan(id, err.Error())
 		return err
 	}
 	current, err := m.chatTarget(id)
@@ -2287,16 +2421,29 @@ WHERE j.status = ? AND j.scan_state = ?`, ChatStatusDownloading, chatScanComplet
 				next = ChatStatusFailed
 			}
 		}
+		// Every write below is conditional on the status this pass observed.
+		// Pause and cancel take the chat lock and stop the task themselves, but
+		// this pass reads a batch of tasks and then writes them one at a time, so
+		// without the guard a control action landing in that window was
+		// overwritten: a task the user had just cancelled turned itself back into
+		// completed or failed a moment later.
 		if next != status {
-			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id)
+			result, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id, status)
+			if err != nil {
+				continue
+			}
+			if changed, _ := result.RowsAffected(); changed != 1 {
+				// The task left 'downloading' between the read and this write.
+				continue
+			}
 			m.touch()
 			m.markChatListenerDirty()
 		}
 		if next == ChatStatusListening && failed > 0 {
-			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("历史下载有 %d 个文件失败，可重新开始失败项", failed), id)
+			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ? AND status = ?`, fmt.Sprintf("历史下载有 %d 个文件失败，可重新开始失败项", failed), id, next)
 		}
 		if next == ChatStatusFailed && failed > 0 {
-			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ?`, fmt.Sprintf("全部 %d 个文件均下载失败，请查看各文件的失败原因", failed), id)
+			_, _ = m.db.Exec(`UPDATE chat_download_jobs SET error = ? WHERE id = ? AND status = ?`, fmt.Sprintf("全部 %d 个文件均下载失败，请查看各文件的失败原因", failed), id, next)
 		}
 		if pending > 0 {
 			// This runs inside chatWorker, so it must wake only the transfer
@@ -2317,6 +2464,67 @@ func releaseChatClaims(id string) func(*databaseTx) error {
 		_, err := tx.Exec(`DELETE FROM downloaded_media WHERE status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, id)
 		return err
 	}
+}
+
+// failChatScan marks a session task failed and releases the media it had
+// claimed while indexing, in one transaction.
+//
+// The two writes belong together. A failed task transfers nothing, so a claim it
+// keeps is held by nobody and blocks every other task that wants that file; and
+// media indexed before the failure has already been claimed, so failing without
+// releasing is exactly how those claims get stranded.
+func (m *Manager) failChatScan(id, reason string) {
+	tx, err := m.db.Begin()
+	if err != nil {
+		applog.Error("chat_download", "chat_scan_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, ChatStatusFailed, reason, time.Now().UTC().Format(time.RFC3339Nano), id, ChatStatusScanning); err != nil {
+		applog.Error("chat_download", "chat_scan_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	if err := releaseChatClaims(id)(tx); err != nil {
+		applog.Error("chat_download", "chat_scan_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		applog.Error("chat_download", "chat_scan_failure_not_recorded", "chat_job_id", id, "error", err.Error())
+		return
+	}
+	m.touch()
+	m.markChatListenerDirty()
+	m.signalChat()
+}
+
+// orphanedMediaClaims removes global media claims held by a task that cannot
+// transfer, in either direction.
+//
+// A claim exists to stop another task downloading the same media, so a claim
+// held by a task that is not running protects nothing: it only blocks every
+// other task that wants that file. The release paths cover pause and cancel,
+// and deleting or purging a session task now releases explicitly, but a claim
+// can still be stranded - by a task removed before those paths existed, by a
+// failure branch that ends a task without passing through either, or by a task
+// the user deletes while its scan is failing. This sweep is what makes the
+// invariant self-healing rather than dependent on every writer remembering.
+//
+// Two different rules, deliberately. A session task holds claims only while it
+// is runnable, so a claim under any other status is stale and is dropped. An
+// ordinary message task is only dropped when its row is gone altogether: it has
+// several terminal states whose claim handling has not been audited to the same
+// standard, and deleting a claim it still intends to use would download the same
+// file twice, which is worse than leaving it.
+func (m *Manager) orphanedMediaClaims() error {
+	_, err := m.db.Exec(`DELETE FROM downloaded_media d
+WHERE d.status = 'claimed' AND (
+ (d.owner_kind = 'chat' AND NOT EXISTS (
+   SELECT 1 FROM chat_download_jobs j WHERE j.id = d.owner_id
+   AND j.status IN ('queued', 'scanning', 'downloading', 'listening')))
+ OR (d.owner_kind = 'message' AND NOT EXISTS (SELECT 1 FROM download_jobs j WHERE j.id = d.owner_id))
+ OR d.owner_kind NOT IN ('chat', 'message')
+)`)
+	return err
 }
 
 // PauseChat stops both indexing and active transfers for this one visible task.
@@ -2388,7 +2596,10 @@ func (m *Manager) RetryChat(id string) error {
 	if target.ScanState == chatScanCompleted {
 		next = ChatStatusDownloading
 	}
-	if err := m.transitionChatItems(id, target.Status, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE chat_job_id = ? AND status != 'completed'`, nil, id); err != nil {
+	// A file's attempts counter bounds the automatic stall retries. A click is a
+	// new budget - leaving the counter at the cap made the next stall fail the
+	// file immediately with "已停止自动重试", so asking for a retry did nothing.
+	if err := m.transitionChatItems(id, target.Status, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE chat_job_id = ? AND status != 'completed'`, nil, id); err != nil {
 		return err
 	}
 	m.signalChat()
@@ -2500,23 +2711,6 @@ func (m *Manager) transitionChatItems(id, expected, next, message, itemSQL strin
 	return nil
 }
 
-// updateChatStatus makes concurrent parent controls observable instead of
-// silently succeeding after another request has already changed the task.
-func (m *Manager) updateChatStatus(id, expected, next, message string) error {
-	result, err := m.db.Exec(`UPDATE chat_download_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status = ?`, next, message, time.Now().UTC().Format(time.RFC3339Nano), id, expected)
-	if err != nil {
-		return err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if changed != 1 {
-		return errors.New("会话任务状态已变化，请刷新后重试")
-	}
-	return nil
-}
-
 func (m *Manager) DeleteChat(id string) error {
 	lock := m.chatLock(id)
 	lock.Lock()
@@ -2543,6 +2737,13 @@ func (m *Manager) DeleteChat(id string) error {
 	}
 	if changed != 1 {
 		return errors.New("会话任务状态已变化，请刷新后重试")
+	}
+	// A deleted task transfers nothing, so it must not keep owning media. The
+	// task row stays for history, which means the orphan sweep cannot tell that
+	// this claim is dead: it has to be released here, in the same transaction
+	// that removes the task's ability to run.
+	if err := releaseChatClaims(id)(tx); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -2572,6 +2773,13 @@ func (m *Manager) PurgeChat(id string) error {
 		return err
 	}
 	defer tx.Rollback()
+	// The media index is removed with the task, so the claims go first and in the
+	// same transaction. Deleting the task alone leaves claim rows pointing at an
+	// id that no longer exists, and nothing can ever release them again - every
+	// other task that wants that media waits for an owner that is gone.
+	if err := releaseChatClaims(id)(tx); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM chat_download_jobs WHERE id = ?`, id); err != nil {
 		return err
 	}

@@ -180,7 +180,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearLoginFailures(client)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: requestHTTPS(r), SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: s.requestHTTPS(r), SameSite: http.SameSiteLaxMode, MaxAge: 86400})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -188,7 +188,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		s.sessions.Delete(c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestHTTPS(r), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.requestHTTPS(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -213,10 +213,15 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// dashboard reports only what can be answered without touching the permanent
+// download history: connection states and the in-memory resource trend. The
+// file counts it used to carry could not be, because a task's file count is
+// unbounded, so on this three second poll they grew with the download history
+// and with how much was downloading. Those figures are available on demand from
+// the Bot's /status command, where a person asks for them once.
 func (s *Server) dashboard(w http.ResponseWriter, _ *http.Request) {
-	active, failedItems := s.downloads.Summary()
 	current, trend := s.monitor.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "database": s.downloads.DatabaseHealth(), "reactions": s.reactions.Health(), "downloads": map[string]int{"active": active, "failedItems": failedItems}, "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
+	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "database": s.downloads.DatabaseHealth(), "reactions": s.reactions.Health(), "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
 }
 
 func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
@@ -637,7 +642,7 @@ func (s *Server) validRequestOrigin(r *http.Request) bool {
 		return r.Header.Get("X-Requested-With") == "TDL-Web"
 	}
 	scheme := "http"
-	if requestHTTPS(r) {
+	if s.requestHTTPS(r) {
 		scheme = "https"
 	}
 	if origin == scheme+"://"+r.Host {
@@ -647,13 +652,48 @@ func (s *Server) validRequestOrigin(r *http.Request) bool {
 }
 
 // requestHTTPS supports ordinary HTTPS and standard reverse-proxy forwarding.
-// The header only affects cookie transport and same-origin validation; client
-// IP addresses are deliberately never read from forwarding headers.
-func requestHTTPS(r *http.Request) bool {
+// The header only affects cookie transport and same-origin validation, and it
+// is honoured only when the request came from an address configured as a
+// trusted proxy. Any direct client can otherwise assert it, which decides
+// whether the session cookie is marked Secure and which scheme the same-origin
+// check compares against. Client IP addresses are still never read from
+// forwarding headers.
+func (s *Server) requestHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
+	if !s.trustedProxy(r) {
+		return false
+	}
 	return strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https")
+}
+
+// trustedProxy reports whether the peer address is one whose forwarding headers
+// the operator chose to believe. An empty list means none of them are.
+func (s *Server) trustedProxy(r *http.Request) bool {
+	if len(s.cfg.TrustedProxies) == 0 {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || host == "" {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if peer == nil {
+		return false
+	}
+	for _, entry := range s.cfg.TrustedProxies {
+		if _, network, parseErr := net.ParseCIDR(entry); parseErr == nil {
+			if network.Contains(peer) {
+				return true
+			}
+			continue
+		}
+		if candidate := net.ParseIP(entry); candidate != nil && candidate.Equal(peer) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) loginClient(r *http.Request) string {
@@ -675,22 +715,37 @@ func (s *Server) loginRetryAfter(client string) time.Duration {
 	return 0
 }
 
+// loginLockoutThreshold is the failure count at which the throttle engages.
+const loginLockoutThreshold = 5
+
 func (s *Server) recordLoginFailure(client string) {
 	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
 	now := time.Now()
 	s.pruneLoginAttemptsLocked(now)
 	attempt := s.logins[client]
 	attempt.failures++
-	if attempt.failures >= 5 {
-		delay := time.Second * time.Duration(1<<min(attempt.failures-5, 6))
+	lockedOut := false
+	if attempt.failures >= loginLockoutThreshold {
+		delay := time.Second * time.Duration(1<<min(attempt.failures-loginLockoutThreshold, 6))
 		if delay > time.Minute {
 			delay = time.Minute
 		}
 		attempt.until = now.Add(delay)
+		lockedOut = true
 	}
+	failures := attempt.failures
 	attempt.updated = now
 	s.logins[client] = attempt
+	s.loginMu.Unlock()
+	// A failed login was previously invisible: it was counted in memory and
+	// nothing else, so a brute force attempt left no trace in the service log.
+	// The password is never logged, and the client address is the same one the
+	// throttle already keys on.
+	if lockedOut {
+		applog.Error("httpapi", "login_locked_out", "client", client, "failures", failures)
+		return
+	}
+	applog.Info("httpapi", "login_failed", "client", client, "failures", failures)
 }
 
 func (s *Server) clearLoginFailures(client string) {
@@ -708,6 +763,11 @@ func (s *Server) pruneLoginAttemptsLocked(now time.Time) {
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// Several of these responses carry a credential - the Telegram Bot token is
+	// part of the settings document - and none of them are safe to replay from a
+	// cache. Without this a browser or an intermediary was free to store them
+	// heuristically.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
