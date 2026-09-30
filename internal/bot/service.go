@@ -112,6 +112,14 @@ type messageRef struct {
 	Text              string
 	TokenHash         string
 }
+
+// key identifies a rendered card in the edit-throttle maps. It is one
+// definition because those maps are written from six places - tracking,
+// untracking by key, untracking by message, and the throttle itself - and a
+// format that drifted in one of them would stop suppressing edits there
+// without failing anything.
+func (r messageRef) key() string { return fmt.Sprintf("%d:%d", r.ChatID, r.MessageID) }
+
 type trackedRef struct {
 	JobID string
 	messageRef
@@ -434,10 +442,11 @@ func (s *Service) acknowledgeHandled(token string) {
 // 25-second getUpdates request therefore never delays a viewed task card's
 // three-second progress refresh, while an idle Bot performs no task-table I/O.
 func (s *Service) refreshLoop() {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(refreshMinInterval)
 	defer ticker.Stop()
 	for {
-		s.pruneListPages(time.Now())
+		start := time.Now()
+		s.pruneListPages(start)
 		cfg := s.settings.Get().Bot
 		if cfg.Enabled && strings.TrimSpace(cfg.Token) != "" && len(cfg.ControlUserIDs) > 0 {
 			s.refresh(cfg)
@@ -445,11 +454,32 @@ func (s *Service) refreshLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-s.downloadWake:
 		case <-ticker.C:
+		case <-s.downloadWake:
+			// A wake asks for the next pass sooner, and the floor is what
+			// "sooner" means. Without it a wake runs the next pass immediately,
+			// and because the signal is refilled the moment it is drained while
+			// a download is emitting a transition per file, the loop ran at the
+			// event rate. What it does for each pass is per task, so the loop's
+			// cost was set by how many files a task had rather than by how many
+			// tasks were being watched. The pass is at most one interval late
+			// now, which is not a delay anything can observe.
+			if remaining := refreshMinInterval - time.Since(start); remaining > 0 {
+				timer := time.NewTimer(remaining)
+				select {
+				case <-s.ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
 		}
 	}
 }
+
+// refreshMinInterval is the shortest gap between two passes of the refresh
+// loop, and the tick that drives it when no wake arrives.
+const refreshMinInterval = time.Second
 
 func pollRetryDelay(failures int) time.Duration {
 	if failures < 1 {
@@ -1580,6 +1610,15 @@ func (s *Service) refresh(cfg settings.Bot) {
 	// Only explicitly viewed task cards are refreshed on the cadence. This
 	// avoids repeatedly reading the newest task page when there is no event.
 	for key, ref := range tracked {
+		// The interval is checked before the read, not only before the edit it
+		// feeds. Checking it inside editLive meant the read had already
+		// happened, so the limit suppressed the Telegram request and nothing
+		// else - and since every file transition of a download wakes this loop,
+		// the task row was read at the event rate to produce an edit the same
+		// limit then declined to send.
+		if !s.liveCardDue(ref.key(), time.Now()) {
+			continue
+		}
 		job, err := s.downloads.Get(ref.JobID)
 		if err != nil {
 			// Untracking is permanent: it is how a card stops being refreshed. A
@@ -1600,6 +1639,9 @@ func (s *Service) refresh(cfg settings.Bot) {
 	// ordinary task card. It is not a lifecycle notification, so it stops once
 	// the history has settled and no new-media listener remains active.
 	for key, ref := range chatTracked {
+		if !s.liveCardDue(ref.key(), time.Now()) {
+			continue
+		}
 		job, err := s.downloads.GetChat(ref.JobID)
 		if err != nil {
 			if errors.Is(err, download.ErrChatJobNotFound) {
@@ -1651,8 +1693,8 @@ func (s *Service) track(id string, ref messageRef) {
 func (s *Service) untrack(key string) {
 	s.mu.Lock()
 	if ref, ok := s.tracked[key]; ok {
-		delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
-		delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+		delete(s.liveRendered, ref.key())
+		delete(s.lastLiveEdit, ref.key())
 	}
 	delete(s.tracked, key)
 	s.mu.Unlock()
@@ -1752,8 +1794,8 @@ func (s *Service) untrackJob(jobID string) {
 	defer s.mu.Unlock()
 	for key, ref := range s.tracked {
 		if ref.JobID == jobID {
-			delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
-			delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+			delete(s.liveRendered, ref.key())
+			delete(s.lastLiveEdit, ref.key())
 			delete(s.tracked, key)
 		}
 	}
@@ -1763,8 +1805,8 @@ func (s *Service) untrackMessage(chatID, messageID int64) {
 	defer s.mu.Unlock()
 	for key, ref := range s.tracked {
 		if ref.ChatID == chatID && ref.MessageID == messageID {
-			delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
-			delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+			delete(s.liveRendered, ref.key())
+			delete(s.lastLiveEdit, ref.key())
 			delete(s.tracked, key)
 		}
 	}
@@ -1778,8 +1820,8 @@ func (s *Service) trackChat(id string, ref messageRef) {
 func (s *Service) untrackChat(key string) {
 	s.mu.Lock()
 	if ref, ok := s.chatTracked[key]; ok {
-		delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
-		delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+		delete(s.liveRendered, ref.key())
+		delete(s.lastLiveEdit, ref.key())
 	}
 	delete(s.chatTracked, key)
 	s.mu.Unlock()
@@ -1789,8 +1831,8 @@ func (s *Service) untrackChatMessage(chatID, messageID int64) {
 	defer s.mu.Unlock()
 	for key, ref := range s.chatTracked {
 		if ref.ChatID == chatID && ref.MessageID == messageID {
-			delete(s.liveRendered, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
-			delete(s.lastLiveEdit, fmt.Sprintf("%d:%d", ref.ChatID, ref.MessageID))
+			delete(s.liveRendered, ref.key())
+			delete(s.lastLiveEdit, ref.key())
 			delete(s.chatTracked, key)
 		}
 	}
@@ -2530,6 +2572,21 @@ func normalizeCommand(text string) string {
 	return strings.Join(fields, " ")
 }
 
+// liveCardInterval is how often a viewed card may be re-read and re-edited.
+// The same value gates both, because gating only the edit meant the read
+// happened anyway.
+const liveCardInterval = 3 * time.Second
+
+// liveCardDue reports whether a viewed card's interval has elapsed, checked
+// before the read that renders it. It deliberately does not replace the check
+// inside editLive: that one is still the authority on whether an edit is sent,
+// and this one only decides whether the row is worth reading to find out.
+func (s *Service) liveCardDue(key string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return now.Sub(s.lastLiveEdit[key]) >= liveCardInterval
+}
+
 func (s *Service) editLive(token string, chatID, messageID int64, text string, keyboard [][]button) bool {
 	key := fmt.Sprintf("%d:%d", chatID, messageID)
 	encoded, _ := json.Marshal(struct {
@@ -2543,7 +2600,7 @@ func (s *Service) editLive(token string, chatID, messageID int64, text string, k
 		s.mu.Unlock()
 		return false
 	}
-	if now.Sub(s.lastLiveEdit[key]) < 3*time.Second || now.Before(s.nextLiveEdit) {
+	if now.Sub(s.lastLiveEdit[key]) < liveCardInterval || now.Before(s.nextLiveEdit) {
 		s.mu.Unlock()
 		return false
 	}

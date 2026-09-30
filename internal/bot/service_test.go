@@ -3,12 +3,15 @@ package bot
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/vacks/tdl/internal/download"
 	"github.com/vacks/tdl/internal/settings"
+	"github.com/vacks/tdl/internal/telegram"
 )
 
 func TestNormalizeCommand(t *testing.T) {
@@ -456,5 +459,65 @@ func TestTaskCardKeepsShortCaptionsAndFooter(t *testing.T) {
 	}
 	if !strings.Contains(text, "对话") || !strings.Contains(text, "进度") {
 		t.Fatal("the card lost a field it always showed")
+	}
+}
+
+// The three-second interval used to be enforced only inside editLive, which is
+// handed a task that has already been read - so it suppressed the Telegram
+// request and nothing else. Every file transition of a download wakes the
+// refresh loop, so the row was read at the event rate to produce an edit the
+// same interval then declined to send.
+//
+// The card below is tracked against a task that does not exist, which is what
+// makes the read observable: reading it returns "not found" and the card is
+// retired. So a card that survives the pass was not read, and the second half
+// of the test - where the interval has passed and the card is retired - is what
+// keeps that from also being true of a loop that never reads anything.
+func TestRefreshSkipsTheReadForACardThatIsNotDue(t *testing.T) {
+	databaseURL := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	root := t.TempDir()
+	store, err := settings.Open(filepath.Join(root, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := telegram.Open(filepath.Join(root, "telegram"), func() string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloads, err := download.Open(filepath.Join(root, "data"), filepath.Join(root, "downloads"), databaseURL, store, accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(downloads.Stop)
+	s := &Service{
+		downloads:        downloads,
+		ctx:              context.Background(),
+		tracked:          map[string]trackedRef{},
+		chatTracked:      map[string]chatTrackedRef{},
+		known:            map[string]string{},
+		lifecycle:        map[string]map[int64]messageRef{},
+		dirty:            map[string]struct{}{},
+		deleted:          map[string]time.Time{},
+		suppressedStatus: map[string]string{},
+		lastLiveEdit:     map[string]time.Time{},
+		liveRendered:     map[string]string{},
+	}
+	ref := messageRef{ChatID: 1, MessageID: 2}
+	s.track("task-that-does-not-exist", ref)
+	cfg := settings.Bot{Token: "token", ControlUserIDs: []int64{1}}
+
+	s.lastLiveEdit[ref.key()] = time.Now()
+	s.refresh(cfg)
+	if len(s.tracked) != 1 {
+		t.Fatal("a card that was just edited was read again; the interval is being applied after the read instead of before it")
+	}
+
+	s.lastLiveEdit[ref.key()] = time.Now().Add(-2 * liveCardInterval)
+	s.refresh(cfg)
+	if len(s.tracked) != 0 {
+		t.Fatal("a card past its interval was not read, so the check above proves nothing")
 	}
 }

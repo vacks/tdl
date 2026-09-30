@@ -60,6 +60,13 @@ const (
 	// Bot's list and in the count above it. A positive list makes a status
 	// visible only once someone has decided it belongs here.
 	openEventStatuses = `status IN ('pending', 'processing', 'failed')`
+	// eventRetentionStatuses is the set of states the retention sweep may
+	// delete, shared with the partial indexes that serve that sweep so a status
+	// added to one and not the other cannot make the sweep scan the whole queue
+	// it is supposed to be trimming. It overlaps openEventStatuses on 'failed'
+	// on purpose: a failed event is still listed while it can be retried, and
+	// is discarded once it is older than the retention window either way.
+	eventRetentionStatuses = `status IN ('done', 'failed', 'skipped')`
 )
 
 var errInvalidEventCursor = errors.New("invalid event cursor")

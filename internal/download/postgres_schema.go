@@ -169,6 +169,15 @@ var postgresIndexStatements = []string{
 	// optimisation for an unlikely shape.
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_queued_created_id ON download_jobs(created_at, id) WHERE status = 'queued'`,
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_account_visible_created_id ON download_jobs(account_id, created_at DESC, id DESC) WHERE parent_chat_id = '' AND status != 'deleted'`,
+	// Deleting an account asks which of its tasks are still active. The visible
+	// index above cannot answer it: that one requires parent_chat_id = '', and
+	// this question must include the child tasks a session task created, which
+	// are exactly the rows with a parent. Without an index of its own the read
+	// fell back to scanning every running or queued task of every account and
+	// discarding the ones that were not this account's - measured at 942ms on
+	// 2M tasks with 200k active, and it grows with the active set rather than
+	// with the account. 2.1ms as an index-only scan with this index.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_jobs_account_active ON download_jobs(account_id, status) WHERE status IN ('queued', 'running', 'paused')`,
 	// The settle pass walks queued tasks in id order from a cursor and asks only
 	// about top-level ones. download_jobs_queued_created_id carries the same
 	// status but orders by created_at, so the cursor could not seek: every pass
@@ -180,6 +189,20 @@ var postgresIndexStatements = []string{
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_requests_created_id ON download_requests(created_at, id)`,
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS reaction_inbox_ready ON reaction_inbox(status, next_attempt_at, id)`,
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS reaction_inbox_cleanup ON reaction_inbox(status, updated_at, id)`,
+	// The retention sweep deletes the oldest discarded rows and does it in
+	// batches, so its subquery is a ranged read of `updated_at` across three
+	// statuses. The (status, updated_at, id) index above cannot answer that:
+	// its leading column is the one the query does not constrain to a single
+	// value, so no single ordered stream of updated_at exists in it. The
+	// planner therefore read every discarded row and sorted the whole set, once
+	// per batch - deleting N rows cost N/1000 passes over N. Measured on 900k
+	// discarded rows: 481ms a batch, against 2ms with this index, because the
+	// LIMIT is pushed into the index instead of being applied after a sort.
+	//
+	// The predicate is eventRetentionStatuses, the same string the sweep uses,
+	// for the reason spelled out below: a partial index is only chosen when the
+	// planner can prove the query's WHERE implies the index's.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS reaction_inbox_retention ON reaction_inbox(updated_at, id) WHERE ` + eventRetentionStatuses,
 	// The event list reads the open queue newest first, and the count above it
 	// asks the same question. Narrowed to the open statuses so the index holds
 	// only events someone can still act on: a settled row is the permanent
@@ -233,6 +256,10 @@ var postgresIndexStatements = []string{
 
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_ready ON chat_message_inbox(status, next_attempt_at, id)`,
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_cleanup ON chat_message_inbox(status, updated_at, id)`,
+	// The same retention sweep as reaction_inbox, with the same reason: the
+	// delete orders by updated_at across a set of statuses and the
+	// (status, updated_at, id) index cannot provide one ordered stream for it.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_retention ON chat_message_inbox(updated_at, id) WHERE ` + eventRetentionStatuses,
 	// Counterpart of reaction_inbox_open_created_id: the message arm of the
 	// event list, restricted to the queue the list is allowed to show.
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_open_created_id ON chat_message_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,

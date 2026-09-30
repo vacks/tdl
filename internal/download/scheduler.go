@@ -16,17 +16,31 @@ import "time"
 // going to run. At the default concurrency of one that is total - the chat
 // share is floor(1/2), so session downloads could not start at all until the
 // cooldown expired, which for a flood wait can be hours.
+// The two halves are written as two EXISTS rather than one OR over them. The
+// planner cannot prove that a disjunction implies either index's predicate, so
+// the OR form was answered by scanning download_jobs and hashing the queued
+// files of every row in it - the whole task history, to answer "is there one
+// task". Split, each half is a seek: 'running' on download_jobs_status_updated_id
+// and 'queued with a queued file' on download_jobs_queued_created_id. This runs
+// on every session batch, so its cost is paid per batch, not per task.
 func (m *Manager) hasPriorityMessageTask() (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var found bool
 	err := m.db.QueryRow(`SELECT EXISTS (
   SELECT 1
   FROM download_jobs j
-  WHERE (j.status = 'running'
-      OR (j.status = 'queued'
-          AND EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = j.id AND i.status = 'queued')))
+  WHERE j.status = 'running'
     AND NOT EXISTS (
       SELECT 1 FROM telegram_rate_limits l
       WHERE l.account_id = j.account_id AND l.blocked_until::timestamptz > ?::timestamptz)
-)`, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&found)
+) OR EXISTS (
+  SELECT 1
+  FROM download_jobs j
+  WHERE j.status = 'queued'
+    AND EXISTS (SELECT 1 FROM download_items i WHERE i.job_id = j.id AND i.status = 'queued')
+    AND NOT EXISTS (
+      SELECT 1 FROM telegram_rate_limits l
+      WHERE l.account_id = j.account_id AND l.blocked_until::timestamptz > ?::timestamptz)
+)`, now, now).Scan(&found)
 	return found, err
 }

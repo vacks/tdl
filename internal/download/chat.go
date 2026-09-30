@@ -312,8 +312,8 @@ func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string
 		if err != nil {
 			return nil, 0, "", errors.New("分页游标无效，请返回第一页")
 		}
-		where += " AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))"
-		args = []any{ChatStatusDeleted, createdAt, createdAt, id, pageSize + 1}
+		where += keysetAfter("c")
+		args = []any{ChatStatusDeleted, createdAt, id, pageSize + 1}
 	}
 	// The media index can be millions of rows. Its derived one-row summary is
 	// maintained transactionally, so list rendering never aggregates history.

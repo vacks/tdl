@@ -2,7 +2,9 @@ package download
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,4 +171,105 @@ func TestDiscussionGapRecoveredCommentKeepsItsAttribution(t *testing.T) {
 		return
 	}
 	t.Fatal("the recovered comment was not claimable from the inbox")
+}
+
+// cursorManager gives the list queries a database with tasks that share one
+// timestamp, which is the case a keyset cursor exists to get right.
+func cursorManager(t *testing.T, now string, count int) *Manager {
+	t.Helper()
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= count; index++ {
+		// One timestamp for every row: ordering then rests entirely on the id
+		// tiebreaker, which is the half of the cursor an OR form gets wrong.
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES (?, 'tg://test', 'queued', ?, ?)`,
+			fmt.Sprintf("job-%02d", index), now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.loadVisibleCounts(); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// Paginating a list whose rows all share a timestamp has to visit every row
+// exactly once, newest id first. This is what the keyset predicate decides, and
+// it is one parameter shorter as a row comparison than as the OR form it
+// replaced - so a binding left behind is a page that silently skips or repeats
+// rows rather than an error.
+func TestTaskListPagingIsCompleteAcrossTiedTimestamps(t *testing.T) {
+	const now = "2026-01-02T03:04:05Z"
+	const count = 7
+	m := cursorManager(t, now, count)
+	seen := make([]string, 0, count)
+	for cursor := ""; ; {
+		jobs, _, next, err := m.ListCursor(cursor, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, job := range jobs {
+			seen = append(seen, job.ID)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != count {
+		t.Fatalf("paging returned %d tasks (%v), want all %d", len(seen), seen, count)
+	}
+	want := []string{"job-07", "job-06", "job-05", "job-04", "job-03", "job-02", "job-01"}
+	for index, id := range seen {
+		if id != want[index] {
+			t.Fatalf("page order %v, want %v", seen, want)
+		}
+	}
+}
+
+// The predicate itself, pinned. The OR form is the same answer written in a way
+// the planner cannot push into the index, which makes a page cost the whole
+// history in front of it - a difference that only shows up on a large table and
+// so is never caught by a correctness test above.
+func TestKeysetPredicateIsASingleRangeCondition(t *testing.T) {
+	for _, alias := range []string{"j", "c"} {
+		condition := keysetAfter(alias)
+		if strings.Contains(condition, " OR ") {
+			t.Fatalf("keyset condition for %q is %q; the OR form is applied as a filter over a scan from the top of the index", alias, condition)
+		}
+		if strings.Count(condition, "?") != 2 {
+			t.Fatalf("keyset condition for %q binds %d parameters, want 2", alias, strings.Count(condition, "?"))
+		}
+	}
+}
+
+// The retention sweep's indexes have to exist for the sweep to stay bounded.
+// Their absence is invisible in behaviour - the delete returns the same rows,
+// just by reading and sorting the whole queue once per batch - so nothing else
+// would notice one being dropped from the index set.
+func TestRetentionIndexesSurviveTheIndexSet(t *testing.T) {
+	m := cursorManager(t, "2026-01-02T03:04:05Z", 0)
+	for _, name := range []string{"reaction_inbox_retention", "chat_message_inbox_retention"} {
+		var found bool
+		if err := m.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = ?)`, name).Scan(&found); err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			t.Fatalf("index %s was not created; the retention sweep falls back to sorting the whole queue on every batch", name)
+		}
+	}
 }
