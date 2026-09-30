@@ -57,6 +57,17 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 	if len(originMessages) == 0 || originPeer == nil || rootMessageID <= 0 || originMessageID <= 0 {
 		return nil, nil
 	}
+	// Saved Messages has no comment section to expand. Telegram draws none on a
+	// saved copy, the dialog can have no linked discussion group (see
+	// resolveChatDiscussionLink), and its peer is not merely reply-less:
+	// messages.getReplies rejects it outright with PEER_ID_INVALID. That error
+	// is not one of the ones that mean "no discussion", so the listener path -
+	// which asks about every new message - spent one paced request and one ERROR
+	// line per saved message on a question whose answer cannot change. Returning
+	// here states the fact instead of asking it.
+	if _, saved := originPeer.(*tg.InputPeerSelf); saved {
+		return nil, nil
+	}
 	threadPeer := originPeer
 	threadMessageID := rootMessageID
 	isDiscussion := false

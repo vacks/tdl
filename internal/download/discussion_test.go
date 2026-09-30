@@ -91,6 +91,23 @@ func TestRelatedSourcesSkipsPostThatDeclaresNoComments(t *testing.T) {
 	}
 }
 
+// Saved Messages has no comment section, and its peer is not merely reply-less:
+// Telegram rejects messages.getReplies on it with PEER_ID_INVALID, which does not
+// mean "no discussion" and therefore reached the operator as an ERROR for every
+// saved message the listener resolved. learnRoot is set because the listener is
+// the path that asked; the nil client is the assertion, since reaching the
+// network would fault.
+func TestRelatedSourcesSkipsSavedMessages(t *testing.T) {
+	post := &tg.Message{ID: 100}
+	items, err := relatedSources(&Manager{}, context.Background(), nil, "acct", &tg.InputPeerSelf{}, "收藏消息", []*tg.Message{post}, 100, 100, true, "job")
+	if err != nil {
+		t.Fatalf("Saved Messages must resolve without an error: %v", err)
+	}
+	if items != nil {
+		t.Fatalf("Saved Messages must yield no related items: %#v", items)
+	}
+}
+
 // The shortcut above must not swallow a post that declares a linked discussion,
 // even while it has no comments yet: that group is where the first comment will
 // land. It also must not swallow a post that declares a comment count, since
