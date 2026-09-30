@@ -3,8 +3,10 @@ package httpapi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -221,5 +223,83 @@ func TestEventStreamEndsWhenTheSessionIsCleared(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the stream outlived the session it was authorized with")
+	}
+}
+
+// The order the process actually shuts down in: the HTTP server is drained, and
+// only then are the services stopped. http.Server.Shutdown waits for active
+// handlers and does not cancel them, and an event stream ends only when its
+// client goes away - so a stream still open when the drain starts makes it wait
+// out its whole timeout, on every restart, for as long as a dashboard tab is
+// open.
+//
+// This reproduces that order instead of calling Stop, because calling Stop
+// directly is what let the first version of this test pass while the behaviour
+// it names was not happening at all: Stop closes the streams, and Stop runs
+// after the drain.
+func TestDrainingHTTPServerDoesNotWaitForAnOpenEventStream(t *testing.T) {
+	databaseURL := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	root := t.TempDir()
+	server, err := New(config.Config{
+		DataDir:         filepath.Join(root, "data"),
+		DownloadDir:     filepath.Join(root, "downloads"),
+		AdminUsername:   "admin",
+		InitialPassword: "test-password",
+		DatabaseDSN:     databaseURL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Stop)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: server}
+	go func() { _ = httpServer.Serve(listener) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+	baseURL := "http://" + listener.Addr().String()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Jar: jar}
+	body, _ := json.Marshal(map[string]string{"username": "admin", "password": "test-password"})
+	login, err := http.NewRequest(http.MethodPost, baseURL+"/api/auth/login", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login.Header.Set("X-Requested-With", "TDL-Web")
+	loginResponse, err := client.Do(login)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = loginResponse.Body.Close()
+	if loginResponse.StatusCode != http.StatusOK {
+		t.Fatalf("login status=%d", loginResponse.StatusCode)
+	}
+	response, err := client.Get(baseURL + "/api/downloads/progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reader := bufio.NewReader(response.Body)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("the stream produced no first frame: %v", err)
+	}
+	// The stream is open and this client will not close it. End them first,
+	// exactly as the process does, then drain with the deadline it uses.
+	server.EndStreams()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := httpServer.Shutdown(ctx); err != nil {
+		t.Fatalf("draining returned %v after %s, so it waited for the stream rather than the stream ending first", err, time.Since(started))
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("draining took %s, which is the timeout rather than the handler ending", elapsed)
 	}
 }

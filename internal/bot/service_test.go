@@ -561,3 +561,18 @@ func TestStopEndsTheServicesGoroutines(t *testing.T) {
 	// Shutdown paths overlap - a signal, a deferred call, a test cleanup.
 	service.Stop()
 }
+
+// The "not listed" count is the task's own total minus what the card rendered.
+// A task's files are unbounded, so a read carries one bounded page of them, and
+// counting the page instead told a task with 480 unlisted files that it had
+// thirty - the page size minus the twenty lines that fit.
+func TestTaskCardCountsUnlistedFilesFromTheTaskTotal(t *testing.T) {
+	job := download.Job{ID: "job", Status: "running", TotalItems: 500}
+	for index := 0; index < 50; index++ {
+		job.Items = append(job.Items, download.Item{DialogKey: "channel:1", MessageID: index + 1, OriginalName: "file.bin", Status: "completed"})
+	}
+	text := taskText(job, nil)
+	if !strings.Contains(text, "另有 480 个文件未在此列出") {
+		t.Fatalf("card does not report the real unlisted count: %s", text)
+	}
+}

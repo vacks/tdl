@@ -101,13 +101,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// EndStreams ends the long-lived event streams.
+//
+// It is separate from Stop because of the order the process shuts down in, and
+// the order is the whole point: the HTTP server is drained first and the
+// services are stopped after it. http.Server.Shutdown waits for active handlers
+// and does not cancel them, and an event stream ends only when its client goes
+// away - so a stream still open when Shutdown is called makes it wait out its
+// entire timeout. Ending the streams has to happen before the drain, which is
+// why Stop cannot be the only place that does it. Idempotent; Stop calls it too,
+// so a caller that never drains HTTP still ends them.
+func (s *Server) EndStreams() {
+	s.shutdownOn.Do(func() { close(s.shutdown) })
+}
+
 // Stop releases background connections and active downloads before process exit.
 func (s *Server) Stop() {
-	// Disconnect the event streams first. A stream ends only when its client
-	// goes away, and Shutdown waits for active handlers, so leaving them open
-	// makes every restart wait out the whole shutdown budget while downloads
-	// keep running behind it. Closing this is what lets the handler return.
-	s.shutdownOn.Do(func() { close(s.shutdown) })
+	s.EndStreams()
 	s.bot.Stop()
 	s.reactions.Stop()
 	s.downloads.Stop()
@@ -829,8 +839,9 @@ func (s *Server) validRequestOrigin(r *http.Request) bool {
 // is honoured only when the request came from an address configured as a
 // trusted proxy. Any direct client can otherwise assert it, which decides
 // whether the session cookie is marked Secure and which scheme the same-origin
-// check compares against. Client IP addresses are still never read from
-// forwarding headers.
+// check compares against. Client IP addresses are read from forwarding headers
+// in exactly one place - the login attempt limit, see loginClient - and under
+// the same rule: only from a peer this list names as a proxy.
 func (s *Server) requestHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true

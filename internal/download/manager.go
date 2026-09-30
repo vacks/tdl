@@ -2495,7 +2495,7 @@ func (m *Manager) setMessageItemsWaiting(jobID string, items []source) error {
 		// files of a cancelled task as "waiting" is what made the cancel come
 		// back, because the claim reconciler promotes the waiting files of a
 		// queued task.
-		_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND status NOT IN ('completed', 'waiting') AND EXISTS (SELECT 1 FROM download_jobs j WHERE j.id = ? AND j.status IN ('queued', 'running')) AND (dialog_key, message_id) IN (`+list+`)`, append([]any{jobID, jobID}, args...)...)
+		_, err := m.db.Exec(`UPDATE download_items SET status = 'waiting', error = '等待其他任务完成同一文件', started_at = '', finished_at = '' WHERE job_id = ? AND status NOT IN ('completed', 'waiting') AND EXISTS (SELECT 1 FROM download_jobs j WHERE j.id = ? AND j.status IN (`+runningTaskStatusesSQL()+`)) AND (dialog_key, message_id) IN (`+list+`)`, append([]any{jobID, jobID}, args...)...)
 		return err
 	})
 	if err == nil {
@@ -3501,6 +3501,19 @@ func (m *Manager) setJob(id, status, message string) error {
 // the condition that decides whether a task can still be settled.
 var runningTaskStatuses = [...]string{"queued", "running"}
 
+// runningTaskStatusesSQL is the same set written for a statement. It is derived
+// from the list rather than typed out again, for the reason every other shared
+// string in this package exists: a status list with two copies is a status list
+// that will disagree with itself, and the disagreement shows up as a write that
+// lands on a task it was supposed to leave alone.
+func runningTaskStatusesSQL() string {
+	quoted := make([]string, 0, len(runningTaskStatuses))
+	for _, status := range runningTaskStatuses {
+		quoted = append(quoted, "'"+status+"'")
+	}
+	return strings.Join(quoted, ", ")
+}
+
 // setJobWhileRunning writes a task's status only while the task still holds a
 // state a running worker can own, and changes nothing otherwise.
 //
@@ -3682,19 +3695,35 @@ func (m *Manager) execItemState(event string, item Item, status, query string, a
 // update for every file, on the failure path of a task that may hold a row per
 // media comment.
 func (m *Manager) fail(id string, err error) {
-	if _, execErr := m.db.Exec(`UPDATE download_items SET status = 'failed', error = ?, finished_at = ? WHERE job_id = ? AND status NOT IN ('completed', 'downloaded', 'waiting')`, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id); execErr != nil {
+	// Failing is a decision about a task the caller was running, so the task's
+	// own status is part of both writes. Without it a pause or a cancel that
+	// landed first was overwritten: the items were rewritten to 'failed' -
+	// 'paused' and 'cancelled' are not in the exclusion above, which only names
+	// the three states a finishing worker can leave behind - and the task was
+	// rewritten to 'failed' or 'partial'. A paused task that became 'partial'
+	// can no longer be resumed, because resuming asks for a paused task.
+	if _, execErr := m.db.Exec(`UPDATE download_items SET status = 'failed', error = ?, finished_at = ? WHERE job_id = ? AND status NOT IN ('completed', 'downloaded', 'waiting') AND EXISTS (SELECT 1 FROM download_jobs j WHERE j.id = ? AND j.status IN (`+runningTaskStatusesSQL()+`))`, err.Error(), time.Now().UTC().Format(time.RFC3339Nano), id, id); execErr != nil {
 		applog.Error("download", "task_fail_items_save_failed", "job_id", id, "error", execErr.Error())
 	} else {
 		m.touch()
 	}
 	var completed int
-	_ = m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, id).Scan(&completed)
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, id).Scan(&completed); err != nil {
+		// The count decides between two terminal states, so an unreadable count
+		// is not the same as a zero: reporting "failed" over a task whose files
+		// are in fact done would be wrong in a way the user cannot correct.
+		applog.Error("download", "task_fail_count_failed", "job_id", id, "error", err.Error())
+		return
+	}
+	// The item writes above are already refused for a task that is not running,
+	// so these are too. Releasing the claims still happens either way: a task
+	// that is not downloading has no business holding media other tasks want.
 	if completed > 0 {
-		_ = m.setJob(id, "partial", "部分文件未完成，可重试失败文件")
+		_ = m.setJobWhileRunning(id, "partial", "部分文件未完成，可重试失败文件")
 		m.releaseFailedMessageClaims(id)
 		return
 	}
-	_ = m.setJob(id, "failed", err.Error())
+	_ = m.setJobWhileRunning(id, "failed", err.Error())
 	m.releaseFailedMessageClaims(id)
 }
 

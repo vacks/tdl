@@ -39,8 +39,10 @@ func main() {
 	}
 
 	// Keep ordinary requests bounded against slow readers and writers. The
-	// authenticated SSE handler explicitly clears its deadline after it has
-	// acquired one of the small, dedicated streaming slots.
+	// authenticated SSE handler is exempt from this deadline because a stream
+	// that produced nothing for thirty seconds is idle, not stuck - it sets a
+	// deadline of its own around each individual write instead, so a client
+	// that stops reading is still disconnected rather than held open forever.
 	httpServer := &http.Server{Handler: server, ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.Serve(listener) }()
@@ -58,6 +60,14 @@ func main() {
 		// closes the database, and a request served against a closed database
 		// turns a graceful shutdown into a burst of errors for whoever is still
 		// connected.
+		//
+		// The event streams are ended first, and that is not incidental: they
+		// end only when their client goes away, Shutdown waits for active
+		// handlers, and it does not cancel them. Left open - which is what
+		// happens if the only place that closes them is Stop, which runs after
+		// this - a single dashboard tab makes every restart wait out the whole
+		// timeout below.
+		server.EndStreams()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		if err := httpServer.Shutdown(ctx); err != nil {
 			log.Printf("shutdown HTTP server: %v", err)

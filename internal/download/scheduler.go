@@ -6,8 +6,13 @@ import "time"
 // to start or already transferring. Keeping the reservation until the message
 // task leaves those states gives the message class a durable share of global
 // concurrency instead of immediately handing its slot back to chat batches.
-// It is intentionally a single indexed EXISTS query, so historical chat
-// indexes with millions of rows do not need to be read.
+//
+// Both halves are indexed probes. The 'running' half is a seek: it fixes one
+// status and asks nothing else. The 'queued' half cannot be, because it also
+// asks that the task have a queued file - that is a seek into the queued set
+// with one indexed probe per candidate, and it is bounded by the queue rather
+// than by the history. What matters is that neither reads the history, which
+// holds millions of chat tasks.
 //
 // A task whose account is inside a Telegram cooldown is excluded. The
 // reservation it would otherwise hold is not protecting interactive work: the
@@ -20,9 +25,8 @@ import "time"
 // planner cannot prove that a disjunction implies either index's predicate, so
 // the OR form was answered by scanning download_jobs and hashing the queued
 // files of every row in it - the whole task history, to answer "is there one
-// task". Split, each half is a seek: 'running' on download_jobs_status_updated_id
-// and 'queued with a queued file' on download_jobs_queued_created_id. This runs
-// on every session batch, so its cost is paid per batch, not per task.
+// task". Split, each half reads only what its own status and index cover. This
+// runs on every session batch, so its cost is paid per batch, not per task.
 func (m *Manager) hasPriorityMessageTask() (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var found bool

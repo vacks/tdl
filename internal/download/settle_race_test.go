@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -88,5 +89,34 @@ func TestRunningTaskIsStillSettledByTheSettlePath(t *testing.T) {
 	m.finishTaskWithoutPendingWork("settle-race", true)
 	if got := settleRaceJob(t, m); got != "queued" {
 		t.Fatalf("task status=%q, want queued so the task is picked up when its files are released", got)
+	}
+}
+
+// Failing a task is a decision about a task the caller was running, and the
+// worker reaches it from several places without re-checking. A pause that lands
+// first must survive it: the fail path rewrote the files to 'failed' and the
+// task to 'failed' or 'partial', and a paused task that became 'partial' can no
+// longer be resumed, because resuming asks for a paused task.
+func TestPausedTaskIsNotTurnedIntoAFailure(t *testing.T) {
+	m := settleRaceManager(t, "paused")
+	m.fail("settle-race", errors.New("下载失败"))
+	if got := settleRaceJob(t, m); got != "paused" {
+		t.Fatalf("task status=%q after a worker reported a failure, want the paused state the user chose", got)
+	}
+	if got := settleRaceItem(t, m); got != "paused" {
+		t.Fatalf("item status=%q after a worker reported a failure, want paused", got)
+	}
+}
+
+// The other direction: a task that really is running still fails, so the guard
+// is a guard and not a wall.
+func TestRunningTaskStillFails(t *testing.T) {
+	m := settleRaceManager(t, "running")
+	m.fail("settle-race", errors.New("下载失败"))
+	if got := settleRaceJob(t, m); got != "failed" {
+		t.Fatalf("task status=%q, want failed: a running task's failure must still be recorded", got)
+	}
+	if got := settleRaceItem(t, m); got != "failed" {
+		t.Fatalf("item status=%q, want failed", got)
 	}
 }

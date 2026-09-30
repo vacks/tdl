@@ -2182,8 +2182,17 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 		}
 		lines = append(lines, fmt.Sprintf("%s %s  %s%s%s", statusIcon(item.Status), html.EscapeString(short(item.OriginalName, 26)), percent, speed, origin))
 	}
-	if len(job.Items) > len(items) {
-		lines = append(lines, fmt.Sprintf("<i>另有 %d 个文件未在此列出，可在管理台查看完整列表。</i>", len(job.Items)-len(items)))
+	// Counted from the task's own total rather than from the rows this read
+	// returned. A task's files are unbounded, so a read carries one bounded
+	// page of them - fifty at the time of writing - and subtracting the rendered
+	// lines from that page's length told a task with 480 files that thirty were
+	// not listed.
+	remaining := job.TotalItems - len(items)
+	if remaining < 0 {
+		remaining = len(job.Items) - len(items)
+	}
+	if remaining > 0 {
+		lines = append(lines, fmt.Sprintf("<i>另有 %d 个文件未在此列出，可在管理台查看完整列表。</i>", remaining))
 	}
 	lines = append(lines,
 		"<b>对话：</b>"+html.EscapeString(short(job.DialogName, 36)),

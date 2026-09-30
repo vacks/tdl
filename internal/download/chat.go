@@ -2321,6 +2321,21 @@ func (m *Manager) reconcileDiscussionGap(ctx context.Context, target storedChatT
 //     boundary - so restarting from the top would stop on its first page and
 //     strand every message below it for good. Resuming downwards is the only
 //     direction that still reaches them.
+//
+// historyMessageID returns the id a history entry carries, or zero for an entry
+// this build does not know. Both message variants carry one, and a walk needs
+// the oldest id in a page to move its cursor past that page - whatever the page
+// contains, because a page of service messages still has to be walked past.
+func historyMessageID(raw tg.MessageClass) int {
+	switch value := raw.(type) {
+	case *tg.Message:
+		return value.ID
+	case *tg.MessageService:
+		return value.ID
+	}
+	return 0
+}
+
 func (m *Manager) walkDiscussionGap(target storedChatTarget, peer tg.InputPeerClass, dialogKey string, boundary int, fetch func(offset int) ([]tg.MessageClass, error)) error {
 	offset := m.gapStreamOffset(target.ID, listenerGapDiscussionStream)
 	completed := false
@@ -2336,12 +2351,19 @@ func (m *Manager) walkDiscussionGap(target storedChatTarget, peer tg.InputPeerCl
 		oldest := 0
 		reached := false
 		for _, raw := range messages {
+			// The cursor advances on any entry, not only on the ones that carry
+			// media. A page that happens to hold nothing but service messages
+			// has no download in it, but it does have a position, and taking
+			// one from every entry is what makes the walk able to move past it.
+			// Deriving it from the download candidates alone left the walk with
+			// no resume point on such a page, and a walk with no resume point
+			// restarts from the newest message and reads the same page again.
+			if id := historyMessageID(raw); id > 0 && (oldest == 0 || id < oldest) {
+				oldest = id
+			}
 			message, ok := raw.(*tg.Message)
 			if !ok {
 				continue
-			}
-			if oldest == 0 || message.ID < oldest {
-				oldest = message.ID
 			}
 			if message.ID <= boundary {
 				reached = true
@@ -2363,10 +2385,12 @@ func (m *Manager) walkDiscussionGap(target storedChatTarget, peer tg.InputPeerCl
 			break
 		}
 		if oldest == 0 || oldest == offset {
-			// The page offered no resume point: either it held no message this
-			// walk can index, or the server returned the page it was asked to
-			// move past. There is nothing to resume from, so start the next walk
-			// from the newest message rather than spinning on this page.
+			// Either the page held nothing with an id at all, or the server
+			// returned the page it was asked to move past. There is nothing to
+			// resume from, so start the next walk from the newest message rather
+			// than spinning on this page. Both are degenerate: the first needs a
+			// page whose every entry is an unknown type, the second a server
+			// that ignores OffsetID.
 			completed = true
 			break
 		}
