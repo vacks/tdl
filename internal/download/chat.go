@@ -54,12 +54,26 @@ type ChatJob struct {
 
 const savedSourcePrefix = "tg://saved/"
 
+// savedDialogKey is the dialog_key of an account's Saved Messages task. It has
+// one definition because it has to agree with what dialogIdentity derives for
+// the account's own peer: the listener matches an admitted message to the task
+// that wants it by this key, so a second literal that drifted would silently
+// stop saved messages being downloaded.
+func savedDialogKey(accountID string) string { return "self:" + accountID }
+
 func isSavedChat(job ChatJob) bool {
 	return job.DialogType == "self" && strings.HasPrefix(job.SourceURL, savedSourcePrefix)
 }
 
+// isSavedListen reports whether a saved task is the one accepting new messages.
+//
+// The flag alone decides it. A saved task used to be one of two shapes - a
+// history scan, or a listen-only task marked by a negative start - so listening
+// was inferred from that marker. There is now at most one saved task per
+// account, and the same task can be told to scan its history and to listen, so
+// the marker no longer says anything about listening.
 func isSavedListen(job ChatJob) bool {
-	return isSavedChat(job) && job.ListenNew && job.StartMessageID < 0
+	return isSavedChat(job) && job.ListenNew
 }
 
 // IsSavedListenForBot exposes only the task classification needed by the Bot
@@ -262,33 +276,11 @@ func (m *Manager) GetChat(id string) (ChatJob, error) {
 	return job, nil
 }
 
-// ListSavedChats returns the small set of saved-message tasks for one
-// Telegram account. It is intentionally bounded: Bot status is not a
-// replacement for the paginated Web task list.
-func (m *Manager) ListSavedChats(accountID string) ([]ChatJob, error) {
-	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND status != ? ORDER BY created_at DESC, id DESC LIMIT 20`, accountID, ChatStatusDeleted)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	jobs := make([]ChatJob, 0, 4)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		job, err := m.GetChat(id)
-		if err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, job)
-	}
-	return jobs, rows.Err()
-}
-
+// FindSavedListener returns the account's saved task when it is the one
+// accepting new messages.
 func (m *Manager) FindSavedListener(accountID string) (ChatJob, bool, error) {
 	var id string
-	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND listen_new = 1 AND start_message_id < 0 AND status IN (?, ?, ?, ?, ?) ORDER BY updated_at DESC LIMIT 1`, accountID, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&id)
+	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND listen_new = 1 AND status IN (?, ?, ?, ?, ?) ORDER BY updated_at DESC LIMIT 1`, accountID, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ChatJob{}, false, nil
 	}
@@ -299,22 +291,47 @@ func (m *Manager) FindSavedListener(accountID string) (ChatJob, bool, error) {
 	return job, err == nil, err
 }
 
+// savedChatFilterPrefix marks the ListChats filter that narrows the list to one
+// account's Saved Messages task. See SavedChatsFilter.
+const savedChatFilterPrefix = "saved:"
+
+// SavedChatsFilter restricts ListChats to the single Saved Messages task of one
+// account.
+//
+// It is a filter rather than a second listing function because the two lists
+// render identically - the same card, the same cursor, the same counts - and a
+// saved task is an ordinary session task that happens to have the account's own
+// dialog as its target.
+func SavedChatsFilter(accountID string) string { return savedChatFilterPrefix + accountID }
+
 // ListChats uses the same opaque cursor approach as message downloads. The
 // count stays cheap even after media details have grown very large.
-func (m *Manager) ListChats(cursor string, pageSize int) ([]ChatJob, int, string, error) {
+func (m *Manager) ListChats(cursor string, pageSize int, filters ...string) ([]ChatJob, int, string, error) {
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 10
 	}
+	where, args := "WHERE c.status != ?", []any{ChatStatusDeleted}
 	total := m.visibleChatCount()
-	where, args := "WHERE c.status != ?", []any{ChatStatusDeleted, pageSize + 1}
+	if len(filters) > 0 && strings.HasPrefix(filters[0], savedChatFilterPrefix) {
+		accountID := strings.TrimPrefix(filters[0], savedChatFilterPrefix)
+		where += " AND c.dialog_type = 'self' AND c.account_id = ?"
+		args = append(args, accountID)
+		// The cached counter covers every session task. This one is a point
+		// lookup on the partial index over one account's saved tasks, so it is
+		// both cheaper than the counter and the only count that matches the rows.
+		if err := m.db.QueryRow(`SELECT COUNT(1) FROM chat_download_jobs WHERE account_id = ? AND dialog_type = 'self' AND status != ?`, accountID, ChatStatusDeleted).Scan(&total); err != nil {
+			return nil, 0, "", err
+		}
+	}
 	if cursor != "" {
 		createdAt, id, err := decodeChatCursor(cursor)
 		if err != nil {
 			return nil, 0, "", errors.New("分页游标无效，请返回第一页")
 		}
 		where += keysetAfter("c")
-		args = []any{ChatStatusDeleted, createdAt, id, pageSize + 1}
+		args = append(args, createdAt, id)
 	}
+	args = append(args, pageSize+1)
 	// The media index can be millions of rows. Its derived one-row summary is
 	// maintained transactionally, so list rendering never aggregates history.
 	rows, err := m.db.Query(`SELECT c.id, c.source_url, c.dialog_type, c.dialog_key, c.dialog_id, c.dialog_name, c.account_id, c.start_message_id, c.upper_message_id, c.listen_new, c.status, c.scan_state, c.error, c.created_at, c.updated_at,
@@ -2012,8 +2029,7 @@ func listensForNewMedia(job ChatJob) bool {
 
 // listenerGapCandidateIDs names the tasks an account's gap walk covers: every
 // listened dialog that has a real persisted peer, which is every channel, every
-// supergroup the user created a task for, and the listen-only Saved Messages
-// form.
+// supergroup the user created a task for, and the Saved Messages task.
 //
 // A supergroup is identified as 'chat', not 'channel': a channel and a
 // supergroup are both an InputPeerChannel on the wire, and the kind is refined
@@ -2024,7 +2040,7 @@ func listensForNewMedia(job ChatJob) bool {
 // channel task, but that only covers the groups this service created implicitly;
 // it never covered one the user asked for.
 func (m *Manager) listenerGapCandidateIDs(accountID string) ([]string, error) {
-	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) AND (dialog_type IN ('channel', 'chat') OR (dialog_type = 'self' AND start_message_id < 0))`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
+	rows, err := m.db.Query(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND listen_new = 1 AND scan_state = ? AND status IN (?, ?) AND dialog_type IN ('channel', 'chat', 'self')`, accountID, chatScanCompleted, ChatStatusDownloading, ChatStatusListening)
 	if err != nil {
 		return nil, err
 	}
@@ -3436,6 +3452,14 @@ func (m *Manager) SetChatListening(id string, enabled bool) error {
 // setChatListening applies the state change under the task lock and reports
 // whether it changed anything, so a no-op request does not rebuild the listener
 // snapshot or wake the workers.
+//
+// The flag is what the listener reads, and the listener only starts for a task
+// whose scan has completed and whose status says it is running or settling. So
+// the flag may be turned on or off at any point in a task's life: a task that is
+// still scanning keeps its status and picks the wish up when it gets there,
+// rather than being refused with a message that made the two requests the
+// controls actually send - "stop listening" while the history downloads, and
+// "listen too" right after starting that download - fail for no reason.
 func (m *Manager) setChatListening(id string, enabled bool) (bool, error) {
 	lock := m.chatLock(id)
 	lock.Lock()
@@ -3444,17 +3468,22 @@ func (m *Manager) setChatListening(id string, enabled bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if target.ScanState != chatScanCompleted {
-		return false, errors.New("历史下载尚未完成索引，暂时不能修改消息监听")
+	// A cancelled or deleted task is not running, and a flag on it would be a
+	// standing request to accept new messages for work its owner abandoned.
+	if target.Status == ChatStatusCancelled || target.Status == ChatStatusDeleted {
+		return false, errors.New("当前会话任务不能修改消息监听")
 	}
+	next := target.Status
 	if enabled {
 		if target.ListenNew {
 			return false, nil
 		}
-		if target.Status != ChatStatusCompleted && target.Status != ChatStatusPartial && target.Status != ChatStatusFailed {
-			return false, errors.New("当前会话任务不能开启消息监听")
+		if target.Status == ChatStatusCompleted || target.Status == ChatStatusPartial || target.Status == ChatStatusFailed {
+			// The task has nothing left to do, so listening is now its whole
+			// state and the card should say so.
+			next = ChatStatusListening
 		}
-		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 1, status = ?, error = '', updated_at = ? WHERE id = ?`, ChatStatusListening, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+		if _, err := m.db.Exec(`UPDATE chat_download_jobs SET listen_new = 1, status = ?, error = '', updated_at = ? WHERE id = ?`, next, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -3462,7 +3491,6 @@ func (m *Manager) setChatListening(id string, enabled bool) (bool, error) {
 	if !target.ListenNew {
 		return false, nil
 	}
-	next := target.Status
 	if target.Status == ChatStatusListening {
 		var failed int
 		if err := m.db.QueryRow(`SELECT COALESCE(failed, 0) FROM chat_download_stats WHERE chat_job_id = ?`, id).Scan(&failed); err != nil {

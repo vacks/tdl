@@ -144,13 +144,18 @@ type chatTrackedRef struct {
 // does not fit. Keeping the small navigation stack per Bot message lets both
 // message and chat lists use keyset pagination without OFFSET scans.
 type listPageState struct {
-	kind     string
-	status   string
-	cursor   string
-	next     string
-	previous []string
-	page     int
-	updated  time.Time
+	kind   string
+	status string
+	// savedAccountID narrows a session list to one account's Saved Messages
+	// task. The list is otherwise an ordinary session list - same cards, same
+	// cursor, same page state - so the narrowing travels with the page rather
+	// than needing a second set of callbacks.
+	savedAccountID string
+	cursor         string
+	next           string
+	previous       []string
+	page           int
+	updated        time.Time
 }
 type helpRetry struct {
 	next     time.Time
@@ -1284,7 +1289,7 @@ func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
 		return
 	}
 	applog.Info("bot", "chat_task_created", "user_id", msg.From.ID, "chat_job_id", job.ID)
-	messageID, err := s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, false))
+	messageID, err := s.send(cfg.Token, msg.Chat.ID, chatTaskText(job), chatTaskKeyboard(job, ""))
 	if err == nil && active(job.Status) {
 		s.trackChat(job.ID, messageRef{ChatID: msg.Chat.ID, MessageID: messageID})
 	}
@@ -1314,36 +1319,24 @@ func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, kind savedCo
 	switch kind {
 	case savedAll:
 		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
-		job, duplicate, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID})
+		job, existing, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID})
 		cancel()
 		if submitErr != nil {
 			s.send(cfg.Token, msg.Chat.ID, "❌ 创建收藏夹任务失败："+html.EscapeString(submitErr.Error()), nil)
 			return
 		}
-		if duplicate {
-			s.send(cfg.Token, msg.Chat.ID, "已有相同的收藏夹任务正在运行。", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
-			return
+		// The account has one saved task, so this either made it or sent it back
+		// over the history it already covers. Saying which keeps the reply
+		// honest about a scan that may already be running.
+		label := "✅ 收藏夹历史下载任务已创建"
+		if existing {
+			label = "✅ 已重新扫描收藏夹任务"
 		}
-		s.send(cfg.Token, msg.Chat.ID, "✅ 收藏夹历史下载任务已创建", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
+		s.send(cfg.Token, msg.Chat.ID, label, [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
 	case savedListen:
 		s.toggleSavedListen(cfg, account, msg)
 	case savedTask:
-		jobs, listErr := s.downloads.ListSavedChats(account.ID)
-		if listErr != nil {
-			s.send(cfg.Token, msg.Chat.ID, "❌ 读取收藏夹任务失败："+html.EscapeString(listErr.Error()), nil)
-			return
-		}
-		if len(jobs) == 0 {
-			s.send(cfg.Token, msg.Chat.ID, "暂无收藏夹任务。", nil)
-			return
-		}
-		lines := []string{"<b>收藏夹任务</b>"}
-		buttons := make([][]button, 0, len(jobs))
-		for _, job := range jobs {
-			lines = append(lines, fmt.Sprintf("%s %s：%d/%d", statusIcon(job.Status), html.EscapeString(short(job.DialogName, 28)), job.Completed, job.Discovered))
-			buttons = append(buttons, []button{{Text: "查看详情", CallbackData: "c:v:" + job.ID}})
-		}
-		s.send(cfg.Token, msg.Chat.ID, strings.Join(lines, "\n"), buttons)
+		s.sendSavedTaskList(cfg, msg.Chat.ID, account.ID)
 	}
 }
 
@@ -1370,14 +1363,10 @@ func (s *Service) toggleSavedListen(cfg settings.Bot, account telegram.Account, 
 		return
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
-	started, duplicate, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID, ListenOnly: true})
+	started, _, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID, ListenOnly: true})
 	cancel()
 	if submitErr != nil {
-		s.send(cfg.Token, msg.Chat.ID, "❌ 创建收藏夹任务失败："+html.EscapeString(submitErr.Error()), nil)
-		return
-	}
-	if duplicate {
-		s.send(cfg.Token, msg.Chat.ID, "已有相同的收藏夹任务正在运行。", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + started.ID}}})
+		s.send(cfg.Token, msg.Chat.ID, "❌ 开启收藏夹监听失败："+html.EscapeString(submitErr.Error()), nil)
 		return
 	}
 	s.send(cfg.Token, msg.Chat.ID, "✅ 收藏夹新消息监听已开启", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + started.ID}}})
@@ -1394,6 +1383,40 @@ func (s *Service) sendChatList(cfg settings.Bot, chatID int64) {
 	if err == nil {
 		s.putListPage("chat", chatID, messageID, state)
 	}
+}
+
+// sendSavedTaskList shows the account's Saved Messages task through the same
+// list the session downloads use: one button per task, a card behind it, and a
+// way back to the list.
+func (s *Service) sendSavedTaskList(cfg settings.Bot, chatID int64, accountID string) {
+	state := listPageState{kind: "chat", savedAccountID: accountID, page: 1}
+	text, buttons, err := s.chatTaskList(&state)
+	if err != nil {
+		s.send(cfg.Token, chatID, "读取收藏夹任务失败。", nil)
+		return
+	}
+	messageID, err := s.send(cfg.Token, chatID, text, buttons)
+	if err == nil {
+		s.putListPage("chat", chatID, messageID, state)
+	}
+}
+
+// chatListBack is the return button for a card that was rendered from a session
+// list: its label, and whether the card came from one at all.
+//
+// The label follows the page state kept for this message rather than the task,
+// because it is that list the button goes back to - a saved task reached from
+// /chats returns to the session list, and the same task reached from
+// /saved_task returns to the saved one.
+func (s *Service) chatListBack(chatID, messageID int64) (string, bool) {
+	state, ok := s.getListPage("chat", chatID, messageID)
+	if !ok {
+		return "", false
+	}
+	if state.savedAccountID != "" {
+		return "‹ 返回收藏夹列表", true
+	}
+	return "‹ 返回会话列表", true
 }
 
 func (s *Service) editChatList(cfg settings.Bot, chatID, messageID int64, direction string) {
@@ -1419,12 +1442,18 @@ func (s *Service) editChatList(cfg settings.Bot, chatID, messageID int64, direct
 }
 
 func (s *Service) chatTaskList(state *listPageState) (string, [][]button, error) {
-	jobs, total, next, err := s.downloads.ListChats(state.cursor, 10)
+	var filters []string
+	title, empty := "会话下载", "暂无会话下载任务。"
+	if state.savedAccountID != "" {
+		filters = append(filters, download.SavedChatsFilter(state.savedAccountID))
+		title, empty = "收藏夹任务", "暂无收藏夹任务。"
+	}
+	jobs, total, next, err := s.downloads.ListChats(state.cursor, 10, filters...)
 	if err != nil {
 		return "", nil, err
 	}
 	if len(jobs) == 0 {
-		return "暂无会话下载任务。", nil, nil
+		return empty, nil, nil
 	}
 	totalPages := max(1, (total+9)/10)
 	state.next = next
@@ -1442,7 +1471,7 @@ func (s *Service) chatTaskList(state *listPageState) (string, [][]button, error)
 		navigation = append(navigation, button{Text: "下一页 ›", CallbackData: "c:l:next"})
 	}
 	buttons = append(buttons, navigation)
-	return fmt.Sprintf("<b>会话下载</b> · 共 %d 个 · 第 %d/%d 页", total, state.page, totalPages), buttons, nil
+	return fmt.Sprintf("<b>%s</b> · 共 %d 个 · 第 %d/%d 页", title, total, state.page, totalPages), buttons, nil
 }
 
 // eventPageSize is the number of rows one /events page shows. Ten events plus a
@@ -1678,7 +1707,7 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 		return
 	}
 	if parts[1] == "v" && len(parts) == 3 {
-		s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, parts[2], s.hasListPage("chat", query.Message.Chat.ID, query.Message.MessageID))
+		s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, parts[2])
 		s.answer(cfg.Token, query.ID, "")
 		return
 	}
@@ -1719,34 +1748,36 @@ func (s *Service) handleChatCallback(cfg settings.Bot, query callbackQuery) {
 		if action == "purge" {
 			message = "会话任务已彻底删除；最终下载文件已保留。"
 		}
-		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, message, [][]button{{{Text: "返回会话列表", CallbackData: "c:l:back"}}})
+		back, fromList := s.chatListBack(query.Message.Chat.ID, query.Message.MessageID)
+		var buttons [][]button
+		if fromList {
+			buttons = [][]button{{{Text: back, CallbackData: "c:l:back"}}}
+		}
+		s.edit(cfg.Token, query.Message.Chat.ID, query.Message.MessageID, message, buttons)
 		return
 	}
-	s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id, s.hasListPage("chat", query.Message.Chat.ID, query.Message.MessageID))
+	s.editChatTask(cfg, query.Message.Chat.ID, query.Message.MessageID, id)
 }
 
-func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id string, fromList bool) {
+func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id string) {
+	back, fromList := s.chatListBack(chatID, messageID)
 	job, err := s.downloads.GetChat(id)
 	if err != nil {
 		buttons := [][]button(nil)
 		if fromList {
-			buttons = [][]button{{{Text: "返回会话列表", CallbackData: "c:l:back"}}}
+			buttons = [][]button{{{Text: back, CallbackData: "c:l:back"}}}
 		}
 		s.edit(cfg.Token, chatID, messageID, "会话任务不存在或已删除。", buttons)
 		return
 	}
-	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, fromList))
+	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, back))
 	if active(job.Status) {
 		s.trackChat(job.ID, messageRef{ChatID: chatID, MessageID: messageID})
 	}
 }
 
 func chatTaskText(job download.ChatJob) string {
-	rangeLabel := chatRangeLabel(job)
-	if download.IsSavedListenForBot(job) {
-		rangeLabel = "仅监听新消息"
-	}
-	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), "<b>对话：</b>" + html.EscapeString(short(job.DialogName, 36)), "<b>范围：</b>" + rangeLabel, fmt.Sprintf("<b>进度：</b>%d/%d", job.Completed, job.Discovered)}
+	lines := []string{fmt.Sprintf("%s <b>%s</b>", statusIcon(job.Status), statusName(job.Status)), "<b>对话：</b>" + html.EscapeString(short(job.DialogName, 36)), "<b>范围：</b>" + chatRangeLabel(job), fmt.Sprintf("<b>进度：</b>%d/%d", job.Completed, job.Discovered)}
 	if job.Failed > 0 {
 		lines = append(lines, fmt.Sprintf("<b>失败：</b>%d", job.Failed))
 	}
@@ -1767,7 +1798,17 @@ func chatTaskText(job download.ChatJob) string {
 // chatRangeLabel mirrors the Web range display. Before the scanner discovers
 // media, "最早" is an intent; afterwards the lowest discovered media ID is
 // the meaningful range boundary, including while indexing is still running.
+//
+// A negative start is the one shape with no history at all - a Saved Messages
+// task told to listen and not to scan - and it is described rather than given a
+// range, because "最早 — N" would claim a coverage the task deliberately does
+// not have. It is read from the range itself and not from the listening flag:
+// the same saved task both scans a history and listens once /saved_all has been
+// asked for, and the flag says nothing about which range it holds.
 func chatRangeLabel(job download.ChatJob) string {
+	if job.StartMessageID < 0 {
+		return "仅监听新消息"
+	}
 	if job.StartMessageID > 0 {
 		return fmt.Sprintf("%d — %d", job.StartMessageID, job.UpperMessageID)
 	}
@@ -1777,7 +1818,9 @@ func chatRangeLabel(job download.ChatJob) string {
 	return fmt.Sprintf("最早 — %d", job.UpperMessageID)
 }
 
-func chatTaskKeyboard(job download.ChatJob, fromList bool) [][]button {
+// chatTaskKeyboard renders a session card's controls. back is the label of the
+// return button, empty for a card that was not reached from a list.
+func chatTaskKeyboard(job download.ChatJob, back string) [][]button {
 	buttons := make([][]button, 0, 3)
 	if job.Status == "queued" || job.Status == "scanning" || job.Status == "downloading" || job.Status == "listening" {
 		buttons = append(buttons, []button{{Text: "暂停", CallbackData: fmt.Sprintf("c:t:%s:pause", job.ID)}, {Text: "取消", CallbackData: fmt.Sprintf("c:t:%s:cancel", job.ID)}})
@@ -1801,8 +1844,8 @@ func chatTaskKeyboard(job download.ChatJob, fromList bool) [][]button {
 	} else if !job.ListenNew && (job.Status == "completed" || job.Status == "failed" || job.Status == "partial") {
 		buttons = append(buttons, []button{{Text: "开启消息监听", CallbackData: fmt.Sprintf("c:t:%s:listenon", job.ID)}})
 	}
-	if fromList {
-		buttons = append(buttons, []button{{Text: "返回会话列表", CallbackData: "c:l:back"}})
+	if back != "" {
+		buttons = append(buttons, []button{{Text: back, CallbackData: "c:l:back"}})
 	}
 	return buttons
 }
@@ -1933,7 +1976,8 @@ func (s *Service) refresh(cfg settings.Bot) {
 			}
 			continue
 		}
-		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, chatTaskText(job), chatTaskKeyboard(job, s.hasListPage("chat", ref.ChatID, ref.MessageID))) {
+		back, _ := s.chatListBack(ref.ChatID, ref.MessageID)
+		if s.editLive(cfg.Token, ref.ChatID, ref.MessageID, chatTaskText(job), chatTaskKeyboard(job, back)) {
 			s.untrackChat(key)
 			continue
 		}

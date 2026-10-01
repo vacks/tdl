@@ -45,6 +45,12 @@ func TestChatTaskPresentationMirrorsWebRangeRules(t *testing.T) {
 		{name: "not discovered", job: download.ChatJob{UpperMessageID: 99}, want: "最早 — 99"},
 		{name: "discovered while indexing", job: download.ChatJob{EarliestMediaID: 42, UpperMessageID: 99}, want: "42 — 99"},
 		{name: "explicit start", job: download.ChatJob{StartMessageID: 50, EarliestMediaID: 42, UpperMessageID: 99}, want: "50 — 99"},
+		// A Saved Messages task that listens without scanning holds no history,
+		// so it has no range to show. The rule reads the range, not the
+		// listening flag: a saved task that scanned and then listened has both,
+		// and describing it as listening-only would hide the files it indexed.
+		{name: "saved listening without a history", job: download.ChatJob{DialogType: "self", StartMessageID: -1, ListenNew: true, UpperMessageID: 99}, want: "仅监听新消息"},
+		{name: "saved listening over a history", job: download.ChatJob{DialogType: "self", StartMessageID: 0, ListenNew: true, EarliestMediaID: 42, UpperMessageID: 99}, want: "42 — 99"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -66,7 +72,7 @@ func TestChatTaskPresentationMirrorsWebRangeRules(t *testing.T) {
 }
 
 func TestChatTaskKeyboardExposesPurgeForTerminalTask(t *testing.T) {
-	keys := chatTaskKeyboard(download.ChatJob{ID: "chat-1", Status: "completed"}, true)
+	keys := chatTaskKeyboard(download.ChatJob{ID: "chat-1", Status: "completed"}, "‹ 返回会话列表")
 	joined := ""
 	for _, row := range keys {
 		for _, key := range row {

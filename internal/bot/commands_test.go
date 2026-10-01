@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -245,5 +246,64 @@ func TestForwardOriginWinsOverTheLegacyFields(t *testing.T) {
 	})
 	if !ok || got != "https://t.me/c/1934225758/9522" {
 		t.Fatalf("forwardedMessageURL() = %q, %v; want the forward_origin message", got, ok)
+	}
+}
+
+// /saved_task has to read like /tasks: every task is a button on the list, the
+// button says which task it is, and the card behind it leads back to the list it
+// came from. A column of identical "查看详情" buttons is not a list - it is a
+// menu with no labels.
+func TestSavedTaskCardIsAListButtonWithAWayBack(t *testing.T) {
+	job := download.ChatJob{ID: "saved-1", DialogName: "收藏消息_42", Status: "listening", Discovered: 9, Completed: 4, ListenNew: true}
+
+	// The list row: the task names itself, and its payload opens the card.
+	label := fmt.Sprintf("%s %s %d/%d下载", statusIcon(job.Status), short(job.DialogName, 18), job.Completed, job.Discovered)
+	if label == "查看详情" || !strings.Contains(label, "收藏消息_42") || !strings.Contains(label, "4/9下载") {
+		t.Fatalf("the saved list button reads %q; it has to name the task it opens", label)
+	}
+
+	// The card: the same controls a session card carries, plus the way back.
+	buttons := chatTaskKeyboard(job, "‹ 返回收藏夹列表")
+	joined := ""
+	for _, row := range buttons {
+		for _, key := range row {
+			joined += key.CallbackData + " "
+		}
+	}
+	if !strings.Contains(joined, "c:l:back") {
+		t.Fatalf("the saved card has no way back to its list: %s", joined)
+	}
+	if !strings.Contains(joined, "c:t:saved-1:listenoff") {
+		t.Fatalf("the saved card cannot stop listening: %s", joined)
+	}
+	if got := buttons[len(buttons)-1][0].Text; got != "‹ 返回收藏夹列表" {
+		t.Fatalf("the return button reads %q", got)
+	}
+
+	// A card that did not come from a list carries no return button at all.
+	for _, row := range chatTaskKeyboard(job, "") {
+		for _, key := range row {
+			if key.CallbackData == "c:l:back" {
+				t.Fatal("a card that was not opened from a list offers to return to one")
+			}
+		}
+	}
+}
+
+// The return button follows the list the card was opened from, not the task:
+// the same Saved Messages task is listed by /chats and by /saved_task, and each
+// button has to go back where it came from.
+func TestChatListBackFollowsTheListTheCardCameFrom(t *testing.T) {
+	s := &Service{listPages: map[string]listPageState{}}
+	if back, ok := s.chatListBack(1, 2); ok || back != "" {
+		t.Fatalf("a card with no list behind it returned %q, %v", back, ok)
+	}
+	s.putListPage("chat", 1, 2, listPageState{kind: "chat", page: 1})
+	if back, ok := s.chatListBack(1, 2); !ok || back != "‹ 返回会话列表" {
+		t.Fatalf("a session list returned %q, %v", back, ok)
+	}
+	s.putListPage("chat", 3, 4, listPageState{kind: "chat", savedAccountID: "acc", page: 1})
+	if back, ok := s.chatListBack(3, 4); !ok || back != "‹ 返回收藏夹列表" {
+		t.Fatalf("a saved list returned %q, %v", back, ok)
 	}
 }

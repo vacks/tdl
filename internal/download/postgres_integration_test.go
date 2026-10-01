@@ -1459,9 +1459,11 @@ func TestPostgresSettleQueuedJobsWithoutPendingWork(t *testing.T) {
 	}
 }
 
-// The gap walk has to cover listened channels, not only the listen-only Saved
-// Messages form, and it must leave alone the tasks that have no settled
-// watermark or no responsibility for new media.
+// The gap walk has to cover every listened dialog, not only channels and
+// groups: the Saved Messages task listens too, and a message saved while the
+// process was down is as recoverable - and as lost - there as anywhere else.
+// It must leave alone the tasks with no settled watermark or no responsibility
+// for new media.
 func TestPostgresListenerGapCandidatesCoverChannels(t *testing.T) {
 	url := os.Getenv("TDL_TEST_POSTGRES_URL")
 	if url == "" {
@@ -1502,7 +1504,10 @@ func TestPostgresListenerGapCandidatesCoverChannels(t *testing.T) {
 		{"gap-channel-not-listening", "channel", 1000, 0, chatScanCompleted, ChatStatusDownloading, false},
 		{"gap-channel-scanning", "channel", 1000, 1, chatScanIndexing, ChatStatusScanning, false},
 		{"gap-channel-completed", "channel", 1000, 1, chatScanCompleted, ChatStatusCompleted, false},
-		{"gap-saved-history-form", "self", 1000, 1, chatScanCompleted, ChatStatusListening, false},
+		// A saved task that has scanned a history range and then listens is the
+		// same responsibility as a channel's: the scan froze an upper bound, and
+		// everything above it arrives over a connection that can drop.
+		{"gap-saved-history-form", "self", 1000, 1, chatScanCompleted, ChatStatusListening, true},
 	}
 	for _, testCase := range cases {
 		if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, start_message_id, listen_new, status, scan_state, created_at, updated_at) VALUES (?,?,?,?,1,'test','account',?,?,?,?,?,?)`, testCase.id, savedSourcePrefix+"account", testCase.dialogType, "channel:"+testCase.id, testCase.start, testCase.listen, testCase.status, testCase.scanState, now, now); err != nil {

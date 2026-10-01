@@ -53,7 +53,12 @@ func TestPostgresSavedListenerIsTheRunningListenOnlyTask(t *testing.T) {
 		{name: "a listener nobody has resumed yet", accountID: "acc", startMessage: -1, listenNew: 1, status: ChatStatusQueued, want: true},
 		{name: "a paused listener still holds the task", accountID: "acc", startMessage: -1, listenNew: 1, status: ChatStatusPaused, want: true},
 		{name: "an ordinary history download is not a listener", accountID: "acc", startMessage: 0, listenNew: 0, status: ChatStatusDownloading},
-		{name: "a history download that also listens is not listen-only", accountID: "acc", startMessage: 0, listenNew: 1, status: ChatStatusDownloading},
+		// The account has one saved task, and /saved_all leaves listening on it
+		// alone. So a task that is downloading its history and listening is the
+		// listener, and the toggle has to be able to stop it - keying on the
+		// listen-only shape instead meant this task could be started but never
+		// stopped.
+		{name: "a history download that also listens is the listener", accountID: "acc", startMessage: 0, listenNew: 1, status: ChatStatusDownloading, want: true},
 		{name: "a finished listener has stopped", accountID: "acc", startMessage: -1, listenNew: 1, status: ChatStatusCompleted},
 		{name: "a cancelled listener has stopped", accountID: "acc", startMessage: -1, listenNew: 1, status: ChatStatusCancelled},
 		{name: "another account's listener is not this one's", accountID: "other", startMessage: -1, listenNew: 1, status: ChatStatusListening},

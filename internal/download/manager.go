@@ -2099,7 +2099,7 @@ func (j Job) directInputPeer() tg.InputPeerClass {
 func dialogIdentity(peer tg.InputPeerClass, accountID string) (kind, key string, id int64) {
 	switch value := peer.(type) {
 	case *tg.InputPeerSelf:
-		return "self", "self:" + accountID, 0
+		return "self", savedDialogKey(accountID), 0
 	case *tg.InputPeerUser:
 		return "user", fmt.Sprintf("user:%d", value.UserID), value.UserID
 	case *tg.InputPeerChat:

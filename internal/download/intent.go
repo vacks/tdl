@@ -87,9 +87,20 @@ type SavedIntent struct {
 	ListenOnly bool
 }
 
-// SubmitSaved creates a history or listen-only Saved Messages task. The
-// listen-only task starts with an already-completed scan state and therefore
-// never walks historical messages.
+// SubmitSaved acts on the one Saved Messages task an account has.
+//
+// There is at most one of them, and that is the point: the task's target is the
+// account's own saved dialog, so a second one would index the same media and
+// race the first for every file. Asking for the history again is therefore a
+// request to scan that task again, not a reason to make another, and ListenOnly
+// selects which half of the task the call acts on - start listening on it, or
+// re-scan it - rather than which task to build.
+//
+// The one exception is an account that has never had a task: the first request
+// still decides the shape. A history request scans from the oldest message; a
+// listen request starts already scanned and therefore never walks history,
+// because "listen for new messages" must not begin by downloading everything
+// ever saved.
 func (m *Manager) SubmitSaved(ctx context.Context, intent SavedIntent) (ChatJob, bool, error) {
 	if intent.AccountID == "" || intent.TelegramID <= 0 {
 		return ChatJob{}, false, errors.New("收藏夹账号信息不完整")
@@ -97,71 +108,219 @@ func (m *Manager) SubmitSaved(ctx context.Context, intent SavedIntent) (ChatJob,
 	if intent.Source == "" {
 		intent.Source = SourceBot
 	}
-	var created ChatJob
-	var duplicate bool
+	var job ChatJob
+	var existing bool
 	err := m.accounts.Run(ctx, intent.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
-		key := "self:" + intent.AccountID
-		start := 0
-		if intent.ListenOnly {
-			var existingID string
-			err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND listen_new = 1 AND start_message_id < 0 AND status IN (?, ?, ?, ?, ?) LIMIT 1`, intent.AccountID, key, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&existingID)
-			if err == nil {
-				created, err = m.GetChat(existingID)
-				duplicate = err == nil
-				return err
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			start = -1
-		} else {
-			var existingID string
-			err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND start_message_id = 0 AND listen_new = 0 AND status IN (?, ?, ?, ?, ?) LIMIT 1`, intent.AccountID, key, ChatStatusQueued, ChatStatusScanning, ChatStatusDownloading, ChatStatusListening, ChatStatusPaused).Scan(&existingID)
-			if err == nil {
-				created, err = m.GetChat(existingID)
-				duplicate = err == nil
-				return err
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
+		key := savedDialogKey(intent.AccountID)
+		id, found, err := m.keepOneSavedChat(intent.AccountID)
+		if err != nil {
+			return err
 		}
-		latestID := 0
-		it := query.Messages(client.API()).GetHistory((&tg.InputPeerSelf{})).BatchSize(1).Iter()
-		if it.Next(ctx) {
-			if latest, ok := it.Value().Msg.(*tg.Message); ok {
-				latestID = latest.ID
+		if found {
+			existing = true
+			if intent.ListenOnly {
+				if err := m.SetChatListening(id, true); err != nil {
+					return err
+				}
+			} else {
+				latestID, err := latestSavedMessageID(ctx, client)
+				if err != nil {
+					return err
+				}
+				if err := m.rescanSavedChat(id, latestID); err != nil {
+					return err
+				}
 			}
-		} else if err := it.Err(); err != nil {
-			return fmt.Errorf("读取收藏消息: %w", err)
+			job, err = m.GetChat(id)
+			return err
+		}
+		latestID, err := latestSavedMessageID(ctx, client)
+		if err != nil {
+			return err
 		}
 		name := fmt.Sprintf("收藏消息_%d", intent.TelegramID)
-		status, scanState := ChatStatusQueued, chatScanPending
+		start, status, scanState := 0, ChatStatusQueued, chatScanPending
 		if intent.ListenOnly {
-			status, scanState = ChatStatusListening, chatScanCompleted
+			start, status, scanState = -1, ChatStatusListening, chatScanCompleted
 		}
 		configJSON, marshalErr := json.Marshal(m.settings.Get().Download)
 		if marshalErr != nil {
 			return marshalErr
 		}
-		var createErr error
-		created, createErr = m.createChatJob(ChatJob{SourceURL: savedSourcePrefix + intent.AccountID, DialogType: "self", DialogKey: key, DialogName: name, AccountID: intent.AccountID, StartMessageID: start, UpperMessageID: latestID, ListenNew: intent.ListenOnly, Status: status, ScanState: scanState}, directPeer{kind: "self"}, string(configJSON))
-		return createErr
+		job, err = m.createChatJob(ChatJob{SourceURL: savedSourcePrefix + intent.AccountID, DialogType: "self", DialogKey: key, DialogName: name, AccountID: intent.AccountID, StartMessageID: start, UpperMessageID: latestID, ListenNew: intent.ListenOnly, Status: status, ScanState: scanState}, directPeer{kind: "self"}, string(configJSON))
+		return err
 	})
 	if err != nil {
 		return ChatJob{}, false, err
 	}
-	if !duplicate {
-		m.signalChat()
-		m.markChatListenerDirty()
-		if intent.ListenOnly {
-			// A listener that starts after the fact still owes whatever was
-			// published between its watermark and now.
-			go m.reconcileListenerGap(created.ID)
-		}
-		applog.Info("chat_download", "saved_task_created", "chat_job_id", created.ID, "account_id", intent.AccountID, "telegram_id", intent.TelegramID, "listen_only", intent.ListenOnly)
+	m.signalChat()
+	m.markChatListenerDirty()
+	if existing {
+		applog.Info("chat_download", "saved_task_updated", "chat_job_id", job.ID, "account_id", intent.AccountID, "listen_only", intent.ListenOnly)
+	} else {
+		applog.Info("chat_download", "saved_task_created", "chat_job_id", job.ID, "account_id", intent.AccountID, "telegram_id", intent.TelegramID, "listen_only", intent.ListenOnly)
 	}
-	return created, duplicate, nil
+	if intent.ListenOnly {
+		// A listener that starts after the fact still owes whatever was
+		// published between its watermark and now. That is as true of turning
+		// listening on for a task that already exists - the usual case now that
+		// the account has one task - as it is of creating a listen-only one: the
+		// task's upper bound is where its knowledge ends either way, and the
+		// live connection only sees what arrives after it is established.
+		go m.reconcileListenerGap(job.ID)
+	}
+	return job, existing, nil
+}
+
+// keepOneSavedChat names the account's one Saved Messages task and retires any
+// others it still has.
+//
+// An account is meant to have one, and this is where that is enforced rather
+// than at each caller, because every path that acts on the saved task comes
+// through here. A database written before the rule can hold two at once - a
+// history task and a listen-only task, both running - because the old duplicate
+// check only looked for the shape it was about to create. The lookup keeps the
+// row that carries a history range and retires the rest.
+//
+// Preferring the history row is not cosmetic. The active-uniqueness index covers
+// (account_id, dialog_key, start_message_id), so rescanning a listen-only task
+// while a running history task still holds the range would move it onto a key
+// that already exists and the whole command would fail with a duplicate-key
+// error - which is exactly the arrangement the two-task era leaves behind.
+//
+// Deleted is the one status that does not count as existing: a purged task is
+// gone, and asking for the history afterwards is a request to build a new one.
+func (m *Manager) keepOneSavedChat(accountID string) (string, bool, error) {
+	key := savedDialogKey(accountID)
+	var id string
+	// A false sorts before a true, so a task with a history range is preferred
+	// over one that only listens, and the newest of each kind wins otherwise.
+	err := m.db.QueryRow(`SELECT id FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND status != ? ORDER BY (start_message_id < 0), created_at DESC LIMIT 1`, accountID, key, ChatStatusDeleted).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if err := m.retireOtherSavedChats(accountID, key, id); err != nil {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+// retireOtherSavedChats stops and hides the account's other Saved Messages
+// tasks.
+//
+// The steps are the ones a person would take by hand - cancel a task that is
+// still running, then delete it - because those are the paths that already know
+// how to end a task safely: they release the media claims it holds, stop its
+// transfers and drop its temporary directory. Deleting a running task directly
+// is refused for exactly that reason, so this goes through the same doors rather
+// than around them.
+func (m *Manager) retireOtherSavedChats(accountID, key, keepID string) error {
+	rows, err := m.db.Query(`SELECT id, status FROM chat_download_jobs WHERE account_id = ? AND dialog_key = ? AND id != ? AND status != ?`, accountID, key, keepID, ChatStatusDeleted)
+	if err != nil {
+		return err
+	}
+	type savedRow struct{ id, status string }
+	others := make([]savedRow, 0, 2)
+	for rows.Next() {
+		var row savedRow
+		if err := rows.Scan(&row.id, &row.status); err != nil {
+			rows.Close()
+			return err
+		}
+		others = append(others, row)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, other := range others {
+		// The two guards are complementary and total: the statuses CancelChat
+		// refuses are the ones DeleteChat accepts.
+		switch other.status {
+		case ChatStatusCompleted, ChatStatusFailed, ChatStatusPartial, ChatStatusCancelled:
+		default:
+			if err := m.CancelChat(other.id); err != nil {
+				return err
+			}
+		}
+		if err := m.DeleteChat(other.id); err != nil {
+			return err
+		}
+		applog.Info("chat_download", "saved_task_retired", "chat_job_id", other.id, "account_id", accountID, "kept_chat_job_id", keepID)
+	}
+	return nil
+}
+
+// rescanSavedChat sends the account's saved task back over its history.
+//
+// It re-reads the dialog's newest message as the upper bound, drops every scan
+// cursor so the walk starts from the top, and requeues the files that are not
+// already published - so a file that had failed is offered again rather than
+// being left as the one thing a re-scan cannot fix.
+//
+// Walking the history again is what "scan it again" means, and it is safe: the
+// media index is keyed by (dialog_key, message_id), so a file that is already
+// indexed is left alone instead of being downloaded twice. The gap cursors are
+// deliberately left where they are; they belong to the listener's own walk,
+// which is a different question from where the history scan stopped.
+func (m *Manager) rescanSavedChat(id string, latestID int) error {
+	lock := m.chatLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	target, err := m.chatTarget(id)
+	if err != nil {
+		return err
+	}
+	// A cancelled task is revived rather than refused, which is what asking for
+	// its history again means; RetryChat already treats the same state that way.
+	// A deleted one is not reachable here - the lookup that found this task
+	// skips them - so it only guards against a purge that landed in between.
+	if target.Status == ChatStatusDeleted {
+		return errors.New("当前会话任务已被删除")
+	}
+	// The item rows and the parent move together, so the scan can never be
+	// observed queued while the files it is about to index are still marked
+	// finished: a file that failed and was requeued by the same transaction is
+	// either both visible or neither.
+	//
+	// The state change comes before the execution contexts are cancelled, in the
+	// order PauseChat established: the lock is held throughout, so a transfer
+	// that is publishing right now waits for this to finish and then sees a
+	// parent that is no longer running, which is the check it makes anyway.
+	if err := m.transitionChatItems(id, target.Status, ChatStatusQueued, "",
+		`UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE chat_job_id = ? AND status IN ('failed', 'cancelled', 'paused')`,
+		func(tx *databaseTx) error {
+			if _, err := tx.Exec(`UPDATE chat_download_streams SET offset_message_id = 0, completed = 0 WHERE chat_job_id = ? AND stream_kind NOT IN (?, ?)`, id, listenerGapStream, listenerGapDiscussionStream); err != nil {
+				return err
+			}
+			// start_message_id is put back to zero: a task that was listening
+			// only had never claimed a history, and this is the request that
+			// claims one.
+			_, err := tx.Exec(`UPDATE chat_download_jobs SET start_message_id = 0, upper_message_id = ?, scan_state = ?, error = '' WHERE id = ?`, latestID, chatScanPending, id)
+			return err
+		}, id); err != nil {
+		return err
+	}
+	m.cancelChatExecutions(id)
+	return nil
+}
+
+// latestSavedMessageID reads the newest message in the account's saved dialog,
+// which is the upper bound a scan of it is frozen at.
+func latestSavedMessageID(ctx context.Context, client *gotd.Client) (int, error) {
+	latestID := 0
+	it := query.Messages(client.API()).GetHistory((&tg.InputPeerSelf{})).BatchSize(1).Iter()
+	if it.Next(ctx) {
+		if latest, ok := it.Value().Msg.(*tg.Message); ok {
+			latestID = latest.ID
+		}
+	} else if err := it.Err(); err != nil {
+		return 0, fmt.Errorf("读取收藏消息: %w", err)
+	}
+	return latestID, nil
 }
 
 // ErrNoEligibleMedia reports that a message was read successfully and every
