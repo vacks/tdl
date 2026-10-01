@@ -45,6 +45,11 @@ type Server struct {
 	reactions *reaction.Service
 	mux       *http.ServeMux
 	sseSlots  chan struct{}
+	// statusSlots bounds the sidebar's status streams separately from the
+	// download progress ones. Each stream is one goroutine per open page, and
+	// both limits exist to bound them - but a page that is only watching the
+	// sidebar must not consume the budget that live download progress needs.
+	statusSlots chan struct{}
 	// shutdown is closed by Stop to end the long-lived event streams. They are
 	// the one handler that outlives a request by design, so http.Server.Shutdown
 	// - which waits for active handlers but does not cancel their contexts -
@@ -84,7 +89,7 @@ func New(cfg config.Config) (*Server, error) {
 	reactions := reaction.New(settingsStore, telegram, downloads)
 	reactions.Start()
 	systemMonitor := monitor.New(cfg.DownloadDir)
-	s := &Server{cfg: cfg, accounts: accounts, sessions: auth.NewSessions(), telegram: telegram, settings: settingsStore, downloads: downloads, monitor: systemMonitor, bot: bot.New(settingsStore, downloads, telegram, systemMonitor, cfg.DataDir), reactions: reactions, mux: http.NewServeMux(), sseSlots: make(chan struct{}, 8), shutdown: make(chan struct{}), logins: make(map[string]loginAttempt)}
+	s := &Server{cfg: cfg, accounts: accounts, sessions: auth.NewSessions(), telegram: telegram, settings: settingsStore, downloads: downloads, monitor: systemMonitor, bot: bot.New(settingsStore, downloads, telegram, systemMonitor, cfg.DataDir), reactions: reactions, mux: http.NewServeMux(), sseSlots: make(chan struct{}, 8), statusSlots: make(chan struct{}, 16), shutdown: make(chan struct{}), logins: make(map[string]loginAttempt)}
 	s.routes()
 	return s, nil
 }
@@ -148,6 +153,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/auth/logout", s.requireAuth(s.logout))
 	s.mux.HandleFunc("/api/auth/password", s.requireAuth(s.changePassword))
 	s.mux.HandleFunc("/api/dashboard", s.requireAuth(s.dashboard))
+	s.mux.HandleFunc("/api/status", s.requireAuth(s.statusSnapshot))
+	s.mux.HandleFunc("/api/status/events", s.requireAuth(s.statusSSE))
 	s.mux.HandleFunc("/api/config", s.requireAuth(s.configAPI))
 	s.mux.HandleFunc("/api/telegram/accounts", s.requireAuth(s.telegramAccounts))
 	s.mux.HandleFunc("/api/telegram/accounts/", s.requireAuth(s.telegramAccount))
@@ -719,6 +726,146 @@ func coalesceEvents(events <-chan download.Event, first download.Event) download
 			latest = next
 		case <-timer.C:
 			return latest
+		}
+	}
+}
+
+// statusCheckInterval is how often an open status stream re-reads the two
+// connection states it reports. Both reads are in-memory and mutex-guarded, so
+// asking is free; writing is not, and that is why the answer is compared with
+// the one already sent before anything goes out.
+const statusCheckInterval = 2 * time.Second
+
+// statusKeepAliveInterval is how long a status stream may stay silent before it
+// writes a comment frame. The states it reports can hold steady for days, and a
+// connection that carries nothing at all is one an intermediary closes without
+// telling either end.
+const statusKeepAliveInterval = 20 * time.Second
+
+// connectionStatus is the pair of connection states the Web sidebar shows.
+//
+// Every field is a plain string, which is what lets the stream below compare
+// two of these directly: the comparison is the change detector, and "nothing
+// changed" therefore costs nothing. That is also why it does not carry the
+// database health's CheckedAt - the monitor rewrites that every five seconds
+// whether or not the state moved, so including it would turn every check into a
+// change and every change into a message. The page renders the state, and the
+// state is what it is sent.
+type connectionStatus struct {
+	Telegram struct {
+		Status string `json:"status"`
+	} `json:"telegram"`
+	Database struct {
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	} `json:"database"`
+}
+
+func (s *Server) connectionStatus() connectionStatus {
+	var status connectionStatus
+	status.Telegram.Status = s.telegram.Status()
+	health := s.downloads.DatabaseHealth()
+	status.Database.Status = health.Status
+	status.Database.Error = health.Error
+	return status
+}
+
+// statusSnapshot answers the sidebar's read when a page appears. The stream
+// below keeps that page correct from then on, but a page that is still loading
+// cannot wait for a connection to be established before it shows anything, and
+// a stream that fails to open must not leave the sidebar blank.
+func (s *Server) statusSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.connectionStatus())
+}
+
+// statusSSE pushes the two connection states to an open page when - and only
+// when - they change. The states live behind mutexes rather than in a channel,
+// so there is nothing to subscribe to; the stream watches them instead, which
+// keeps the cost of a change to the clients that can see it and adds no
+// background loop to the process.
+func (s *Server) statusSSE(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unavailable", http.StatusInternalServerError)
+		return
+	}
+	select {
+	case s.statusSlots <- struct{}{}:
+		defer func() { <-s.statusSlots }()
+	default:
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "已有过多实时连接，请关闭多余页面后重试"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	// Each write is bounded, for the same reason the download stream's writes
+	// are: a client that stopped reading must not block this handler forever
+	// while it holds one of the slots above.
+	controller := http.NewResponseController(w)
+	write := func(frame []byte) bool {
+		if err := controller.SetWriteDeadline(time.Now().Add(sseWriteTimeout)); err != nil {
+			return false
+		}
+		if _, err := w.Write(frame); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+	send := func(status connectionStatus) bool {
+		data, err := json.Marshal(status)
+		if err != nil {
+			return false
+		}
+		return write(append(append([]byte("data: "), data...), '\n', '\n'))
+	}
+	// The states go out on connect, not only when they next change: a browser
+	// that reconnects - after a restart, a dropped socket, a laptop waking up -
+	// would otherwise have to fetch again to learn what it missed.
+	last := s.connectionStatus()
+	if !send(last) {
+		return
+	}
+	check := time.NewTicker(statusCheckInterval)
+	defer check.Stop()
+	keepAlive := time.NewTicker(statusKeepAliveInterval)
+	defer keepAlive.Stop()
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case <-r.Context().Done():
+			return
+		case <-check.C:
+			// Re-checked here for the reason the download stream re-checks it:
+			// a stream is authorized once, at the handshake, and outlives what
+			// authorized it - a session expires after a day, and changing the
+			// password clears every session at once.
+			if !s.authenticated(r) {
+				return
+			}
+			current := s.connectionStatus()
+			if current == last {
+				continue
+			}
+			last = current
+			if !send(current) {
+				return
+			}
+		case <-keepAlive.C:
+			if !write([]byte(": keepalive\n\n")) {
+				return
+			}
 		}
 	}
 }

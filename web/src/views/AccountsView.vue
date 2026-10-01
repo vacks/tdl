@@ -4,7 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { APIError, api } from '@/api'
-import { projectVersion } from '@/buildInfo'
+import SidebarStatus from '@/components/SidebarStatus.vue'
 
 type Account = {
   id: string; telegramId?: number; firstName?: string; lastName?: string; username?: string
@@ -118,7 +118,7 @@ onBeforeUnmount(() => { disposed = true; if (timer) window.clearInterval(timer) 
 
 <template>
   <el-container class="shell">
-    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/accounts" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>{{ projectVersion }}</b></span></div></el-aside>
+    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/accounts" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><SidebarStatus /></el-aside>
     <el-container><el-header><span>登录管理</span><el-button text @click="logout">退出管理台</el-button></el-header>
       <el-main class="accounts-page">
         <section class="page-heading"><div><p class="eyebrow">ACCOUNT MANAGEMENT</p><h1>Telegram 登录管理</h1><p class="subtle">每个账户独立保存会话；切换当前账户会影响后续从 Web 或 Bot 链接新建的下载任务。</p></div><el-button type="primary" :loading="loading" @click="startLogin">添加 Telegram 账户</el-button></section>

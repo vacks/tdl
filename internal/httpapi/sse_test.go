@@ -303,3 +303,140 @@ func TestDrainingHTTPServerDoesNotWaitForAnOpenEventStream(t *testing.T) {
 		t.Fatalf("draining took %s, which is the timeout rather than the handler ending", elapsed)
 	}
 }
+
+// The sidebar reads the two connection states once, when the page appears, and
+// depends on this stream for every change after that. The stream therefore has
+// to answer a connection with the states it holds, not with silence: a page
+// whose read failed, or whose read raced the stream, has nothing else to show.
+//
+// It also has to end with the server, for the reason the download stream does -
+// a stream still open when the drain starts makes every restart wait it out.
+func TestStatusStreamSendsTheCurrentStatesOnConnectAndEndsWithTheServer(t *testing.T) {
+	server, client, baseURL := sseTestServer(t)
+	response, err := client.Get(baseURL + "/api/status/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("stream status=%d", response.StatusCode)
+	}
+	reader := bufio.NewReader(response.Body)
+	frame, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("the stream produced no first frame: %v", err)
+	}
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("the first frame was not terminated: %v", err)
+	}
+	if !strings.HasPrefix(frame, "data: ") {
+		t.Fatalf("first frame = %q, want a data frame", frame)
+	}
+	var status struct {
+		Telegram struct{ Status string } `json:"telegram"`
+		Database struct{ Status string } `json:"database"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(frame), "data: ")), &status); err != nil {
+		t.Fatalf("the first frame is not the status document: %v", err)
+	}
+	if status.Telegram.Status == "" || status.Database.Status == "" {
+		t.Fatalf("the first frame carries empty states: %+v", status)
+	}
+	server.Stop()
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, reader)
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the status stream outlived the server; Shutdown will wait out its whole budget on every restart")
+	}
+}
+
+// The database monitor rewrites the health's CheckedAt on its own every five
+// seconds whether or not the state moved. A stream that treated that as a
+// change would wake every open page with the same two states for as long as the
+// process ran - the poll this stream exists to replace. Nothing else in these
+// two states changes on its own, so a stream with nothing to report must stay
+// silent, and its keep-alive must not arrive as a message either.
+func TestStatusStreamStaysSilentWhileNothingChanges(t *testing.T) {
+	server, client, baseURL := sseTestServer(t)
+	response, err := client.Get(baseURL + "/api/status/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reader := bufio.NewReader(response.Body)
+	for line := 0; line < 2; line++ {
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Fatalf("the stream produced no first frame: %v", err)
+		}
+	}
+	frames := make(chan string, 16)
+	go func() {
+		defer close(frames)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if strings.TrimSpace(line) != "" {
+				frames <- line
+			}
+		}
+	}()
+	// Wait for the monitor to publish a health check. The wait is what makes
+	// this deterministic: the re-check has definitely happened by the time the
+	// stream's next tick comes round, so the tick that follows it is the one a
+	// change-triggered push would arrive on.
+	seen := server.downloads.DatabaseHealth().CheckedAt
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if current := server.downloads.DatabaseHealth().CheckedAt; current != seen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the database monitor never re-checked the connection")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(statusCheckInterval + time.Second)
+	select {
+	case line, ok := <-frames:
+		if !ok {
+			t.Fatal("the stream ended while the server was running")
+		}
+		t.Fatalf("the stream sent %q with nothing to report", line)
+	default:
+	}
+}
+
+// A stream is authorized once, at the handshake, and then lives on - so the
+// sidebar's stream re-checks the session on its own tick, as the download
+// stream does. Without it a page that is no longer logged in goes on being told
+// the service is up, on a connection a session expiry should have closed.
+func TestStatusStreamEndsWhenTheSessionIsCleared(t *testing.T) {
+	server, client, baseURL := sseTestServer(t)
+	response, err := client.Get(baseURL + "/api/status/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	reader := bufio.NewReader(response.Body)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("the stream produced no first frame: %v", err)
+	}
+	server.sessions.Clear()
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, reader)
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the status stream outlived the session it was authorized with")
+	}
+}

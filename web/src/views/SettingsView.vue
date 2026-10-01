@@ -3,7 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { api } from '@/api'
-import { projectVersion } from '@/buildInfo'
+import SidebarStatus from '@/components/SidebarStatus.vue'
 
 type Settings = {
   proxyUrl: string
@@ -59,7 +59,7 @@ onMounted(async () => { try { const session = await api<{ authenticated: boolean
 
 <template>
   <el-container class="shell">
-    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/settings" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>{{ projectVersion }}</b></span></div></el-aside>
+    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/settings" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><SidebarStatus /></el-aside>
     <el-container><el-header><span>配置管理</span><el-button text @click="logout">退出管理台</el-button></el-header>
       <el-main class="settings-page"><section class="page-heading settings-heading"><div><p class="eyebrow">SETTINGS</p><h1>配置管理</h1></div><el-button type="primary" :loading="saving" @click="save">保存配置</el-button></section>
         <el-card shadow="never" class="settings-card"><template #header><strong>网络代理</strong></template><el-form label-position="top" @submit.prevent><el-form-item label="代理地址"><el-input v-model="form.proxyUrl" placeholder="例如 socks5://127.0.0.1:1080 或 http://user:pass@host:port" clearable /></el-form-item><p class="field-help">留空表示直连。支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H；保存后，后续 Telegram 操作使用新代理，已建立的监听连接会自动重连。</p></el-form></el-card>

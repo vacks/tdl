@@ -3,7 +3,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { APIError, api } from '@/api'
-import { projectVersion } from '@/buildInfo'
+import SidebarStatus from '@/components/SidebarStatus.vue'
 
 type Item = { id: number; dialogType: string; dialogKey: string; dialogId: number; messageId: number; messageText?: string; originDialogName?: string; originMessageId?: number; isComment?: boolean; originalName: string; size: number; finalPath?: string; startedAt?: string; finishedAt?: string; elapsedMs: number; attempts: number; status: string; error?: string }
 type Job = { id: string; sourceUrl: string; dialogType: string; dialogKey: string; dialogName: string; sourceLink: string; messageText?: string; status: string; attempts: number; error?: string; createdAt: string; totalItems: number; completedItems: number; items?: Item[]; itemsNextCursor?: string }
@@ -74,7 +74,7 @@ onMounted(async () => { const s = await api<{ authenticated: boolean }>('/api/au
 </script>
 <template>
   <el-container class="shell">
-    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/downloads" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><div class="sidebar-meta"><span>上游 tdl <b>v0.20.4</b></span><span>项目版本 <b>{{ projectVersion }}</b></span></div></el-aside>
+    <el-aside width="244px"><div class="brand">TDL 管理</div><el-menu default-active="/downloads" router><el-menu-item index="/">仪表盘</el-menu-item><el-menu-item index="/accounts">登录管理</el-menu-item><el-menu-item index="/downloads">下载管理</el-menu-item><el-menu-item index="/settings">配置管理</el-menu-item></el-menu><SidebarStatus /></el-aside>
     <el-container><el-header><span>下载管理</span><el-button text @click="logout">退出管理台</el-button></el-header>
       <el-main class="downloads-page">
         <el-tabs v-model="activeTab" class="download-tabs"><el-tab-pane label="消息下载" name="message" /><el-tab-pane label="会话下载" name="chat" /></el-tabs>
