@@ -18,6 +18,37 @@ func TestNormalizeTaskStatusFilter(t *testing.T) {
 	}
 }
 
+// TaskStatusFilters is what a caller builds its filter controls from, so every
+// entry has to survive the other two functions in this file: normalized to
+// itself (or the request it produces is not the one that was asked for), and
+// named (or the control has no text). The label round trip is the same claim
+// from the user's side - the wording on the button is one the filter accepts.
+func TestTaskStatusFiltersRoundTripThroughNormalizeAndLabel(t *testing.T) {
+	seen := map[string]bool{}
+	for _, status := range TaskStatusFilters() {
+		if seen[status] {
+			t.Fatalf("%s is listed twice", status)
+		}
+		seen[status] = true
+		normalized, err := NormalizeTaskStatusFilter(status)
+		if err != nil || normalized != status {
+			t.Fatalf("TaskStatusFilters lists %q, which normalizes to %q, %v", status, normalized, err)
+		}
+		label := TaskStatusFilterLabel(status)
+		if label == "" {
+			t.Fatalf("%s has no label, so a button built from it would be blank", status)
+		}
+		back, err := NormalizeTaskStatusFilter(label)
+		if err != nil || back != status {
+			t.Fatalf("the label %q for %s normalizes to %q, %v", label, status, back, err)
+		}
+	}
+	// The one filter that is not a status: the empty string means no filter.
+	if normalized, err := NormalizeTaskStatusFilter(""); err != nil || normalized != "" {
+		t.Fatalf("the unfiltered list is no longer addressable: %q, %v", normalized, err)
+	}
+}
+
 // "等待中" was offered by the Web UI and the Bot, but it mapped to
 // download_jobs.status = 'waiting', which nothing ever writes: a task waits
 // when its files are held by another active task, and that is an item property.

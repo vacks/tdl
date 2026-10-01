@@ -40,6 +40,17 @@ func NormalizeTaskStatusFilter(value string) (string, error) {
 	}
 }
 
+// TaskStatusFilters lists every status a task list can be filtered by, in the
+// order a caller should present them.
+//
+// It is the same vocabulary as the other two functions here, and that is the
+// point: a filter offered to a user has to be one NormalizeTaskStatusFilter
+// accepts and TaskStatusFilterLabel can name. A button built from a status
+// missing from either would be a control that cannot produce a list.
+func TaskStatusFilters() []string {
+	return []string{"queued", "running", "paused", "completed", "partial", "failed", "cancelled"}
+}
+
 // TaskStatusFilterLabel names a task filter for display. It covers only the
 // values NormalizeTaskStatusFilter can return, so "waiting" is absent here for
 // the same reason it is absent there.

@@ -625,7 +625,84 @@ type message struct {
 		ID int64 `json:"id"`
 	} `json:"from"`
 	Text string `json:"text"`
+	// ForwardOrigin is where a forwarded message came from. It is what makes a
+	// forward submittable at all: the origin names the chat and the message, which
+	// is exactly what a t.me link names.
+	ForwardOrigin *forwardOrigin `json:"forward_origin"`
+	// The pre-7.0 fields Telegram still sends next to forward_origin. A client
+	// that only sets these must not lose the ability to submit a forward, and
+	// reading both costs nothing.
+	ForwardFromChat      *forwardOriginChat `json:"forward_from_chat"`
+	ForwardFromMessageID int                `json:"forward_from_message_id"`
 }
+
+// forwardOrigin is narrowed to the fields a message link is made of. The
+// origin's own type is deliberately not read: what decides whether a forward
+// can be addressed is the id encoding below, and a chat whose type string a
+// client left out would still be addressable.
+type forwardOrigin struct {
+	Chat      *forwardOriginChat `json:"chat"`
+	MessageID int                `json:"message_id"`
+}
+
+// forwardOriginChat is the chat object inside a forward origin.
+type forwardOriginChat struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+// forwardedMessageURL is the link addressing the post a forwarded message came
+// from, and reports whether this message was such a forward.
+//
+// The link is built rather than the message being resolved directly because the
+// Bot API never exposes an access hash, so there is no InputPeer to hand the
+// downloader - and resolving one would cost a request the link path already
+// knows how to make.
+//
+// Only channels and supergroups qualify. Their Bot API id encodes the id a
+// t.me/c link needs; a private chat or a basic group has no message link at
+// all, so those forwards are left to the ordinary handling instead of being
+// turned into a link nothing can resolve.
+func forwardedMessageURL(msg message) (string, bool) {
+	chat, messageID := forwardTarget(msg)
+	if chat == nil || messageID <= 0 {
+		return "", false
+	}
+	internal, addressable := channelInternalID(chat.ID)
+	if !addressable {
+		return "", false
+	}
+	// A public chat is preferred by name: it resolves through the username rather
+	// than through the account's cached access hash, so it also works for a
+	// channel this instance has never looked at before.
+	if username := strings.TrimPrefix(strings.TrimSpace(chat.Username), "@"); username != "" {
+		return fmt.Sprintf("https://t.me/%s/%d", username, messageID), true
+	}
+	return fmt.Sprintf("https://t.me/c/%d/%d", internal, messageID), true
+}
+
+// forwardTarget returns the chat and message a forward points at, from either
+// shape of the field. forward_origin wins: when Telegram sends both, the legacy
+// fields describe the same forward.
+func forwardTarget(msg message) (*forwardOriginChat, int) {
+	if origin := msg.ForwardOrigin; origin != nil && origin.Chat != nil {
+		return origin.Chat, origin.MessageID
+	}
+	return msg.ForwardFromChat, msg.ForwardFromMessageID
+}
+
+// channelInternalID converts the Bot API id of a channel or supergroup - the
+// -100 prefix followed by the internal id - into the id a t.me/c link carries.
+// It reports false for every other chat, including a basic group, whose
+// negative id is not addressable that way.
+func channelInternalID(chatID int64) (int64, bool) {
+	const prefix = int64(1000000000000)
+	if chatID >= -prefix {
+		return 0, false
+	}
+	return -chatID - prefix, true
+}
+
 type callbackQuery struct {
 	ID   string `json:"id"`
 	From struct {
@@ -728,38 +805,40 @@ func privateCallback(query callbackQuery) bool {
 }
 
 func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
-	text := normalizeCommand(strings.TrimSpace(msg.Text))
-	switch {
-	case text == "/start" || text == "/help":
+	// A forwarded post is the thing the user wants downloaded, whatever its
+	// caption happens to say, so it is submitted before the caption is read as a
+	// command. Only a forward that names a channel post is taken this way; the
+	// rest fall through and are handled exactly as they were before.
+	if source, forwarded := forwardedMessageURL(msg); forwarded {
+		return s.submitMessageTask(cfg, msg, source)
+	}
+	kind, argument := parseCommand(normalizeCommand(strings.TrimSpace(msg.Text)))
+	switch kind {
+	case commandHelp:
 		s.send(cfg.Token, msg.Chat.ID, helpText(), nil)
-	case text == "/tasks":
+	case commandTasks:
 		s.sendTaskList(cfg, msg.Chat.ID, "")
-	case strings.HasPrefix(text, "/tasks "):
-		status, err := download.NormalizeTaskStatusFilter(strings.TrimSpace(strings.TrimPrefix(text, "/tasks ")))
-		if err != nil {
-			s.send(cfg.Token, msg.Chat.ID, err.Error()+"。可用状态：排队中、下载中、已暂停、已完成、部分完成、失败、已取消。", nil)
-			break
-		}
-		s.sendTaskList(cfg, msg.Chat.ID, status)
-	case text == "/chats":
+	case commandTaskFilter:
+		s.sendTaskFilter(cfg, msg.Chat.ID)
+	case commandChatList:
 		s.sendChatList(cfg, msg.Chat.ID)
-	case strings.HasPrefix(text, "/chats "):
-		s.createChatTask(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/chats ")))
-	case text == "/saved" || strings.HasPrefix(text, "/saved "):
-		s.handleSavedCommand(cfg, msg, strings.TrimSpace(strings.TrimPrefix(text, "/saved")))
-	case text == "/status":
+	case commandChatCreate:
+		s.createChatTask(cfg, msg, argument)
+	case commandSavedAll:
+		s.handleSavedCommand(cfg, msg, savedAll)
+	case commandSavedListen:
+		s.handleSavedCommand(cfg, msg, savedListen)
+	case commandSavedTask:
+		s.handleSavedCommand(cfg, msg, savedTask)
+	case commandStatus:
 		s.send(cfg.Token, msg.Chat.ID, s.statusText(), nil)
-	case text == "/event":
+	case commandEvents:
 		s.sendEventList(cfg, msg.Chat.ID)
-	case strings.HasPrefix(text, "/event "):
-		if strings.TrimSpace(strings.TrimPrefix(text, "/event ")) == "clear" {
-			s.sendEventClearConfirm(cfg, msg.Chat.ID)
-			break
-		}
-		s.send(cfg.Token, msg.Chat.ID, "用法：<code>/event</code> 查看监听的待处理事件；<code>/event clear</code> 清空已停止重试的事件。", nil)
-	case text == "/config":
+	case commandEventClear:
+		s.sendEventClearConfirm(cfg, msg.Chat.ID)
+	case commandConfig:
 		s.send(cfg.Token, msg.Chat.ID, configText(s.settings.Get()), nil)
-	case text == "/restart":
+	case commandRestart:
 		if _, err := s.send(cfg.Token, msg.Chat.ID, "🔄 正在重启所有服务…", nil); err != nil {
 			applog.Error("bot", "restart_notice_send_failed", "error", redactBotError(cfg.Token, err.Error()))
 			return !retryableSubmitError(err)
@@ -771,29 +850,104 @@ func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
 				_ = process.Signal(syscall.SIGTERM)
 			}
 		}()
-	case isTelegramLink(text):
-		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
-		submission, err := s.downloads.Submit(ctx, download.DownloadIntent{Source: download.SourceBot, URL: text})
-		cancel()
-		if err != nil {
-			applog.Error("bot", "task_create_failed", "user_id", msg.From.ID, "error", err.Error())
-			s.send(cfg.Token, msg.Chat.ID, "❌ 创建下载任务失败："+html.EscapeString(err.Error()), nil)
-			return !retryableSubmitError(err)
-		}
-		job := submission.Job
-		if submission.Duplicate {
-			applog.Info("bot", "task_request_attached", "user_id", msg.From.ID, "job_id", job.ID)
-		} else {
-			applog.Info("bot", "task_created", "user_id", msg.From.ID, "job_id", job.ID, "item_count", job.TotalItems)
-		}
-		// The lifecycle card is deliberately not rendered here. Submit emits
-		// job_created before it returns, and the refresh loop renders exactly one
-		// card for a job it has not seen yet — the same single path the Web UI and
-		// reactions already rely on. Sending a card from this handler as well raced
-		// with that loop and produced "下载任务已创建" plus a second progress card.
+	case commandLink:
+		return s.submitMessageTask(cfg, msg, argument)
 	default:
 		s.send(cfg.Token, msg.Chat.ID, "发送 <code>/help</code> 查看可用命令。", nil)
 	}
+	return true
+}
+
+// command is what a message turns out to be asking for. Recognition is a pure
+// function of the text so that the set of commands the Bot answers is one thing
+// a test can compare against the help text and the Telegram command menu - a
+// rename the dispatcher did not follow is otherwise a command that silently
+// reaches the "unknown" branch and tells the user to read /help.
+type command int
+
+const (
+	commandUnknown command = iota
+	commandHelp
+	commandTasks
+	commandTaskFilter
+	commandChatList
+	commandChatCreate
+	commandSavedAll
+	commandSavedListen
+	commandSavedTask
+	commandStatus
+	commandEvents
+	commandEventClear
+	commandConfig
+	commandRestart
+	commandLink
+)
+
+// parseCommand classifies one normalized message and returns its argument, if
+// the command takes one.
+func parseCommand(text string) (command, string) {
+	switch {
+	case text == "/start" || text == "/help":
+		return commandHelp, ""
+	case text == "/tasks":
+		return commandTasks, ""
+	case text == "/task_filter":
+		return commandTaskFilter, ""
+	case text == "/chats":
+		return commandChatList, ""
+	case strings.HasPrefix(text, "/chats "):
+		return commandChatCreate, strings.TrimSpace(strings.TrimPrefix(text, "/chats "))
+	case text == "/saved_all":
+		return commandSavedAll, ""
+	case text == "/saved_listen":
+		return commandSavedListen, ""
+	case text == "/saved_task":
+		return commandSavedTask, ""
+	case text == "/status":
+		return commandStatus, ""
+	case text == "/events":
+		return commandEvents, ""
+	case text == "/event_clear":
+		return commandEventClear, ""
+	case text == "/config":
+		return commandConfig, ""
+	case text == "/restart":
+		return commandRestart, ""
+	case isTelegramLink(text):
+		return commandLink, text
+	default:
+		return commandUnknown, ""
+	}
+}
+
+// submitMessageTask creates a message download task for a Telegram message
+// link. A pasted link and a forwarded post both arrive here, because a forward
+// carries what a link carries - which chat, which message - and two entry
+// points for one download is how the two ways of asking for it drift apart.
+//
+// The returned bool is the retry decision the poll loop acts on: a failure that
+// another attempt cannot change is reported as handled so the command is not
+// retried forever.
+func (s *Service) submitMessageTask(cfg settings.Bot, msg message, sourceURL string) bool {
+	ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+	submission, err := s.downloads.Submit(ctx, download.DownloadIntent{Source: download.SourceBot, URL: sourceURL})
+	cancel()
+	if err != nil {
+		applog.Error("bot", "task_create_failed", "user_id", msg.From.ID, "error", err.Error())
+		s.send(cfg.Token, msg.Chat.ID, "❌ 创建下载任务失败："+html.EscapeString(err.Error()), nil)
+		return !retryableSubmitError(err)
+	}
+	job := submission.Job
+	if submission.Duplicate {
+		applog.Info("bot", "task_request_attached", "user_id", msg.From.ID, "job_id", job.ID)
+	} else {
+		applog.Info("bot", "task_created", "user_id", msg.From.ID, "job_id", job.ID, "item_count", job.TotalItems)
+	}
+	// The lifecycle card is deliberately not rendered here. Submit emits
+	// job_created before it returns, and the refresh loop renders exactly one
+	// card for a job it has not seen yet — the same single path the Web UI and
+	// reactions already rely on. Sending a card from this handler as well raced
+	// with that loop and produced "下载任务已创建" plus a second progress card.
 	return true
 }
 
@@ -841,6 +995,10 @@ func (s *Service) handleCallback(cfg settings.Bot, query callbackQuery) {
 	}
 	if strings.HasPrefix(query.Data, "e:") {
 		s.handleEventCallback(cfg, query)
+		return
+	}
+	if strings.HasPrefix(query.Data, "f:") {
+		s.taskFilterCallback(cfg, query)
 		return
 	}
 	if strings.HasPrefix(query.Data, "l:") {
@@ -997,6 +1155,68 @@ func (s *Service) sendTaskList(cfg settings.Bot, chatID int64, status string) {
 	}
 }
 
+// sendTaskFilter offers one button per status a task can be filtered by. The
+// filtering itself lives behind the buttons rather than in the command, because
+// a status is a choice out of a closed set and a keyboard is how Telegram asks
+// for one; it also means a person never has to remember the wording.
+func (s *Service) sendTaskFilter(cfg settings.Bot, chatID int64) {
+	s.send(cfg.Token, chatID, taskFilterText(), taskFilterKeyboard())
+}
+
+func taskFilterText() string {
+	return "<b>筛选任务</b>\n请选择要查看的任务状态。"
+}
+
+// taskFilterKeyboard is built from the task filters the download package
+// defines, so the buttons, the labels and the values they are normalized back
+// into are one vocabulary.
+func taskFilterKeyboard() [][]button {
+	rows := make([][]button, 0, 3)
+	row := []button{{Text: "全部", CallbackData: "f:all"}}
+	for _, status := range download.TaskStatusFilters() {
+		row = append(row, button{Text: download.TaskStatusFilterLabel(status), CallbackData: "f:" + status})
+		if len(row) == 3 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// editTaskListFilter renders a filtered task list into the message that carried
+// the filter buttons, replacing them.
+//
+// It goes through taskList and putListPage, exactly as a list sent by /tasks
+// does, so the resulting card pages through its own cursor - the status travels
+// in the stored page state and survives 上一页/下一页 without being repeated in
+// every callback payload.
+func (s *Service) editTaskListFilter(cfg settings.Bot, chatID, messageID int64, status string) {
+	state := listPageState{kind: "task", status: status, page: 1}
+	text, buttons, err := s.taskList(&state)
+	if err != nil {
+		s.edit(cfg.Token, chatID, messageID, "读取任务列表失败。", nil)
+		return
+	}
+	s.putListPage("task", chatID, messageID, state)
+	s.edit(cfg.Token, chatID, messageID, text, buttons)
+}
+
+// taskFilterCallback handles a press on a filter button: the status is
+// normalized through the same function the rest of the program uses, so an
+// unknown payload produces no list rather than an unfiltered one.
+func (s *Service) taskFilterCallback(cfg settings.Bot, query callbackQuery) {
+	status, err := download.NormalizeTaskStatusFilter(strings.TrimPrefix(query.Data, "f:"))
+	if err != nil {
+		s.answer(cfg.Token, query.ID, "")
+		return
+	}
+	s.editTaskListFilter(cfg, query.Message.Chat.ID, query.Message.MessageID, status)
+	s.answer(cfg.Token, query.ID, download.TaskStatusFilterLabel(status))
+}
+
 func (s *Service) editTaskList(cfg settings.Bot, chatID, messageID int64, direction string) {
 	state, ok := s.getListPage("task", chatID, messageID)
 	if !ok {
@@ -1070,8 +1290,18 @@ func (s *Service) createChatTask(cfg settings.Bot, msg message, rawURL string) {
 	}
 }
 
-func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, raw string) {
-	command := strings.ToLower(strings.TrimSpace(raw))
+// savedCommand is one of the three things a control user can ask of their Saved
+// Messages. They are separate commands rather than one command with an
+// argument, so Telegram offers them in its command menu like any other.
+type savedCommand int
+
+const (
+	savedAll savedCommand = iota
+	savedListen
+	savedTask
+)
+
+func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, kind savedCommand) {
 	account, err := s.telegram.AuthorizedByTelegramID(msg.From.ID)
 	if err != nil {
 		message := "当前 Telegram 用户尚未登录，无法下载收藏消息。请先在登录管理完成该账号登录。"
@@ -1081,10 +1311,10 @@ func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, raw string) 
 		s.send(cfg.Token, msg.Chat.ID, "❌ "+html.EscapeString(message), nil)
 		return
 	}
-	switch command {
-	case "all", "listen":
+	switch kind {
+	case savedAll:
 		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
-		job, duplicate, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID, ListenOnly: command == "listen"})
+		job, duplicate, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID})
 		cancel()
 		if submitErr != nil {
 			s.send(cfg.Token, msg.Chat.ID, "❌ 创建收藏夹任务失败："+html.EscapeString(submitErr.Error()), nil)
@@ -1094,27 +1324,10 @@ func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, raw string) 
 			s.send(cfg.Token, msg.Chat.ID, "已有相同的收藏夹任务正在运行。", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
 			return
 		}
-		label := "收藏夹历史下载任务已创建"
-		if command == "listen" {
-			label = "收藏夹新消息监听已开启"
-		}
-		s.send(cfg.Token, msg.Chat.ID, "✅ "+label, [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
-	case "stop":
-		job, found, findErr := s.downloads.FindSavedListener(account.ID)
-		if findErr != nil {
-			s.send(cfg.Token, msg.Chat.ID, "❌ 读取收藏夹任务失败："+html.EscapeString(findErr.Error()), nil)
-			return
-		}
-		if !found || !download.IsSavedListenForBot(job) {
-			s.send(cfg.Token, msg.Chat.ID, "当前没有运行中的收藏夹新消息监听。", nil)
-			return
-		}
-		if err := s.downloads.SetChatListening(job.ID, false); err != nil {
-			s.send(cfg.Token, msg.Chat.ID, "❌ 停止收藏夹监听失败："+html.EscapeString(err.Error()), nil)
-			return
-		}
-		s.send(cfg.Token, msg.Chat.ID, "✅ 已停止收藏夹新消息监听。", nil)
-	case "status":
+		s.send(cfg.Token, msg.Chat.ID, "✅ 收藏夹历史下载任务已创建", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + job.ID}}})
+	case savedListen:
+		s.toggleSavedListen(cfg, account, msg)
+	case savedTask:
 		jobs, listErr := s.downloads.ListSavedChats(account.ID)
 		if listErr != nil {
 			s.send(cfg.Token, msg.Chat.ID, "❌ 读取收藏夹任务失败："+html.EscapeString(listErr.Error()), nil)
@@ -1131,9 +1344,43 @@ func (s *Service) handleSavedCommand(cfg settings.Bot, msg message, raw string) 
 			buttons = append(buttons, []button{{Text: "查看详情", CallbackData: "c:v:" + job.ID}})
 		}
 		s.send(cfg.Token, msg.Chat.ID, strings.Join(lines, "\n"), buttons)
-	default:
-		s.send(cfg.Token, msg.Chat.ID, "用法：<code>/saved all</code> 下载历史收藏消息；<code>/saved listen</code> 监听新消息；<code>/saved stop</code> 停止监听；<code>/saved status</code> 查看状态。", nil)
 	}
+}
+
+// toggleSavedListen turns the account's Saved Messages listener on if it is off
+// and off if it is on, so one command covers both without the user having to
+// know which state they are in - which is the state they would otherwise have
+// to look up with /saved_task first.
+//
+// The two directions are the two operations the separate start and stop
+// commands used to be, unchanged: what is new is only the decision between
+// them, and FindSavedListener is what makes it.
+func (s *Service) toggleSavedListen(cfg settings.Bot, account telegram.Account, msg message) {
+	job, found, findErr := s.downloads.FindSavedListener(account.ID)
+	if findErr != nil {
+		s.send(cfg.Token, msg.Chat.ID, "❌ 读取收藏夹任务失败："+html.EscapeString(findErr.Error()), nil)
+		return
+	}
+	if found && download.IsSavedListenForBot(job) {
+		if err := s.downloads.SetChatListening(job.ID, false); err != nil {
+			s.send(cfg.Token, msg.Chat.ID, "❌ 停止收藏夹监听失败："+html.EscapeString(err.Error()), nil)
+			return
+		}
+		s.send(cfg.Token, msg.Chat.ID, "✅ 已停止收藏夹新消息监听。", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+	started, duplicate, submitErr := s.downloads.SubmitSaved(ctx, download.SavedIntent{Source: download.SourceBot, AccountID: account.ID, TelegramID: account.TelegramID, ListenOnly: true})
+	cancel()
+	if submitErr != nil {
+		s.send(cfg.Token, msg.Chat.ID, "❌ 创建收藏夹任务失败："+html.EscapeString(submitErr.Error()), nil)
+		return
+	}
+	if duplicate {
+		s.send(cfg.Token, msg.Chat.ID, "已有相同的收藏夹任务正在运行。", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + started.ID}}})
+		return
+	}
+	s.send(cfg.Token, msg.Chat.ID, "✅ 收藏夹新消息监听已开启", [][]button{{{Text: "查看详情", CallbackData: "c:v:" + started.ID}}})
 }
 
 func (s *Service) sendChatList(cfg settings.Bot, chatID int64) {
@@ -1198,7 +1445,7 @@ func (s *Service) chatTaskList(state *listPageState) (string, [][]button, error)
 	return fmt.Sprintf("<b>会话下载</b> · 共 %d 个 · 第 %d/%d 页", total, state.page, totalPages), buttons, nil
 }
 
-// eventPageSize is the number of rows one /event page shows. Ten events plus a
+// eventPageSize is the number of rows one /events page shows. Ten events plus a
 // header is a card that reads without scrolling on a phone.
 const eventPageSize = 10
 
@@ -1218,7 +1465,7 @@ func (s *Service) sendEventList(cfg settings.Bot, chatID int64) {
 func (s *Service) editEventList(cfg settings.Bot, chatID, messageID int64, direction string) {
 	state, ok := s.getListPage("event", chatID, messageID)
 	if !ok {
-		s.edit(cfg.Token, chatID, messageID, "事件列表已过期，请重新发送 /event。", nil)
+		s.edit(cfg.Token, chatID, messageID, "事件列表已过期，请重新发送 /events。", nil)
 		return
 	}
 	if direction != "refresh" {
@@ -1399,7 +1646,7 @@ func (s *Service) confirmEventClear(cfg settings.Bot, query callbackQuery) {
 	if remaining, _, countErr := s.downloads.StoppedEventCounts(); countErr == nil && remaining > 0 {
 		// Reached only when the queue held more failed events than one call
 		// clears, which says so instead of reporting a partial clear as done.
-		text += fmt.Sprintf("\n仍有 %d 个，请再次执行 <code>/event clear</code>。", remaining)
+		text += fmt.Sprintf("\n仍有 %d 个，请再次执行 <code>/event_clear</code>。", remaining)
 	}
 	s.answer(cfg.Token, query.ID, "已清空")
 	s.edit(cfg.Token, message.Chat.ID, message.MessageID, text, nil)
@@ -2272,7 +2519,7 @@ func messageFullText(value string) string {
 }
 
 func helpText() string {
-	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n直接发送 Telegram 消息链接即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/tasks [状态]</code> 获取下载任务；可筛选：排队中、下载中、已暂停、已完成、部分完成、失败、已取消\n<code>/chats [链接]</code> 获取或创建会话下载\n<code>/saved all</code> 下载本人收藏夹历史消息\n<code>/saved listen</code> 监听本人收藏夹新消息\n<code>/saved stop</code> 停止收藏夹监听\n<code>/saved status</code> 查看收藏夹任务\n<code>/status</code> 获取当前状态\n<code>/event</code> 查看监听的待处理事件（10 条一页）\n<code>/event clear</code> 清空已停止重试的事件\n<code>/config</code> 获取当前配置\n<code>/restart</code> 重启所有服务", buildinfo.Version, upstream.Version)
+	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version, upstream.Version)
 }
 
 func (s *Service) statusText() string {
@@ -2585,8 +2832,8 @@ func normalizeCommand(text string) string {
 	}
 	// The @BotName suffix belongs to the command token whatever follows it.
 	// Stripping it only for a single-token message meant every command that takes
-	// an argument - "/tasks@MyBot 下载中", "/chats@MyBot <链接>",
-	// "/saved@MyBot all" - was rejected as an unknown command.
+	// an argument - "/chats@MyBot <链接>", "/saved_all@MyBot" - was rejected as
+	// an unknown command.
 	if at := strings.IndexByte(fields[0], '@'); at > 1 {
 		fields[0] = fields[0][:at]
 	}
@@ -2637,20 +2884,32 @@ func (s *Service) editLive(token string, chatID, messageID int64, text string, k
 	return missing
 }
 
+// botCommands is the command menu Telegram shows above the input field. It is
+// the same list the help message prints, because a command offered by the menu
+// and missing from the help - or the other way round - is a control that exists
+// for reasons the person reading /help cannot see.
+func botCommands() []map[string]string {
+	return []map[string]string{
+		{"command": "help", "description": "获取帮助信息"},
+		{"command": "status", "description": "获取TDL当前状态"},
+		{"command": "config", "description": "获取TDL当前配置"},
+		{"command": "restart", "description": "重启TDL所有服务"},
+		{"command": "tasks", "description": "获取所有消息下载任务"},
+		{"command": "task_filter", "description": "筛选获取消息下载任务"},
+		{"command": "chats", "description": "获取/创建会话类型下载"},
+		{"command": "saved_task", "description": "获取收藏夹任务"},
+		{"command": "saved_all", "description": "下载收藏夹历史消息"},
+		{"command": "saved_listen", "description": "开始/停止监听收藏夹新消息"},
+		{"command": "events", "description": "获取监听的正在处理事件"},
+		{"command": "event_clear", "description": "清空已停止重试的事件"},
+	}
+}
+
 // configureCommands enables Telegram's native slash-command suggestions and
 // the command menu button shown at the leading edge of the chat input.
 func (s *Service) configureCommands(token string) {
 	var result apiResponse[bool]
-	commands := []map[string]string{
-		{"command": "help", "description": "获取帮助信息"},
-		{"command": "tasks", "description": "获取或筛选下载任务"},
-		{"command": "chats", "description": "获取或创建会话下载"},
-		{"command": "saved", "description": "管理本人收藏夹下载"},
-		{"command": "status", "description": "获取当前状态"},
-		{"command": "event", "description": "查看或清空监听事件"},
-		{"command": "config", "description": "获取当前配置"},
-		{"command": "restart", "description": "重启所有服务"},
-	}
+	commands := botCommands()
 	if err := s.call(token, "setMyCommands", map[string]any{"commands": commands}, &result); err != nil {
 		applog.Error("bot", "commands_configure_failed", "error", redactBotError(token, err.Error()))
 		return
