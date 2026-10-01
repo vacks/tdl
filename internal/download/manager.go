@@ -143,7 +143,7 @@ type Job struct {
 	DialogType     string `json:"dialogType"`
 	DialogKey      string `json:"dialogKey"`
 	DialogName     string `json:"dialogName"`
-	HasPublicLink  bool   `json:"hasPublicLink"`
+	SourceLink     string `json:"sourceLink"`
 	MessageText    string `json:"messageText,omitempty"`
 	AccountID      string `json:"accountId"`
 	Status         string `json:"status"`
@@ -959,7 +959,6 @@ func (m *Manager) Get(id string) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
-	job.HasPublicLink = isPublicMessageLink(job.SourceURL)
 	// The counts come from the summary the triggers maintain. Reading them off
 	// the file rows was exact only by loading every one of them, which is the
 	// read this method exists to avoid; a task's file count has no bound.
@@ -977,6 +976,10 @@ func (m *Manager) Get(id string) (Job, error) {
 		return Job{}, err
 	}
 	job.Items, job.ItemsNextCursor = items, next
+	// Derived after the files are loaded: for a channel task whose source URL
+	// carries no usable link, the route is built from the first file row's
+	// numeric message ID.
+	job.SourceLink = MessageJumpURL(job)
 	return job, nil
 }
 
@@ -1117,8 +1120,12 @@ func (m *Manager) listSummaries(where, pagination string, args []any, total int)
 	if err := rows.Close(); err != nil {
 		return nil, 0, err
 	}
+	// A list row carries no file records by design, so this resolves from the
+	// source URL alone - which is enough for every task a user can create from
+	// a link, and for reaction-created channel tasks, whose URL carries the
+	// channel and message IDs the route needs.
 	for index := range jobs {
-		jobs[index].HasPublicLink = isPublicMessageLink(jobs[index].SourceURL)
+		jobs[index].SourceLink = MessageJumpURL(jobs[index])
 	}
 	return jobs, total, nil
 }
@@ -1470,7 +1477,8 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	}
 	m.jobBecameVisible(parentChatID)
 	m.touch()
-	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, MessageText: messageText, HasPublicLink: isPublicMessageLink(intent.URL), AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, MessageText: messageText, AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job.SourceLink = MessageJumpURL(job)
 	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
 	// Message tasks are interactive work. Wake chat workers so their next
@@ -2121,10 +2129,6 @@ func dialogIdentityForPeer(peer peers.Peer, accountID string) (kind, key string,
 		return "bot", key, id
 	}
 	return kind, key, id
-}
-
-func isPublicMessageLink(value string) bool {
-	return strings.HasPrefix(value, "https://t.me/") || strings.HasPrefix(value, "http://t.me/")
 }
 
 // itemCounts reads a task's file totals from the summary the download_items

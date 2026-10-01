@@ -6,7 +6,7 @@ import { APIError, api } from '@/api'
 import { projectVersion } from '@/buildInfo'
 
 type Item = { id: number; dialogType: string; dialogKey: string; dialogId: number; messageId: number; messageText?: string; originDialogName?: string; originMessageId?: number; isComment?: boolean; originalName: string; size: number; finalPath?: string; startedAt?: string; finishedAt?: string; elapsedMs: number; attempts: number; status: string; error?: string }
-type Job = { id: string; sourceUrl: string; dialogType: string; dialogKey: string; dialogName: string; hasPublicLink: boolean; messageText?: string; status: string; attempts: number; error?: string; createdAt: string; totalItems: number; completedItems: number; items?: Item[]; itemsNextCursor?: string }
+type Job = { id: string; sourceUrl: string; dialogType: string; dialogKey: string; dialogName: string; sourceLink: string; messageText?: string; status: string; attempts: number; error?: string; createdAt: string; totalItems: number; completedItems: number; items?: Item[]; itemsNextCursor?: string }
 type Page = { jobs: Job[]; total: number; pageSize: number; nextCursor?: string; revision: number }
 type Submission = { requestId?: string; job?: Job; created?: boolean; duplicate?: boolean; reactivated?: boolean; pending?: boolean }
 type ChatJob = { id: string; sourceUrl: string; dialogType: string; dialogName: string; startMessageId: number; upperMessageId: number; listenNew: boolean; status: string; scanState: string; error?: string; discovered: number; completed: number; failed: number; earliestMediaId: number; activeFiles: number; speedBps: number }
@@ -53,7 +53,6 @@ function type(status: string) { return status === 'completed' || status === 'dow
 function statusLabel(status: string) { return ({ queued: '排队中', waiting: '等待中', running: '下载中', downloaded: '下载完成', paused: '已暂停', completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消', scanning: '索引中', downloading: '下载中', listening: '监听中' } as Record<string, string>)[status] || status }
 function statusTip(item: Item) { return item.error || ({ queued: '等待可用下载槽位，尚未开始传输', waiting: '同一文件正由其他任务下载，完成后会自动复用', running: '正在下载文件', downloaded: '下载已完成，等待移动到最终路径', paused: '下载已暂停，可恢复', completed: '文件已下载并移动至最终路径', failed: '文件下载或处理失败', cancelled: '下载已取消' } as Record<string, string>)[item.status] || item.status }
 function dialogTypeLabel(value: string) { return ({ user: '私聊', bot: 'Bot', chat: '群组', channel: '频道', self: '收藏消息', legacy: '会话' } as Record<string, string>)[value] || '会话' }
-function sourceLabel(job: Job) { return job.hasPublicLink ? job.sourceUrl : '私有会话（无公开消息链接）' }
 function progressFor(item: Item) { return liveProgress.value[`${item.dialogKey}:${item.messageId}`] }
 function byteLabel(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let index = 0; let result = value; while (result >= 1024 && index < units.length - 1) { result /= 1024; index++ }; return `${result >= 10 || index === 0 ? result.toFixed(0) : result.toFixed(1)} ${units[index]}` }
 function fileSizeLabel(value: number) { if (!Number.isFinite(value) || value <= 0) return '—'; const unit = value >= 1024 ** 3 ? 'GB' : value >= 1024 ** 2 ? 'MB' : value >= 1024 ? 'KB' : 'B'; const divisor = unit === 'GB' ? 1024 ** 3 : unit === 'MB' ? 1024 ** 2 : unit === 'KB' ? 1024 : 1; return `${Number((value / divisor).toFixed(2))} ${unit}` }
@@ -88,7 +87,7 @@ onMounted(async () => { const s = await api<{ authenticated: boolean }>('/api/au
           </el-table-column>
           <el-table-column label="对话名称" min-width="147" show-overflow-tooltip><template #default="{ row }"><span>{{ row.dialogName || '—' }}</span><small class="dialog-kind">{{ dialogTypeLabel(row.dialogType) }}</small></template></el-table-column>
           <el-table-column label="消息内容" min-width="245" :show-overflow-tooltip="{ popperClass: 'file-overflow-tooltip' }"><template #default="{ row }">{{ row.messageText || '—' }}</template></el-table-column>
-          <el-table-column label="消息链接" min-width="172" show-overflow-tooltip><template #default="{ row }">{{ sourceLabel(row) }}</template></el-table-column>
+          <el-table-column label="消息链接" min-width="172" show-overflow-tooltip><template #default="{ row }"><a v-if="row.sourceLink" class="source-link" :href="row.sourceLink" target="_blank" rel="noopener noreferrer">{{ row.sourceLink }}</a><span v-else>私有会话（无公开消息链接）</span></template></el-table-column>
           <el-table-column label="进度" width="86"><template #default="{ row }">{{ row.completedItems }}/{{ row.totalItems }} 文件</template></el-table-column>
           <el-table-column prop="status" label="状态" width="90"><template #default="{ row }"><el-tag :type="type(row.status) as any">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
           <el-table-column label="操作" width="150"><template #default="{ row }"><div class="job-actions" @click.stop><el-popconfirm v-if="row.status === 'completed' || row.status === 'failed' || row.status === 'partial' || row.status === 'cancelled'" title="从列表隐藏任务并清理临时文件？不会删除下载记录或已下载的最终文件。" confirm-button-text="删除" cancel-button-text="保留" @confirm="control(row, 'delete')"><template #reference><el-button text type="danger">删除</el-button></template></el-popconfirm><el-button v-if="row.status === 'failed' || row.status === 'partial'" text type="primary" @click="control(row, 'retry')">重试</el-button><el-button v-if="row.status === 'cancelled'" text type="primary" @click="control(row, 'retry')">重新开始</el-button><el-button v-if="row.status === 'paused'" text type="primary" @click="control(row, 'resume')">恢复</el-button><el-button v-if="row.status === 'queued' || row.status === 'running'" text @click="control(row, 'pause')">暂停</el-button><el-button v-if="row.status === 'queued' || row.status === 'running' || row.status === 'paused'" text type="danger" @click="control(row, 'cancel')">取消</el-button></div></template></el-table-column>
@@ -116,6 +115,12 @@ onMounted(async () => { const s = await api<{ authenticated: boolean }>('/api/au
 
 <style scoped>
 .dialog-kind { margin-left: 6px; color: var(--el-text-color-secondary); font-size: 12px; white-space: nowrap; }
+/* The link reads as the cell text it replaced - same colour, same size, no
+   underline at rest - so the column keeps the table's plain look. Only the
+   pointer and the hover underline say it can be opened; without those a
+   clickable value is indistinguishable from one that is not. */
+.source-link { color: inherit; text-decoration: none; }
+.source-link:hover { text-decoration: underline; }
 .job-actions { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
 .job-actions :deep(.el-button) { margin: 0; padding: 2px 4px; min-height: 24px; font-size: 13px; line-height: 20px; }
 .status-filter { width: 126px; }

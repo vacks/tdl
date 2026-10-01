@@ -2224,39 +2224,14 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 
 // sourceLine only emits externally usable Telegram links. The tg://reaction/*
 // and tg://message/* values stored for internal retry bookkeeping must never
-// be presented as Bot links.
+// be presented as Bot links. The rule behind it lives in the download package
+// because the Web UI asks the same question of the same task, and two copies of
+// it had already drifted into two different answers.
 func sourceLine(job download.Job) string {
-	if target := messageJumpURL(job); target != "" {
+	if target := download.MessageJumpURL(job); target != "" {
 		return `<b>来源：</b><a href="` + html.EscapeString(target) + `">点击查看</a>`
 	}
 	return "<b>来源：</b>" + sourceTypeName(job) + "不支持跳转"
-}
-
-func messageJumpURL(job download.Job) string {
-	if sourceTelegramURL(job.SourceURL) {
-		return job.SourceURL
-	}
-	// Private channels and supergroups have a Telegram-supported /c/ route.
-	// Its numeric ID is stored per file, so it also works for reaction-created
-	// tasks that deliberately have no public source URL.
-	if job.DialogType != "channel" {
-		return ""
-	}
-	for _, item := range job.Items {
-		if item.DialogID > 0 && item.MessageID > 0 {
-			return fmt.Sprintf("https://t.me/c/%d/%d", item.DialogID, item.MessageID)
-		}
-	}
-	return ""
-}
-
-func sourceTelegramURL(raw string) bool {
-	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Path == "" {
-		return false
-	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "t.me" || host == "www.t.me"
 }
 
 func sourceTypeName(job download.Job) string {
