@@ -43,7 +43,7 @@ services:
     restart: unless-stopped
 
   app:
-    image: ghcr.io/vacks/tdl:1.6.4
+    image: ghcr.io/vacks/tdl:1.6.5
     ports:
       - "127.0.0.1:8080:8080"
     environment:
@@ -58,11 +58,17 @@ services:
       TDL_ADMIN_INITIAL_PASSWORD: admin
       TDL_DATABASE_URL: postgres://tdl:tdl-postgres-7rQ4mX9pL2vN8kD6@postgres:5432/tdl?sslmode=disable
       # When a reverse proxy sits in front of this service, list the addresses
-      # whose X-Forwarded-Proto header may be believed, for example
-      # "127.0.0.1" or "172.16.0.0/12". Without it the header is ignored, which
-      # is the safe default: any client can send it, and it decides whether the
-      # session cookie is marked Secure.
-      # TDL_TRUSTED_PROXIES: 127.0.0.1
+      # this container sees it as - never 127.0.0.1, which is not the source of
+      # a connection arriving through a published port or over the "internal"
+      # network: a proxy on the host arrives as the gateway, a proxy running as
+      # a container on that network arrives as its own address. The subnet
+      # covers either case and survives the address changing:
+      #   docker network inspect tdl_internal --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+      # Without it the header is ignored, which is the safe default: any client
+      # can send it, and it decides whether the session cookie is marked Secure
+      # and which scheme same-origin requests are compared against. A value that
+      # matches nothing makes every write, login included, answer 请求来源无效.
+      # TDL_TRUSTED_PROXIES: 172.16.0.0/12
     volumes:
       - ./data:/data
       - ./downloads:/downloads

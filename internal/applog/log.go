@@ -14,6 +14,10 @@ func Info(component, event string, args ...any) {
 	logger.Info(event, append([]any{"component", component}, args...)...)
 }
 
+func Warn(component, event string, args ...any) {
+	logger.Warn(event, append([]any{"component", component}, args...)...)
+}
+
 func Error(component, event string, args ...any) {
 	logger.Error(event, append([]any{"component", component}, args...)...)
 }

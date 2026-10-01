@@ -150,7 +150,7 @@ docker compose down          # 停止服务，保留全部数据
 | `TDL_DOWNLOAD_DIR` | `./downloads` | 下载文件目录 |
 | `TDL_ADMIN_USERNAME` | `admin` | 管理台用户名 |
 | `TDL_ADMIN_INITIAL_PASSWORD` | `admin` | 首次创建管理员账号时使用的密码，**请务必修改** |
-| `TDL_TRUSTED_PROXIES` | 空 | 可信反向代理地址（IP 或 CIDR，逗号分隔） |
+| `TDL_TRUSTED_PROXIES` | 空 | **本容器看到的**反向代理地址（IP 或 CIDR，逗号分隔），见[反向代理与 HTTPS](#反向代理与-https) |
 
 ### 命名模板
 
@@ -168,9 +168,42 @@ docker compose down          # 停止服务，保留全部数据
 
 ## 反向代理与 HTTPS
 
-公网部署时由你自己的 HTTPS 反向代理转发至 `127.0.0.1:8080`。反向代理应保留原始 `Host`，并传递 `X-Forwarded-Proto`；Caddy、Nginx、Traefik 的标准配置都会自动处理。
+公网部署时由你自己的 HTTPS 反向代理转发至 tdl。反向代理有两条硬性要求：
 
-`X-Forwarded-Proto` 只在请求来自受信任地址时才被采信，因此使用反向代理时需要设置 `TDL_TRUSTED_PROXIES`，例如 `127.0.0.1` 或 `172.16.0.0/12`。不设置时该头被忽略——这是刻意的安全默认值，因为任何客户端都能伪造它，而它决定会话 Cookie 是否标记为 `Secure`。直接暴露 8080 时不需要设置。
+- **保留原始 `Host`。** 改写 `Host` 会让服务端算出的来源与浏览器发来的 `Origin` 对不上。
+- **传递 `X-Forwarded-Proto: $scheme`。** Caddy、Traefik 默认会加，**Nginx 不会**，必须显式配置。
+
+```nginx
+location / {
+    proxy_pass http://tdl:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+`X-Forwarded-Proto` 只在请求来自受信任地址时才被采信，所以还要把**本容器看到的反代地址**填进 `TDL_TRUSTED_PROXIES`：
+
+| 反向代理的位置 | 应填写的值 |
+| --- | --- |
+| 与 tdl 在同一个容器网络 | 反代容器在该网络中的地址，或该网络的网段 |
+| 宿主机上，经 `127.0.0.1:8080` 发布端口访问 | compose 网络的网关地址 |
+
+**填 `127.0.0.1` 是无效的**：经发布端口或容器网络到达的连接，源地址不可能是回环地址。实际值可以直接查：
+
+```bash
+docker network inspect tdl_internal --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+```
+
+不设置（或填错）时该头被忽略——这是刻意的安全默认值，因为任何客户端都能伪造它，而它决定会话 Cookie 是否标记为 `Secure`，以及同源校验用哪个协议去比对。
+
+**忽略它的直接后果是：所有写操作被拒绝，包括登录**，返回 `请求来源无效`。同时服务端会打一条 `request_origin_rejected` 的 WARN 日志，带着 `origin`、`host`、`scheme`、`forwarded_proto`、`peer` 五个值——照着比对就能判断是缺了这个头，还是 `Host` 被改写了：
+
+```bash
+docker compose logs app | grep request_origin_rejected
+```
+
+直接暴露 8080、不经过反向代理时不需要设置。
 
 ---
 

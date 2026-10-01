@@ -186,6 +186,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	// post here with the attacker's credentials and leave the victim's browser
 	// holding the attacker's session.
 	if !s.validRequestOrigin(r) {
+		s.reportOriginRejection(r)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "请求来源无效"})
 		return
 	}
@@ -806,6 +807,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if unsafeMethod(r.Method) && !s.validRequestOrigin(r) {
+			s.reportOriginRejection(r)
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "请求来源校验失败"})
 			return
 		}
@@ -824,14 +826,38 @@ func (s *Server) validRequestOrigin(r *http.Request) bool {
 		// a cross-site form cannot forge it without a successful CORS preflight.
 		return r.Header.Get("X-Requested-With") == "TDL-Web"
 	}
-	scheme := "http"
+	return origin == s.requestedScheme(r)+"://"+r.Host
+}
+
+// requestedScheme is the scheme the same-origin check compares an Origin header
+// against. It is derived rather than read: this service terminates no TLS
+// itself, so behind the documented reverse proxy the public scheme is knowable
+// only from a forwarding header the operator told the service to believe.
+func (s *Server) requestedScheme(r *http.Request) string {
 	if s.requestHTTPS(r) {
-		scheme = "https"
+		return "https"
 	}
-	if origin == scheme+"://"+r.Host {
-		return true
-	}
-	return false
+	return "http"
+}
+
+// reportOriginRejection records the inputs a refused state-changing request was
+// judged on. None of them are otherwise visible, and the usual cause is the
+// deployment rather than the client: a reverse proxy that terminates TLS while
+// X-Forwarded-Proto is not believed - the header is honoured only from an
+// address listed in TDL_TRUSTED_PROXIES, whose default is empty - or one that
+// rewrites Host. Either leaves every write answered with "请求来源无效",
+// login included, and names nothing that would lead an operator to the header.
+func (s *Server) reportOriginRejection(r *http.Request) {
+	applog.Warn("http", "request_origin_rejected",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"origin", r.Header.Get("Origin"),
+		"host", r.Host,
+		"scheme", s.requestedScheme(r),
+		"forwarded_proto", r.Header.Get("X-Forwarded-Proto"),
+		"requested_with", r.Header.Get("X-Requested-With"),
+		"peer", r.RemoteAddr,
+	)
 }
 
 // requestHTTPS supports ordinary HTTPS and standard reverse-proxy forwarding.
