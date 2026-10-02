@@ -25,11 +25,11 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	upstreamDL "github.com/iyear/tdl/app/dl"
-	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/tmessage"
 	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/kv"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 	"golang.org/x/sys/unix"
@@ -1794,7 +1794,7 @@ func (m *Manager) run(job Job, sources []source) {
 	// A deleted task may have left an upstream resume key. Consume this one-shot
 	// marker so recreating it starts with a new temporary directory.
 	restart := m.consumeRestart(job.AccountID, job.SourceURL)
-	err = m.accounts.Run(transferCtx, job.AccountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
+	err = m.accounts.Run(transferCtx, job.AccountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
 		// Upstream callbacks identify only a message ID. Execute one real
 		// Telegram dialog at a time so a discussion-group comment cannot collide
 		// with a channel post that happens to have the same numeric message ID.
@@ -2962,8 +2962,8 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 
 func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]source, error) {
 	var result []source
-	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
+		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
 		peer, messageID, err := tutil.ParseMessageLink(ctx, manager, sourceURL)
 		if err != nil {
 			return err
@@ -3059,7 +3059,7 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 // on. See relatedSources.
 func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool, chatJobID string) ([]source, error) {
 	var result []source
-	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
+	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
 		message, err := tutil.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
 		if err != nil {
 			m.recordTelegramRPCError(accountID, err)
@@ -3079,7 +3079,7 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		dialogType, dialogKey, resolvedDialogID := dialogIdentity(inputPeer, accountID)
 		// Direct peers originate from reactions and listener updates. Resolve them
 		// once here so a supergroup does not inherit the generic channel label.
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
 		var resolved peers.Peer
 		if peer, resolveErr := manager.FromInputPeer(ctx, inputPeer); resolveErr == nil {
 			resolved = peer

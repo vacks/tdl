@@ -13,7 +13,7 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/iyear/tdl/core/storage"
+	"github.com/vacks/tdl/internal/kv"
 )
 
 // A listener-named dialog must read its display name from the same entity map
@@ -319,7 +319,7 @@ func TestRunReportsAnUnbuildableConnectionInsteadOfWaitingForever(t *testing.T) 
 	called := false
 	done := make(chan error, 1)
 	go func() {
-		done <- m.Run(context.Background(), accountID, func(context.Context, *gotd.Client, storage.Storage) error {
+		done <- m.Run(context.Background(), accountID, func(context.Context, *gotd.Client, kv.Storage) error {
 			called = true
 			return nil
 		})

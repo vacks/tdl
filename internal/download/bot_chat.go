@@ -9,7 +9,7 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
-	"github.com/iyear/tdl/core/storage"
+	"github.com/vacks/tdl/internal/kv"
 )
 
 // botChatHistoryScan bounds the page this reads when looking for the message a
@@ -66,8 +66,8 @@ func (m *Manager) SubmitBotChatMessage(ctx context.Context, intent BotChatIntent
 		}
 	}
 	var ref *MessageRef
-	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
+		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
 		// Resolved as a username rather than through the general resolver, which
 		// decides between a username, a phone number and a deeplink by looking at
 		// the text: a Bot whose username happens to begin with a digit would be

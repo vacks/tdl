@@ -11,7 +11,7 @@ import (
 
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	"github.com/iyear/tdl/core/storage"
+	"github.com/vacks/tdl/internal/kv"
 )
 
 // TestIntegrationSearchContact performs no message reads or writes. It is
@@ -37,7 +37,7 @@ func TestIntegrationSearchContact(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	var result *tg.ContactsFound
-	err = manager.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+	err = manager.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, _ kv.Storage) error {
 		found, err := client.API().ContactsSearch(ctx, &tg.ContactsSearchRequest{Q: query, Limit: 20})
 		if err != nil {
 			return err

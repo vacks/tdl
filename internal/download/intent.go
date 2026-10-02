@@ -14,9 +14,9 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
-	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/kv"
 )
 
 func triggerJSON(trigger map[string]string) string {
@@ -110,7 +110,7 @@ func (m *Manager) SubmitSaved(ctx context.Context, intent SavedIntent) (ChatJob,
 	}
 	var job ChatJob
 	var existing bool
-	err := m.accounts.Run(ctx, intent.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+	err := m.accounts.Run(ctx, intent.AccountID, func(ctx context.Context, client *gotd.Client, _ kv.Storage) error {
 		key := savedDialogKey(intent.AccountID)
 		id, found, err := m.keepOneSavedChat(intent.AccountID)
 		if err != nil {
@@ -463,8 +463,8 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 	}
 	intent.URL = strings.TrimSpace(intent.URL)
 	var created ChatJob
-	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API())
+	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
+		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
 		peer, startID, err := resolveChatTarget(ctx, manager, intent.URL)
 		if err != nil {
 			return err

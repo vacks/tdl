@@ -20,11 +20,10 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/iyear/tdl/core/storage"
-	upstreamKey "github.com/iyear/tdl/pkg/key"
-	upstreamClient "github.com/iyear/tdl/pkg/tclient"
 	"github.com/skip2/go-qrcode"
 	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/kv"
+	tgclient "github.com/vacks/tdl/internal/tgclient"
 )
 
 var (
@@ -720,7 +719,7 @@ func (m *Manager) Status() string {
 
 // RunCurrent runs an authenticated operation with the currently selected account.
 // Callers never receive the session bytes themselves.
-func (m *Manager) RunCurrent(ctx context.Context, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
+func (m *Manager) RunCurrent(ctx context.Context, fn func(context.Context, *gotd.Client, kv.Storage) error) error {
 	m.mu.RLock()
 	currentID := m.current
 	m.mu.RUnlock()
@@ -1057,7 +1056,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 		// supply the InputPeer. It is also the only source of a name here; when
 		// it fails the name stays empty rather than becoming a dialog type label.
 		name := ""
-		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
+		manager := peers.Options{Storage: kv.NewPeers(store)}.Build(client.API())
 		// Bounded for the same reason reactionEvent's lookup is: this runs inside
 		// the update dispatcher, and a request that waits here holds up every
 		// update behind it.
@@ -1123,7 +1122,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 	// contacts.resolveUsername requests the download path does, against the same
 	// account and the same server-side window, so leaving them unpaced meant the
 	// listener and the transfers were not sharing one budget at all.
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher}, false, m.accountMiddlewares(accountID)...)
+	client, err := tgclient.New(ctx, tgclient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher, Middlewares: m.accountMiddlewares(accountID)})
 	if err != nil {
 		return &sessionBuildError{err: fmt.Errorf("创建 Telegram 连接: %w", err)}
 	}
@@ -1234,7 +1233,7 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 	// label would attribute unrelated dialogs to the same download directory.
 	dialogName := ""
 	sourceURL := reactionFallbackURL(inputPeer, accountID, messageID)
-	manager := peers.Options{Storage: storage.NewPeers(m.accountStore(accountID))}.Build(api)
+	manager := peers.Options{Storage: kv.NewPeers(m.accountStore(accountID))}.Build(api)
 	// Resolve through the InputPeer extracted from this update: ExtractPeer only
 	// succeeds when the entity is present, and it copies that entity's access
 	// hash into the InputPeer. ResolvePeer(rawPeer) would discard the hash and
@@ -1428,11 +1427,11 @@ func reactionFallbackURL(peer tg.InputPeerClass, accountID string, messageID int
 // Run executes an operation with one specific authorized account. Download
 // jobs store this ID at enqueue time so changing the UI selection later cannot
 // change which account resumes a task.
-func (m *Manager) Run(ctx context.Context, id string, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
+func (m *Manager) Run(ctx context.Context, id string, fn func(context.Context, *gotd.Client, kv.Storage) error) error {
 	return m.runAccount(ctx, id, fn)
 }
 
-func (m *Manager) runAccount(ctx context.Context, id string, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
+func (m *Manager) runAccount(ctx context.Context, id string, fn func(context.Context, *gotd.Client, kv.Storage) error) error {
 	operation := m.operation(id)
 	// A shared lease, which concurrent operations all take at once. It is no
 	// longer about how many connections an account may have - there is one - but
@@ -1449,7 +1448,7 @@ func (m *Manager) runAccount(ctx context.Context, id string, fn func(context.Con
 // It used to build a client and run it for the duration of the call, which is
 // where every operation's fixed cost came from. It now waits for the account's
 // session instead, and the only thing that opens a connection is runSession.
-func (m *Manager) runAccountLocked(ctx context.Context, id string, fn func(context.Context, *gotd.Client, storage.Storage) error) error {
+func (m *Manager) runAccountLocked(ctx context.Context, id string, fn func(context.Context, *gotd.Client, kv.Storage) error) error {
 	session, err := m.acquireSession(id)
 	if err != nil {
 		return err
@@ -1527,7 +1526,7 @@ func (m *Manager) checkSessions(parent context.Context) {
 		operation := m.operation(id)
 		operation.RLock()
 		ctx, cancel := context.WithTimeout(parent, sessionCheckTimeout)
-		err := m.runAccountLocked(ctx, id, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+		err := m.runAccountLocked(ctx, id, func(ctx context.Context, client *gotd.Client, _ kv.Storage) error {
 			_, err := client.Self(ctx)
 			return err
 		})
@@ -1637,7 +1636,7 @@ func (m *Manager) markExpired(id string) {
 func (m *Manager) runQR(ctx context.Context, id string) {
 	store := m.accountStore(id)
 	dispatcher := tg.NewUpdateDispatcher()
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true, m.accountMiddlewares(id)...)
+	client, err := tgclient.New(ctx, tgclient.Options{KV: store, Login: true, Proxy: m.proxyURL(), UpdateHandler: dispatcher, Middlewares: m.accountMiddlewares(id)})
 	if err != nil {
 		m.setError(id, fmt.Errorf("创建 Telegram 客户端失败: %w", err))
 		return
@@ -1801,12 +1800,12 @@ func (s *accountStore) Get(_ context.Context, key string) ([]byte, error) {
 		s.fileMu.RLock()
 		defer s.fileMu.RUnlock()
 	}
-	if key == upstreamKey.App() {
-		return []byte(upstreamClient.AppDesktop), nil
+	if key == kv.App() {
+		return []byte(tgclient.AppDesktop), nil
 	}
 	data, err := os.ReadFile(s.path(key))
 	if os.IsNotExist(err) {
-		return nil, storage.ErrNotFound
+		return nil, kv.ErrNotFound
 	}
 	return data, err
 }

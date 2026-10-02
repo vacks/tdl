@@ -17,11 +17,11 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	upstreamDL "github.com/iyear/tdl/app/dl"
-	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/tmessage"
 	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/kv"
 	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
@@ -1114,7 +1114,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		}
 		publishMu.Unlock()
 	}
-	err = m.accounts.Run(transferCtx, target.AccountID, func(runCtx context.Context, client *gotd.Client, kvd storage.Storage) error {
+	err = m.accounts.Run(transferCtx, target.AccountID, func(runCtx context.Context, client *gotd.Client, kvd kv.Storage) error {
 		peer := selected.inputPeer()
 		if peer == nil {
 			return errors.New("会话下载文件缺少 Telegram 来源会话")
@@ -1966,7 +1966,7 @@ func (m *Manager) resolveChatDiscussionLink(ctx context.Context, target storedCh
 	if !ok {
 		return true, "", nil, nil
 	}
-	runErr := m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, kvd storage.Storage) error {
+	runErr := m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
 		result, rpcErr := client.API().ChannelsGetFullChannel(ctx, &tg.InputChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash})
 		if rpcErr != nil {
 			m.recordTelegramRPCError(target.AccountID, rpcErr)
@@ -1996,7 +1996,7 @@ func (m *Manager) resolveChatDiscussionLink(ctx context.Context, target storedCh
 			peer = &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
 			return nil
 		}
-		resolved, resolveErr := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client.API()).ResolvePeer(ctx, &tg.PeerChannel{ChannelID: linkedID})
+		resolved, resolveErr := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API()).ResolvePeer(ctx, &tg.PeerChannel{ChannelID: linkedID})
 		if resolveErr != nil {
 			// The key is known even though the peer is not; the next pass records
 			// it with the peer and this request is not repeated per message.
@@ -2146,7 +2146,7 @@ func (m *Manager) reconcileListenerGap(id string) error {
 	// cannot make progress at all.
 	ctx, cancel := context.WithTimeout(context.Background(), listenerGapBudget)
 	defer cancel()
-	return m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+	return m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ kv.Storage) error {
 		// The linked discussion group is a different dialog with its own
 		// history, so the walk below - which reads this task's own dialog -
 		// cannot reach the comments left in it. Its failure is reported and
@@ -2659,7 +2659,7 @@ func targetIncludesReplies(target storedChatTarget) bool {
 func (m *Manager) discoverDiscussionOrigin(event telegram.NewMessageEvent, rootID int) (string, int, int, error) {
 	var originKey string
 	var originID, resolvedRootID int
-	err := m.accounts.Run(context.Background(), event.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+	err := m.accounts.Run(context.Background(), event.AccountID, func(ctx context.Context, client *gotd.Client, _ kv.Storage) error {
 		var err error
 		originKey, originID, resolvedRootID, err = discussionOriginFromRoot(m, ctx, client.API(), event.AccountID, event.InputPeer, rootID)
 		return err
@@ -2724,7 +2724,7 @@ func (m *Manager) scanOneChat() error {
 	}
 	ctx, release := m.beginChatExecution(id)
 	defer release()
-	err = m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ storage.Storage) error {
+	err = m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, _ kv.Storage) error {
 		for _, kind := range chatStreamKinds {
 			if _, err := m.db.Exec(`INSERT INTO chat_download_streams(chat_job_id, stream_kind) VALUES (?, ?) ON CONFLICT(chat_job_id, stream_kind) DO NOTHING`, target.ID, kind); err != nil {
 				return err
