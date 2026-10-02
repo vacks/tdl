@@ -1,7 +1,7 @@
 // Package buildinfo defines the version of this TDL 管理 project.
 package buildinfo
 
-const Version = "v1.11.6"
+const Version = "v1.11.7"
 
 // UpstreamVersion names the upstream TDL release this project was forked from.
 //

@@ -1,0 +1,234 @@
+package transfer
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/gotd/td/telegram/downloader"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/tmsg"
+)
+
+// maxPartSize is Telegram's part size for upload.getFile, and the unit the
+// progress callback counts in.
+const maxPartSize = 1024 * 1024
+
+// engine runs one batch: it pulls elements from the iterator and hands each to
+// a transfer worker.
+type engine struct {
+	deps Deps
+	opts Options
+	iter *iterator
+
+	files  atomic.Int64
+	failed atomic.Int64
+}
+
+// download runs the batch to completion.
+//
+// A worker never returns an error, because errgroup cancels its context when
+// one does, and that would abandon the files still queued behind it: one post
+// deleted mid-task must not cost the other ninety-nine. A failed transfer is
+// counted and logged instead, and the caller decides the task's outcome from
+// the per-file states it keeps.
+func (e *engine) download(ctx context.Context) (Stats, error) {
+	// Cancellable on its own so an iterator failure can stop the workers too,
+	// rather than leaving them transferring into a directory the caller is
+	// about to remove.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(max(1, e.opts.Tasks))
+	for e.iter.Next(groupCtx) {
+		item := e.iter.Value()
+		group.Go(func() error {
+			e.transfer(groupCtx, item)
+			return nil
+		})
+	}
+
+	if err := e.iter.Err(); err != nil {
+		cancel()
+		_ = group.Wait()
+		return e.stats(), err
+	}
+	if err := group.Wait(); err != nil {
+		return e.stats(), err
+	}
+
+	e.iter.reportOutcome(e.deps.AccountID, e.opts.Peer)
+	return e.stats(), nil
+}
+
+func (e *engine) stats() Stats {
+	counts := batchStats{}
+	if source, ok := e.iter.source.(*batchSource); ok {
+		counts = source.counts()
+	}
+	return Stats{
+		Files:       int(e.files.Load()),
+		Deleted:     e.iter.deleted,
+		Empty:       e.iter.empty,
+		Failed:      int(e.failed.Load()),
+		BatchCalls:  counts.batchCalls,
+		SingleCalls: counts.singleCalls,
+	}
+}
+
+// transfer moves one file and makes it publishable.
+func (e *engine) transfer(ctx context.Context, item *element) {
+	// Closed whatever happens: a worker that leaves the file open holds a
+	// descriptor until the process ends.
+	defer item.to.Close()
+
+	e.files.Add(1)
+	// Reported before the first byte so the file counts as started the moment
+	// work begins on it, rather than only once a chunk has landed.
+	e.progress(item, 0)
+
+	if err := e.fetch(ctx, item); err != nil {
+		e.failed.Add(1)
+		// The partial file is removed rather than left in place. The engine this
+		// replaced renamed it out of its temporary name and reported success,
+		// which is how a task could show a completed file of zero bytes.
+		if err := os.Remove(item.to.Name()); err != nil && !os.IsNotExist(err) {
+			applog.Warn("download", "partial_file_not_removed", "path", item.to.Name(), "error", err.Error())
+		}
+		applog.Error("download", "transfer_failed", "account_id", e.deps.AccountID,
+			"dialog_id", item.dialogID, "message_id", item.message.ID,
+			"name", item.media.Name, "size", item.media.Size, "error", err.Error())
+		return
+	}
+
+	path, err := finalize(item)
+	if err != nil {
+		e.failed.Add(1)
+		applog.Error("download", "transfer_finalize_failed", "account_id", e.deps.AccountID,
+			"dialog_id", item.dialogID, "message_id", item.message.ID, "error", err.Error())
+		return
+	}
+
+	if e.opts.OnFileCompleted != nil {
+		e.opts.OnFileCompleted(FileCompletedUpdate{
+			DialogID:  item.dialogID,
+			MessageID: item.message.ID,
+			Path:      path,
+		})
+	}
+}
+
+// fetch pulls the bytes onto disk.
+func (e *engine) fetch(ctx context.Context, item *element) error {
+	client := e.deps.Pool.Client(ctx, item.media.DC)
+	_, err := downloader.NewDownloader().
+		WithPartSize(maxPartSize).
+		Download(client, item.media.InputFileLoc).
+		WithThreads(tmsg.BestThreads(item.media.Size, e.opts.Threads)).
+		Parallel(ctx, &progressWriter{item: item, engine: e})
+	return err
+}
+
+func (e *engine) progress(item *element, downloaded int64) {
+	if e.opts.OnProgress == nil {
+		return
+	}
+	e.opts.OnProgress(ProgressUpdate{
+		DialogID:   item.dialogID,
+		MessageID:  item.message.ID,
+		Downloaded: downloaded,
+		Total:      item.media.Size,
+		Completed:  item.media.Size > 0 && downloaded >= item.media.Size,
+	})
+}
+
+// progressWriter reports progress as parts land.
+//
+// It does not sleep between parts. The implementation it replaces paused two
+// hundred milliseconds whenever a write was smaller than a part - which on a
+// file under a megabyte is every file - so that a terminal progress bar had
+// time to redraw. Nothing here renders a progress bar.
+type progressWriter struct {
+	item   *element
+	engine *engine
+	total  atomic.Int64
+}
+
+func (w *progressWriter) WriteAt(p []byte, off int64) (int, error) {
+	written, err := w.item.to.WriteAt(p, off)
+	if err != nil {
+		return written, err
+	}
+	w.engine.progress(w.item, w.total.Add(int64(written)))
+	return written, nil
+}
+
+// finalize turns the working file into the one the caller publishes.
+func finalize(item *element) (string, error) {
+	working := item.to.Name()
+	path := strings.TrimSuffix(working, tempExt)
+	if err := os.Rename(working, path); err != nil {
+		return "", err
+	}
+	// The file is stamped with the message's date, so a downloaded archive
+	// sorts by when it was posted rather than by when it was fetched.
+	if item.media.Date > 0 {
+		stamp := time.Unix(item.media.Date, 0)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			return "", err
+		}
+	}
+	return filepath.Clean(path), nil
+}
+
+const (
+	tempExt = ".tmp"
+	// maxNameBytes keeps one path component inside the 255 bytes a filesystem
+	// allows, leaving room for the message id, the separator and the extension.
+	maxNameBytes = 180
+)
+
+// tempName builds the working file's name.
+//
+// It is not the published name - the caller chooses that from its own template
+// - so it only has to be unique and safe: the message id makes it unique, and
+// the sanitiser makes it one path component a filesystem will accept.
+func tempName(messageID int, name string) string {
+	return strconv.Itoa(messageID) + "_" + sanitizeName(name) + tempExt
+}
+
+// sanitizeName replaces what a filesystem refuses and bounds the length.
+//
+// Control characters, invalid UTF-8 and the separators and reserved characters
+// of the common filesystems become underscores. A trailing dot or space is
+// dropped, because some filesystems drop them silently and a name that reads
+// differently than it was written is worse than one that was trimmed.
+func sanitizeName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r == utf8.RuneError, r < 0x20, r == 0x7f, unicode.IsControl(r), strings.ContainsRune(`/\:*?"<>|`, r):
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.Trim(b.String(), ". ")
+	if out == "" {
+		out = "file"
+	}
+	for len(out) > maxNameBytes {
+		_, size := utf8.DecodeLastRuneInString(out)
+		out = out[:len(out)-size]
+	}
+	return strings.TrimRight(out, ". ")
+}
