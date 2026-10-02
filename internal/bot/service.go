@@ -2566,23 +2566,83 @@ func helpText() string {
 	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version, upstream.Version)
 }
 
-func (s *Service) statusText() string {
-	accountName := "未登录"
-	if s.telegram != nil {
-		accounts, currentID := s.telegram.List()
-		for _, account := range accounts {
-			if account.ID != currentID || account.State != "authorized" {
-				continue
-			}
-			accountName = strings.TrimSpace(strings.TrimSpace(account.FirstName + " " + account.LastName))
-			if accountName == "" {
-				accountName = "Telegram 用户 " + fmt.Sprint(account.TelegramID)
-			}
-			if account.Username != "" {
-				accountName += " (@" + account.Username + ")"
-			}
-			break
+// accountsStatusText renders one line per account record.
+//
+// The Bot's /status used to name only the selected account - and only when it
+// was authorized - so someone running several sessions saw a single line and
+// read it as the whole truth. Every account is listed instead, with the
+// selected one marked, because the update listeners and the download queue run
+// on all of them and an account that went stale is information the person
+// reading this cannot get anywhere else in the Bot.
+//
+// Authorized accounts carry no state word: it is the ordinary case, and a word
+// repeated on every line is the one the eye stops reading. The marks that carry
+// meaning are the ones that differ from their neighbours.
+func accountsStatusText(accounts []telegram.Account, currentID string) string {
+	if len(accounts) == 0 {
+		return "登录账号：未登录"
+	}
+	lines := make([]string, 0, len(accounts)+1)
+	lines = append(lines, fmt.Sprintf("登录账号（%d）：", len(accounts)))
+	for _, account := range accounts {
+		line := "· " + accountDisplayName(account)
+		if account.State != "authorized" {
+			line += " · " + accountStateLabel(account.State)
 		}
+		if account.ID == currentID {
+			line += " · 当前账户"
+		}
+		lines = append(lines, line)
+	}
+	return html.EscapeString(strings.Join(lines, "\n"))
+}
+
+// accountDisplayName is what a person calls this session. An account still
+// being logged in has neither a name nor a Telegram id yet, so it is named by
+// its state rather than by a placeholder number that means "unknown".
+func accountDisplayName(account telegram.Account) string {
+	name := strings.TrimSpace(account.FirstName + " " + account.LastName)
+	if name == "" {
+		if account.TelegramID != 0 {
+			name = "Telegram 用户 " + fmt.Sprint(account.TelegramID)
+		} else {
+			name = "未命名账户"
+		}
+	}
+	if account.Username != "" {
+		name += " (@" + account.Username + ")"
+	}
+	return name
+}
+
+// accountStateLabel uses the same wording as the Web accounts view, so the two
+// surfaces do not describe one session in two vocabularies.
+func accountStateLabel(state string) string {
+	switch state {
+	case "authorized":
+		return "已登录"
+	case "starting":
+		return "正在准备"
+	case "waiting_for_qr":
+		return "等待扫码"
+	case "waiting_for_2fa":
+		return "等待两步验证"
+	case "expired":
+		return "会话失效"
+	case "error":
+		return "登录失败"
+	case "stopped":
+		return "已停止"
+	default:
+		return state
+	}
+}
+
+func (s *Service) statusText() string {
+	accounts := "登录账号：未登录"
+	if s.telegram != nil {
+		list, currentID := s.telegram.List()
+		accounts = accountsStatusText(list, currentID)
 	}
 	var cpu, memory, receive, transmit float64
 	if s.monitor != nil {
@@ -2616,7 +2676,7 @@ func (s *Service) statusText() string {
 			}
 		}
 	}
-	return fmt.Sprintf("<b>当前状态</b>\n版本：TDL 管理 %s · 上游 TDL %s\n登录账号：%s\n%s\nCPU：%.1f%%\n内存：%.1f%%\n网络：↓ %s/s · ↑ %s/s", buildinfo.Version, upstream.Version, html.EscapeString(accountName), counts, cpu, memory, bytesLabel(int64(receive)), bytesLabel(int64(transmit)))
+	return fmt.Sprintf("<b>当前状态</b>\n版本：TDL 管理 %s · 上游 TDL %s\n%s\n%s\nCPU：%.1f%%\n内存：%.1f%%\n网络：↓ %s/s · ↑ %s/s", buildinfo.Version, upstream.Version, accounts, counts, cpu, memory, bytesLabel(int64(receive)), bytesLabel(int64(transmit)))
 }
 
 func configText(cfg settings.Values) string {
