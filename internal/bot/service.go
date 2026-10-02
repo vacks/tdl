@@ -2585,7 +2585,7 @@ func accountsStatusText(accounts []telegram.Account, currentID string) string {
 	lines := make([]string, 0, len(accounts)+1)
 	lines = append(lines, fmt.Sprintf("登录账号（%d）：", len(accounts)))
 	for _, account := range accounts {
-		line := "· " + accountDisplayName(account)
+		line := "- " + accountDisplayName(account)
 		if account.State != "authorized" {
 			line += " · " + accountStateLabel(account.State)
 		}
@@ -2644,6 +2644,15 @@ func (s *Service) statusText() string {
 		list, currentID := s.telegram.List()
 		accounts = accountsStatusText(list, currentID)
 	}
+	// The database is read from the health the manager already samples every
+	// five seconds rather than by pinging here: a ping that has to wait out a
+	// timeout is exactly what this command must not do, since the Bot answers
+	// commands from the same goroutine pool, and an unreachable database is the
+	// case it would slow down.
+	database := "未知"
+	if s.downloads != nil {
+		database = databaseStatusLabel(s.downloads.DatabaseHealth())
+	}
 	var cpu, memory, receive, transmit float64
 	if s.monitor != nil {
 		sample, _ := s.monitor.Snapshot()
@@ -2653,30 +2662,66 @@ func (s *Service) statusText() string {
 		}
 		receive, transmit = sample.ReceiveBPS, sample.TransmitBPS
 	}
-	// Both figures are counted when this command is sent and never polled. They
-	// are left out entirely, rather than shown as zero, when the database cannot
-	// answer: a person reading "0 个下载中" would otherwise be told the opposite
-	// of what is happening.
-	counts := "下载中文件：暂时无法读取\n最近 30 天失败：暂时无法读取\n监听事件：暂时无法读取"
+	// These figures are counted when this command is sent and never polled. Each
+	// line has its own "could not be read" form: a person reading "0 个下载中"
+	// would otherwise be told the opposite of what is happening.
+	eventsLine := "监听事件：暂时无法读取"
+	downloadsLine, failuresLine := "当前正在下载：暂时无法读取", "最近下载失败：暂时无法读取"
 	if s.downloads != nil {
-		if active, recentFailures, err := s.downloads.DownloadCounts(); err == nil {
-			counts = fmt.Sprintf("下载中文件：%d\n最近 30 天失败：%d", active, recentFailures)
-		}
-		// An event that stopped being retried is a download the user asked for
-		// and did not get, so it is reported next to the download counts rather
-		// than only appearing in the service log.
 		// Work in progress and work waiting to be retried are reported apart: an
 		// event that failed and is backing off can sit for an hour between
 		// attempts, and counting it as "处理中" hid a stuck event behind what
-		// looked like activity.
+		// looked like activity. An event that stopped being retried is a download
+		// the user asked for and did not get, so it is reported here rather than
+		// only appearing in the service log.
 		if processing, waiting, stopped, err := s.downloads.ListenerInboxCounts(); err == nil {
-			counts += fmt.Sprintf("\n监听事件：%d 处理中 · %d 等待重试", processing, waiting)
+			eventsLine = fmt.Sprintf("监听事件：%d 处理中 · %d 等待重试", processing, waiting)
 			if stopped > 0 {
-				counts += fmt.Sprintf(" · %d 已停止重试", stopped)
+				eventsLine += fmt.Sprintf(" · %d 已停止重试", stopped)
 			}
 		}
+		// Both come from one query, so they are reported together: one number
+		// that is stale and one that failed to be read must not look alike.
+		if active, recentFailures, err := s.downloads.DownloadCounts(); err == nil {
+			downloadsLine = fmt.Sprintf("当前正在下载：%d", active)
+			failuresLine = fmt.Sprintf("最近下载失败：%d", recentFailures)
+		}
 	}
-	return fmt.Sprintf("<b>当前状态</b>\n版本：TDL 管理 %s · 上游 TDL %s\n%s\n%s\nCPU：%.1f%%\n内存：%.1f%%\n网络：↓ %s/s · ↑ %s/s", buildinfo.Version, upstream.Version, accounts, counts, cpu, memory, bytesLabel(int64(receive)), bytesLabel(int64(transmit)))
+	return statusCard(accounts, database, []string{eventsLine, downloadsLine, failuresLine}, cpu, memory, receive, transmit)
+}
+
+// databaseStatusLabel uses the same wording as the Web sidebar for the same
+// states, so one connection is not described in two vocabularies. Status is
+// empty only before the first sample is taken.
+func databaseStatusLabel(health download.DatabaseHealth) string {
+	switch health.Status {
+	case "connected":
+		return "已连接"
+	case "":
+		return "检测中"
+	default:
+		return "连接异常"
+	}
+}
+
+// statusCard lays out the /status body. It takes every part as text because
+// each one has its own "could not be read" form that must survive to the
+// screen, and it is a function of its arguments alone so the layout - the one
+// thing in this command a person reads as a whole - is pinned by a test.
+func statusCard(accounts, database string, counts []string, cpu, memory, receive, transmit float64) string {
+	lines := []string{
+		"<b>当前状态</b>",
+		fmt.Sprintf("版本：TDL 管理 %s · 上游 TDL %s", buildinfo.Version, upstream.Version),
+		"数据库状态：" + database,
+		accounts,
+	}
+	lines = append(lines, counts...)
+	lines = append(lines,
+		fmt.Sprintf("CPU：%.1f%%", cpu),
+		fmt.Sprintf("内存：%.1f%%", memory),
+		fmt.Sprintf("网络：↓ %s/s · ↑ %s/s", bytesLabel(int64(receive)), bytesLabel(int64(transmit))),
+	)
+	return strings.Join(lines, "\n")
 }
 
 func configText(cfg settings.Values) string {
