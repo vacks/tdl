@@ -34,6 +34,17 @@ var (
 )
 
 const (
+	// updatePeerNameTimeout bounds the one request an update handler may make
+	// while looking up a dialog's display name. Handlers run inside gotd's
+	// update dispatcher and are called synchronously, so a request that waits
+	// there stops every later update - and a trigger that has not been logged or
+	// persisted yet is lost outright if the process restarts. See reactionEvent.
+	updatePeerNameTimeout = 5 * time.Second
+	// slowRPCThreshold is when a paced request stops being merely slow. Resolves
+	// and history reads answer in well under a second, so this is far above
+	// ordinary cost and far below the minutes a flood window costs. See
+	// noteSlowRPC.
+	slowRPCThreshold         = 5 * time.Second
 	sessionCheckInitialDelay = 15 * time.Second
 	sessionCheckInterval     = 30 * time.Minute
 	// sessionCheckTimeout bounds one validity probe. It no longer has to cover a
@@ -307,6 +318,14 @@ type Manager struct {
 	// sequence, not together.
 	rpcGateMu sync.RWMutex
 	rpcGate   RPCGate
+	// resolveMu guards resolvedNames, the answers to contacts.resolveUsername
+	// this account has already been given. See usernameCacheMiddleware.
+	resolveMu     sync.Mutex
+	resolvedNames map[string]resolvedUsername
+	// slowRPC receives every paced request that outran slowRPCThreshold. It is
+	// settable so a test can watch the reporting happen without capturing the
+	// process's log output; see noteSlowRPC.
+	slowRPC func(accountID, method string, elapsed time.Duration, err error)
 }
 
 // RPCGate is the account-wide metadata gate.
@@ -395,6 +414,33 @@ func pacedRequest(input bin.Encoder) bool {
 // (dcpool.NewPool) and does not pass through here, so the per-message metadata
 // reads it makes are still un-paced. Closing that needs the pool to receive a
 // middleware of its own.
+// noteSlowRPC reports a paced request that took far longer than its own cost.
+//
+// It exists because a flood window is invisible from inside this process. The
+// requests this application makes run to a flood-wait middleware that sleeps off
+// the server's FLOOD_WAIT and retries, so nothing is returned, nothing is
+// logged, and the account-wide cooldown this gate records stays empty: a
+// resolution simply takes ninety seconds, and a reaction waits behind it looking
+// exactly like a reaction that was never received. Timing what the gate already
+// sees turns that silence into a line naming the request being refused.
+//
+// The gap that remains is the download pool, which builds its own invoker chain
+// inside the upstream downloader and does not pass through here at all.
+func (m *Manager) noteSlowRPC(accountID string, input bin.Encoder, elapsed time.Duration, err error) {
+	if elapsed < slowRPCThreshold {
+		return
+	}
+	method := strings.TrimPrefix(fmt.Sprintf("%T", input), "*tg.")
+	if m.slowRPC != nil {
+		m.slowRPC(accountID, method, elapsed, err)
+	}
+	errorText := ""
+	if err != nil {
+		errorText = err.Error()
+	}
+	applog.Warn("telegram", "slow_rpc", "account_id", accountID, "method", method, "elapsed_ms", elapsed.Milliseconds(), "error", errorText)
+}
+
 func (m *Manager) rpcGateMiddleware(accountID string) gotd.Middleware {
 	return gotd.MiddlewareFunc(func(next tg.Invoker) gotd.InvokeFunc {
 		return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
@@ -405,7 +451,9 @@ func (m *Manager) rpcGateMiddleware(accountID string) gotd.Middleware {
 			if err := gate.Acquire(ctx, accountID); err != nil {
 				return err
 			}
+			startedAt := time.Now()
 			err := next.Invoke(ctx, input, output)
+			m.noteSlowRPC(accountID, input, time.Since(startedAt), err)
 			// Reported before it is returned, because the middleware outside this
 			// one consumes a FLOOD_WAIT rather than passing it on.
 			gate.Report(accountID, err)
@@ -565,6 +613,7 @@ func (m *Manager) Select(id string) error {
 func (m *Manager) Delete(id string) error {
 	// Account removal must wait for in-flight reads/downloads, so its session
 	// and state files cannot disappear underneath an active client.
+	defer m.forgetUsernames(id)
 	operation := m.operation(id)
 	operation.Lock()
 	defer operation.Unlock()
@@ -942,7 +991,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 	dispatcher := tg.NewUpdateDispatcher()
 	var client *gotd.Client
 	dispatchReaction := func(updateCtx context.Context, entities tg.Entities, raw tg.MessageClass, updateType string) {
-		m.dispatchEditedReaction(updateCtx, accountID, updateType, entities, raw, client, func(_ context.Context, event ReactionEvent) { m.dispatchReaction(session, event) })
+		m.dispatchEditedReaction(updateCtx, accountID, updateType, entities, raw, client.API(), func(_ context.Context, event ReactionEvent) { m.dispatchReaction(session, event) })
 	}
 	dispatcher.OnMessageReactions(func(updateCtx context.Context, entities tg.Entities, update *tg.UpdateMessageReactions) error {
 		reactions := &update.Reactions
@@ -950,7 +999,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 		if len(emojis) == 0 {
 			return nil
 		}
-		event, ok := m.reactionEvent(updateCtx, accountID, entities, update.Peer, update.MsgID, emojis, client)
+		event, ok := m.reactionEvent(updateCtx, accountID, entities, update.Peer, update.MsgID, emojis, client.API())
 		if !ok {
 			return nil
 		}
@@ -980,7 +1029,13 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 		// it fails the name stays empty rather than becoming a dialog type label.
 		name := ""
 		manager := peers.Options{Storage: storage.NewPeers(store)}.Build(client.API())
-		if peer, err := manager.ResolvePeer(updateCtx, message.PeerID); err == nil {
+		// Bounded for the same reason reactionEvent's lookup is: this runs inside
+		// the update dispatcher, and a request that waits here holds up every
+		// update behind it.
+		nameCtx, cancelName := context.WithTimeout(updateCtx, updatePeerNameTimeout)
+		peer, err := manager.ResolvePeer(nameCtx, message.PeerID)
+		cancelName()
+		if err == nil {
 			input, name = peer.InputPeer(), peer.VisibleName()
 		} else {
 			// Telegram occasionally omits an entity from an otherwise valid
@@ -1039,7 +1094,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 	// contacts.resolveUsername requests the download path does, against the same
 	// account and the same server-side window, so leaving them unpaced meant the
 	// listener and the transfers were not sharing one budget at all.
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher}, false, m.rpcGateMiddleware(accountID))
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher}, false, m.rpcGateMiddleware(accountID), m.usernameCacheMiddleware(accountID))
 	if err != nil {
 		return &sessionBuildError{err: fmt.Errorf("创建 Telegram 连接: %w", err)}
 	}
@@ -1104,7 +1159,7 @@ func replyTopID(message *tg.Message) int {
 	return 0
 }
 
-func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateType string, entities tg.Entities, raw tg.MessageClass, client *gotd.Client, onEvent func(context.Context, ReactionEvent)) {
+func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateType string, entities tg.Entities, raw tg.MessageClass, api *tg.Client, onEvent func(context.Context, ReactionEvent)) {
 	message, ok := raw.(*tg.Message)
 	if !ok {
 		return
@@ -1117,7 +1172,7 @@ func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateT
 	if len(emojis) == 0 {
 		return
 	}
-	event, ok := m.reactionEvent(ctx, accountID, entities, message.PeerID, message.ID, emojis, client)
+	event, ok := m.reactionEvent(ctx, accountID, entities, message.PeerID, message.ID, emojis, api)
 	if !ok {
 		return
 	}
@@ -1128,7 +1183,7 @@ func (m *Manager) dispatchEditedReaction(ctx context.Context, accountID, updateT
 // reactionEvent turns a Telegram peer into a direct-download event. A public
 // t.me URL is optional metadata only; the InputPeer is authoritative and works
 // for private dialogs as well.
-func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities tg.Entities, rawPeer tg.PeerClass, messageID int, emojis []string, client *gotd.Client) (ReactionEvent, bool) {
+func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities tg.Entities, rawPeer tg.PeerClass, messageID int, emojis []string, api *tg.Client) (ReactionEvent, bool) {
 	inputPeer, err := messagePeer.EntitiesFromUpdate(entities).ExtractPeer(rawPeer)
 	if err != nil {
 		// Telegram omits entities from some updates while still naming the dialog,
@@ -1150,14 +1205,31 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 	// label would attribute unrelated dialogs to the same download directory.
 	dialogName := ""
 	sourceURL := reactionFallbackURL(inputPeer, accountID, messageID)
-	manager := peers.Options{Storage: storage.NewPeers(m.accountStore(accountID))}.Build(client.API())
+	manager := peers.Options{Storage: storage.NewPeers(m.accountStore(accountID))}.Build(api)
 	// Resolve through the InputPeer extracted from this update: ExtractPeer only
 	// succeeds when the entity is present, and it copies that entity's access
 	// hash into the InputPeer. ResolvePeer(rawPeer) would discard the hash and
 	// look the peer up by ID alone, which fails whenever the peers storage has
 	// not been seeded yet and silently degraded the name to a type label.
-	peer, resolveErr := manager.FromInputPeer(ctx, inputPeer)
+	// The call is bounded because this handler runs inside gotd's update
+	// dispatcher, which invokes handlers synchronously: whatever waits here
+	// stops every later update behind it. That was not theoretical. While
+	// Telegram was refusing this account's requests, a reaction handler sat on
+	// this call for minutes, the updates arriving after it were never handled,
+	// and their triggers were gone when the process restarted - with no log line
+	// and no inbox row, because both happen after this point. The request only
+	// refines a display name; the InputPeer the download is built from came out
+	// of the update itself, so running out of time costs a name and never a
+	// download.
+	nameCtx, cancelName := context.WithTimeout(ctx, updatePeerNameTimeout)
+	peer, resolveErr := manager.FromInputPeer(nameCtx, inputPeer)
+	cancelName()
 	if resolveErr != nil {
+		// The update usually carries the entity it just named, and reading the
+		// name out of it is a lookup rather than a request. A dialog whose name
+		// is still unknown stays empty: a type label is not a name, and using
+		// one merges unrelated dialogs into a single download directory.
+		dialogName = inputPeerDisplayName(inputPeer, entities)
 		applog.Info("reaction", "peer_name_unavailable", "account_id", accountID, "dialog_id", dialogID, "message_id", messageID, "error", resolveErr.Error())
 	} else {
 		// peers.User maps the current user to InputPeerSelf, which preserves the
@@ -1536,7 +1608,7 @@ func (m *Manager) markExpired(id string) {
 func (m *Manager) runQR(ctx context.Context, id string) {
 	store := m.accountStore(id)
 	dispatcher := tg.NewUpdateDispatcher()
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true, m.rpcGateMiddleware(id))
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true, m.rpcGateMiddleware(id), m.usernameCacheMiddleware(id))
 	if err != nil {
 		m.setError(id, fmt.Errorf("创建 Telegram 客户端失败: %w", err))
 		return
