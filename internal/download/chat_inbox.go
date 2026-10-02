@@ -138,7 +138,7 @@ func (m *Manager) recoverChatEventPeer(accountID, dialogKey string) tg.InputPeer
 	if err != nil {
 		return nil
 	}
-	return chatInboxPeer(kind, id, hash)
+	return inboxPeer(kind, id, hash)
 }
 
 func (m *Manager) claimChatMessageInbox(limit int) ([]chatMessageInboxEvent, error) {
@@ -174,7 +174,7 @@ FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at::timestampt
 		if err := rows.Scan(&item.id, &accountID, &name, &dialogID, &messageID, &replyToMessageID, &replyToTopID, &peerType, &peerID, &peerHash, &item.attempts); err != nil {
 			return nil, err
 		}
-		peer := chatInboxPeer(peerType, peerID, peerHash)
+		peer := inboxPeer(peerType, peerID, peerHash)
 		if peer == nil {
 			return nil, fmt.Errorf("会话消息事件 %d 的会话引用无效", item.id)
 		}
@@ -212,7 +212,12 @@ FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at::timestampt
 	return claimed, nil
 }
 
-func chatInboxPeer(kind string, id, hash int64) tg.InputPeerClass {
+// inboxPeer rebuilds the peer an inbox event was admitted with.
+//
+// The session inbox's copy of this was the same function without the user case,
+// which it never produces: its rows are written from a listener's dialog, and
+// a dialog is a channel, a group or the account's own saved messages.
+func inboxPeer(kind string, id, hash int64) tg.InputPeerClass {
 	switch kind {
 	case "self":
 		return &tg.InputPeerSelf{}
@@ -247,42 +252,7 @@ func (m *Manager) completeChatMessageInbox(id int64) error {
 // is recovered, and one that can never succeed stops for good with its error
 // recorded and counted.
 func (m *Manager) retryChatMessageInbox(id int64, attempts int, cause error) error {
-	now := time.Now().UTC()
-	if IsNothingToDo(cause) {
-		// The event was answered: there is nothing to download. Settling it as
-		// skipped records that the request was seen and acted on while keeping
-		// it out of the queue the Bot lists, because an event nobody can act on
-		// does not belong in the list of events someone can.
-		if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'skipped', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-		applog.Info("chat_download", "new_message_event_skipped", "inbox_id", id, "attempts", attempts, "reason", cause.Error())
-		return nil
-	}
-	if permanentInboxError(cause) {
-		// Telegram rejected the request itself, so no later attempt can succeed.
-		// Spend the whole attempt budget at once: reviveExhaustedInboxEvents only
-		// offers rows below that limit, which is what keeps a rejected event from
-		// coming back every hour to spend another request and to keep showing up
-		// as waiting work.
-		if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = 'failed', attempts = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, inboxAttemptLimit, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-		applog.Error("chat_download", "new_message_event_rejected", "inbox_id", id, "attempts", attempts, "error", cause.Error())
-		return nil
-	}
-	status := "pending"
-	if attempts >= inboxFastAttempts {
-		status = "failed"
-	}
-	delay := time.Duration(1<<min(attempts, 6)) * time.Second
-	if _, err := m.db.Exec(`UPDATE chat_message_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), now.Add(delay).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-		return err
-	}
-	if status == "failed" {
-		applog.Error("chat_download", "new_message_event_gave_up", "inbox_id", id, "attempts", attempts, "error", cause.Error())
-	}
-	return nil
+	return m.retryInboxEvent(messageInbox, id, attempts, cause)
 }
 
 // retryableTelegram400Types are the answers in Telegram's 400 family that are
@@ -422,4 +392,73 @@ func (m *Manager) waitChatEvent(delay time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// An event inbox has one status machine, and it was written twice.
+//
+// The two inboxes take events from different places - a listened message and a
+// reaction on one - and their tables carry different columns, but what happens
+// to an event that failed is the same question with the same three answers, and
+// they were the same forty lines twice over. The answers are not obvious ones,
+// which is what makes a second copy dangerous:
+//
+//   - nothingToDo is not a failure. The event was evaluated and the answer was
+//     "there is nothing here to download", so it settles as skipped and stays
+//     out of the queue the Bot lists, while still recording that the request
+//     was seen.
+//   - a permanent failure spends the whole attempt budget at once, because
+//     reviveExhaustedInboxEvents only offers rows below the limit - which is
+//     what keeps a rejected event from coming back every hour to spend another
+//     Telegram request.
+//   - anything else is a transport failure, and it backs off.
+type inboxTable struct {
+	table     string
+	component string
+	// event names the log lines. The event's own name is the one thing the two
+	// really do say differently, because they are read by different people.
+	event string
+}
+
+var (
+	messageInbox  = inboxTable{table: "chat_message_inbox", component: "chat_download", event: "new_message_event"}
+	reactionInbox = inboxTable{table: "reaction_inbox", component: "reaction", event: "reaction_event"}
+)
+
+// retryInboxEvent settles one event that did not go through.
+func (m *Manager) retryInboxEvent(t inboxTable, id int64, attempts int, cause error) error {
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	if IsNothingToDo(cause) {
+		// The event was answered: nothing in it matches the filter, so there is
+		// nothing to download. Settling it as skipped keeps it out of the queue
+		// the Bot lists while still recording that the request was seen.
+		if _, err := m.db.Exec(`UPDATE `+t.table+` SET status = 'skipped', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, cause.Error(), stamp, stamp, id); err != nil {
+			return err
+		}
+		applog.Info(t.component, t.event+"_skipped", "inbox_id", id, "attempts", attempts, "reason", cause.Error())
+		return nil
+	}
+	if permanentInboxError(cause) {
+		// Telegram rejected the request itself, so no later attempt can succeed.
+		// Spend the whole budget at once: the revive pass only offers rows below
+		// the limit, which is what keeps a rejected event from coming back every
+		// hour to spend another request and to keep showing up as waiting work.
+		if _, err := m.db.Exec(`UPDATE `+t.table+` SET status = 'failed', attempts = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, inboxAttemptLimit, cause.Error(), stamp, stamp, id); err != nil {
+			return err
+		}
+		applog.Error(t.component, t.event+"_rejected", "inbox_id", id, "attempts", attempts, "error", cause.Error())
+		return nil
+	}
+	status := "pending"
+	if attempts >= inboxFastAttempts {
+		status = "failed"
+	}
+	delay := time.Duration(1<<min(attempts, 6)) * time.Second
+	if _, err := m.db.Exec(`UPDATE `+t.table+` SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), now.Add(delay).Format(time.RFC3339Nano), stamp, id); err != nil {
+		return err
+	}
+	if status == "failed" {
+		applog.Error(t.component, t.event+"_gave_up", "inbox_id", id, "attempts", attempts, "error", cause.Error())
+	}
+	return nil
 }

@@ -4,9 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/gotd/td/tg"
-	"github.com/vacks/tdl/internal/applog"
 )
 
 // ReactionInboxEvent is a durable, pre-resolution record of a reaction
@@ -157,21 +154,6 @@ FROM reaction_inbox WHERE status = 'pending' AND next_attempt_at::timestamptz <=
 	return claimed, nil
 }
 
-func inboxPeer(kind string, id, hash int64) tg.InputPeerClass {
-	switch kind {
-	case "self":
-		return &tg.InputPeerSelf{}
-	case "user":
-		return &tg.InputPeerUser{UserID: id, AccessHash: hash}
-	case "chat":
-		return &tg.InputPeerChat{ChatID: id}
-	case "channel":
-		return &tg.InputPeerChannel{ChannelID: id, AccessHash: hash}
-	default:
-		return nil
-	}
-}
-
 func (m *Manager) CompleteReactionInbox(id int64, jobID string) error {
 	_, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'done', job_id = ?, error = '', updated_at = ? WHERE id = ?`, jobID, time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
@@ -195,38 +177,7 @@ func (m *Manager) CompleteReactionInbox(id int64, jobID string) error {
 // Telegram to reach the answer it already had. It now settles as skipped on the
 // first attempt.
 func (m *Manager) RetryReactionInbox(id int64, attempts int, cause error) error {
-	now := time.Now().UTC()
-	if IsNothingToDo(cause) {
-		// The event was answered: nothing in this message matches the filter, so
-		// there is nothing to download. Settling it as skipped keeps it out of
-		// the queue the Bot lists while still recording that the reaction was
-		// seen - and a later reaction on the same message reopens it, which is
-		// what makes the recorded answer revisable rather than final.
-		if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'skipped', error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-		applog.Info("reaction", "reaction_event_skipped", "inbox_id", id, "attempts", attempts, "reason", cause.Error())
-		return nil
-	}
-	if permanentInboxError(cause) {
-		if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = 'failed', attempts = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, inboxAttemptLimit, cause.Error(), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-		applog.Error("reaction", "reaction_event_rejected", "inbox_id", id, "attempts", attempts, "error", cause.Error())
-		return nil
-	}
-	status := "pending"
-	if attempts >= inboxFastAttempts {
-		status = "failed"
-	}
-	delay := time.Duration(1<<min(attempts, 6)) * time.Second
-	if _, err := m.db.Exec(`UPDATE reaction_inbox SET status = ?, error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?`, status, cause.Error(), now.Add(delay).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-		return err
-	}
-	if status == "failed" {
-		applog.Error("reaction", "reaction_event_gave_up", "inbox_id", id, "attempts", attempts, "error", cause.Error())
-	}
-	return nil
+	return m.retryInboxEvent(reactionInbox, id, attempts, cause)
 }
 
 func min(a, b int) int {
