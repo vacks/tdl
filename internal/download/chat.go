@@ -14,7 +14,6 @@ import (
 	"time"
 
 	gotd "github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	transfer "github.com/vacks/tdl/internal/download/transfer"
 	"github.com/vacks/tdl/internal/tmedia"
@@ -1128,7 +1127,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		if peer == nil {
 			return errors.New("会话下载文件缺少 Telegram 来源会话")
 		}
-		stats, runErr := transfer.Run(runCtx, transfer.Deps{Pool: pool, KV: kvd, AccountID: target.AccountID}, transfer.Options{
+		stats, runErr := transfer.Run(runCtx, transfer.Deps{Pool: pool, KV: kvd, Peers: m.accounts.Peers(target.AccountID, client.API(), kvd), AccountID: target.AccountID}, transfer.Options{
 			Dir:      tmpDir,
 			Peer:     peer,
 			Messages: ids,
@@ -2018,7 +2017,7 @@ func (m *Manager) resolveChatDiscussionLink(ctx context.Context, target storedCh
 			peer = &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
 			return nil
 		}
-		resolved, resolveErr := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API()).ResolvePeer(ctx, &tg.PeerChannel{ChannelID: linkedID})
+		resolved, resolveErr := m.accounts.Peers(target.AccountID, client.API(), kvd).ResolvePeer(ctx, &tg.PeerChannel{ChannelID: linkedID})
 		if resolveErr != nil {
 			// The key is known even though the peer is not; the next pass records
 			// it with the peer and this request is not repeated per message.

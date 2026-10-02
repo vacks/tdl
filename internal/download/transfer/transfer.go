@@ -48,6 +48,15 @@ type Deps struct {
 	Pool Pool
 	// KV backs the peer cache, so a dialog resolved once is not resolved again.
 	KV kv.Storage
+	// Peers is the account's peer manager, when the caller has one.
+	//
+	// Supply it. The dialog is resolved once per batch, and a manager built here
+	// would resolve it again - a new manager knows nothing, and gotd's persisted
+	// index is only consulted for an access hash, not for an entity another
+	// manager already read. The request tally showed exactly that: the second
+	// channels.getChannels of a single-file link download. Nil builds a private
+	// manager, which is correct and pays that one request.
+	Peers *peers.Manager
 	// AccountID names the account in logs. It carries no authority: the pool and
 	// the storage handed in here are already that account's.
 	AccountID string
@@ -162,12 +171,17 @@ func Run(ctx context.Context, deps Deps, opts Options) (Stats, error) {
 		source = newBatchSource(deps.Pool, opts.Peer, opts.Messages)
 	}
 
+	manager := deps.Peers
+	if manager == nil {
+		manager = peers.Options{Storage: kv.NewPeers(deps.KV)}.Build(deps.Pool.Default(ctx))
+	}
+
 	engine := &engine{
 		deps: deps,
 		opts: opts,
 		iter: &iterator{
 			source:  source,
-			manager: peers.Options{Storage: kv.NewPeers(deps.KV)}.Build(deps.Pool.Default(ctx)),
+			manager: manager,
 			peer:    opts.Peer,
 			ids:     opts.Messages,
 			delay:   opts.Delay,

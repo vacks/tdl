@@ -346,6 +346,7 @@ type Manager struct {
 	// into a dead connection.
 	poolMu sync.Mutex
 	pools  map[string]*accountPool
+	peers  map[string]*accountPeers
 }
 
 type accountPool struct {
@@ -383,18 +384,64 @@ func (m *Manager) TransferPool(accountID string, client *gotd.Client, size int) 
 	return pool
 }
 
-// closeTransferPool releases an account's pool. It is called wherever the
-// account stops having a session, because the pool's connections are built on
+// releaseAccountConnections drops an account's pool and its peer manager. It is
+// called wherever the account stops having a session, because both are built on
 // that session's authorization and are useless without it.
-func (m *Manager) closeTransferPool(accountID string) {
+func (m *Manager) releaseAccountConnections(accountID string) {
+	m.poolMu.Lock()
+	if existing, ok := m.pools[accountID]; ok {
+		delete(m.pools, accountID)
+		_ = existing.pool.Close()
+	}
+	delete(m.peers, accountID)
+	m.poolMu.Unlock()
+}
+
+// Peers returns the account's peer manager.
+//
+// One per account, deliberately, and built with a real cache.
+//
+// Both halves are needed, and the cache is the half that is easy to miss:
+// peers.Options with no Cache gets peers.NoopCache, whose Find* methods report
+// every lookup as a miss. A manager built that way asks Telegram for every peer
+// it touches, every time - not once per manager, once per lookup - because
+// getChannel finds nothing in the cache and falls through to
+// channels.getChannels. The persisted index does not save it either: the
+// manager reads that only to find an access hash for a lookup by id, and a peer
+// another manager resolved is not a lookup it trusts.
+//
+// The measured cost was a link submission resolving its channel and the
+// download that followed resolving it again, on a request tally of a
+// single-file link: two channels.getChannels. The same shape appears in six
+// other places, and every one of them is now free after the first per process.
+//
+// It is safe to share: gotd's manager is built for concurrent use, and it
+// collapses two callers asking for the same peer into one request.
+//
+// The client is the raw API of the session the manager is built on. A session
+// that reconnects is a different client, and its manager is replaced with it,
+// because the cache holds entities read over the connection it filled and
+// nothing would invalidate them.
+func (m *Manager) Peers(accountID string, api *tg.Client, store kv.Storage) *peers.Manager {
 	m.poolMu.Lock()
 	defer m.poolMu.Unlock()
-	existing, ok := m.pools[accountID]
-	if !ok {
-		return
+	if existing, ok := m.peers[accountID]; ok && existing.api == api {
+		return existing.manager
 	}
-	delete(m.pools, accountID)
-	_ = existing.pool.Close()
+	if m.peers == nil {
+		m.peers = make(map[string]*accountPeers)
+	}
+	manager := peers.Options{
+		Storage: kv.NewPeers(store),
+		Cache:   &peers.InmemoryCache{},
+	}.Build(api)
+	m.peers[accountID] = &accountPeers{api: api, manager: manager}
+	return manager
+}
+
+type accountPeers struct {
+	api     *tg.Client
+	manager *peers.Manager
 }
 
 // RPCGate is the account-wide metadata gate.
@@ -925,7 +972,7 @@ func (m *Manager) detachSession(id string) *accountSession {
 	delete(m.sessions, id)
 	m.sessionsMu.Unlock()
 	if session != nil {
-		m.closeTransferPool(id)
+		m.releaseAccountConnections(id)
 	}
 	return session
 }
@@ -964,7 +1011,7 @@ func (m *Manager) forgetSession(session *accountSession) {
 	}
 	m.sessionsMu.Unlock()
 	if forgotten {
-		m.closeTransferPool(session.accountID)
+		m.releaseAccountConnections(session.accountID)
 	}
 }
 
@@ -1129,7 +1176,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 		// supply the InputPeer. It is also the only source of a name here; when
 		// it fails the name stays empty rather than becoming a dialog type label.
 		name := ""
-		manager := peers.Options{Storage: kv.NewPeers(store)}.Build(client.API())
+		manager := m.Peers(accountID, client.API(), store)
 		// Bounded for the same reason reactionEvent's lookup is: this runs inside
 		// the update dispatcher, and a request that waits here holds up every
 		// update behind it.
@@ -1306,7 +1353,7 @@ func (m *Manager) reactionEvent(ctx context.Context, accountID string, entities 
 	// label would attribute unrelated dialogs to the same download directory.
 	dialogName := ""
 	sourceURL := reactionFallbackURL(inputPeer, accountID, messageID)
-	manager := peers.Options{Storage: kv.NewPeers(m.accountStore(accountID))}.Build(api)
+	manager := m.Peers(accountID, api, m.accountStore(accountID))
 	// Resolve through the InputPeer extracted from this update: ExtractPeer only
 	// succeeds when the entity is present, and it copies that entity's access
 	// hash into the InputPeer. ResolvePeer(rawPeer) would discard the hash and

@@ -464,7 +464,7 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 	intent.URL = strings.TrimSpace(intent.URL)
 	var created ChatJob
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
-		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
+		manager := m.accounts.Peers(accountID, client.API(), kvd)
 		peer, startID, err := resolveChatTarget(ctx, manager, intent.URL)
 		if err != nil {
 			return err

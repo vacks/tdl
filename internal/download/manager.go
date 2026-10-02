@@ -1851,7 +1851,7 @@ func (m *Manager) run(job Job, sources []source) {
 				seenMessages[item.MessageID] = struct{}{}
 				messageIDs = append(messageIDs, item.MessageID)
 			}
-			stats, err := transfer.Run(ctx, transfer.Deps{Pool: pool, KV: kvd, AccountID: job.AccountID}, transfer.Options{
+			stats, err := transfer.Run(ctx, transfer.Deps{Pool: pool, KV: kvd, Peers: m.accounts.Peers(job.AccountID, client.API(), kvd), AccountID: job.AccountID}, transfer.Options{
 				Dir:      tmpDir,
 				Peer:     peer,
 				Messages: messageIDs,
@@ -2983,7 +2983,7 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
-		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
+		manager := m.accounts.Peers(accountID, client.API(), kvd)
 		peer, messageID, err := tmsg.ParseMessageLink(ctx, manager, sourceURL)
 		if err != nil {
 			return err
@@ -3137,7 +3137,7 @@ func (m *Manager) resolveSourcesFor(ctx context.Context, target resolveTarget) (
 		dialogType, dialogKey, resolvedDialogID := dialogIdentity(target.Peer, target.AccountID)
 		// Direct peers originate from reactions and listener updates. Resolve them
 		// once here so a supergroup does not inherit the generic channel label.
-		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
+		manager := m.accounts.Peers(target.AccountID, client.API(), kvd)
 		var resolved peers.Peer
 		dialogName := target.DialogName
 		if peer, resolveErr := manager.FromInputPeer(ctx, target.Peer); resolveErr == nil {
