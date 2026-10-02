@@ -3064,46 +3064,85 @@ func linkAsksForSingleMessage(rawURL string) bool {
 }
 
 func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string) ([]source, error) {
-	return m.resolvePeerWithReplies(ctx, accountID, inputPeer, dialogID, messageID, dialogName, m.settings.Get().Download.IncludeReplies, false, "")
+	return m.resolveSourcesFor(ctx, resolveTarget{
+		AccountID:      accountID,
+		Peer:           inputPeer,
+		DialogID:       dialogID,
+		MessageID:      messageID,
+		DialogName:     dialogName,
+		IncludeReplies: m.settings.Get().Download.IncludeReplies,
+	})
 }
 
-// resolvePeerWithReplies is the shared listener/reaction resolver. Chat
-// download tasks pass their persisted configuration snapshot so later global
-// setting changes cannot alter an already-created task.
+// resolveTarget names the message to turn into downloadable items.
 //
-// learnRoot is set only by the listener path, which resolves a new post even
-// with an empty comment section in order to record its discussion root.
-//
-// chatJobID is the session task a resolved discussion group should be recorded
-// on, or empty for a plain message task that has no session task to record it
-// on. See relatedSources.
-func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool, chatJobID string) ([]source, error) {
+// It is one struct rather than nine positional arguments because the two
+// callers know different things, and the difference is the point: a listener
+// holds the message its update carried, and a reaction holds only an id. See
+// the Message field.
+type resolveTarget struct {
+	AccountID  string
+	Peer       tg.InputPeerClass
+	DialogID   int64
+	MessageID  int
+	DialogName string
+	// Message is the message the caller already has. When it is set, nothing is
+	// read: Telegram sent the whole message in the update, and asking for it
+	// back was one history request per received message - the largest avoidable
+	// source of requests this application had. Nil means read it by id.
+	//
+	// Using it is safe because only the message's identity and its media's name
+	// and size are taken here. The file reference, which is the part that
+	// expires, is read again at transfer time.
+	Message *tg.Message
+	// IncludeReplies expands the comment section.
+	IncludeReplies bool
+	// LearnRoot records the discussion root of a post that has no comments yet,
+	// so the first comment can be attributed without a second lookup. Set only
+	// by the listener.
+	LearnRoot bool
+	// ChatJobID is the session task a resolved discussion group is recorded on,
+	// or empty for a message task that has no session task to record it on. See
+	// relatedSources.
+	ChatJobID string
+}
+
+// resolveSourcesFor is the shared listener/reaction resolver. Chat download
+// tasks pass their persisted configuration snapshot so later global setting
+// changes cannot alter an already-created task.
+func (m *Manager) resolveSourcesFor(ctx context.Context, target resolveTarget) ([]source, error) {
 	var result []source
-	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
-		message, err := tmsg.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
-		if err != nil {
-			m.recordTelegramRPCError(accountID, err)
-			return err
+	err := m.accounts.Run(ctx, target.AccountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
+		message := target.Message
+		if message == nil {
+			read, err := tmsg.GetSingleMessage(ctx, client.API(), target.Peer, target.MessageID)
+			if err != nil {
+				m.recordTelegramRPCError(target.AccountID, err)
+				return err
+			}
+			message = read
 		}
 		messages := []*tg.Message{message}
 		groupedID := int64(0)
 		if group, ok := message.GetGroupedID(); ok {
 			groupedID = group
-			messages, err = tmsg.GetGroupedMessages(ctx, client.API(), inputPeer, message)
+			expanded, err := tmsg.GetGroupedMessages(ctx, client.API(), target.Peer, message)
 			if err != nil {
-				m.recordTelegramRPCError(accountID, err)
+				m.recordTelegramRPCError(target.AccountID, err)
 				return err
 			}
+			messages = expanded
 		}
 		messageText := groupDisplayText(messages)
-		dialogType, dialogKey, resolvedDialogID := dialogIdentity(inputPeer, accountID)
+		dialogType, dialogKey, resolvedDialogID := dialogIdentity(target.Peer, target.AccountID)
 		// Direct peers originate from reactions and listener updates. Resolve them
 		// once here so a supergroup does not inherit the generic channel label.
 		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
 		var resolved peers.Peer
-		if peer, resolveErr := manager.FromInputPeer(ctx, inputPeer); resolveErr == nil {
+		dialogName := target.DialogName
+		if peer, resolveErr := manager.FromInputPeer(ctx, target.Peer); resolveErr == nil {
 			resolved = peer
-			dialogType, dialogKey, resolvedDialogID = dialogIdentityForPeer(peer, accountID)
+			dialogType, dialogKey, resolvedDialogID = dialogIdentityForPeer(peer, target.AccountID)
 			// An event queued before its name could be resolved carries an empty
 			// name. Fill it from the authoritative peer here so the name is
 			// correct the first time it is written; never invent a substitute.
@@ -3111,8 +3150,8 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 				dialogName = peer.VisibleName()
 			}
 		}
-		if resolvedDialogID == 0 && dialogID != 0 {
-			resolvedDialogID = dialogID
+		if resolvedDialogID == 0 && target.DialogID != 0 {
+			resolvedDialogID = target.DialogID
 		}
 		for _, msg := range messages {
 			media, ok := tmedia.GetMedia(msg)
@@ -3123,14 +3162,14 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		}
 		originID := firstMessageID(messages, message.ID)
 		result = setOrigin(result, dialogName, originID, false)
-		result = setSourcePeer(result, inputPeer)
-		if includeReplies {
-			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, inputPeer, dialogName, messages, message.ID, originID, eagerDiscussionRoot(learnRoot, broadcastOf(resolved)), chatJobID)
+		result = setSourcePeer(result, target.Peer)
+		if target.IncludeReplies {
+			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.Peer, dialogName, messages, message.ID, originID, eagerDiscussionRoot(target.LearnRoot, broadcastOf(resolved)), target.ChatJobID)
 			if relatedErr != nil {
 				if telegramWaitDuration(relatedErr) > 0 {
 					return relatedErr
 				}
-				logRelatedWarning(accountID, message.ID, relatedErr)
+				logRelatedWarning(target.AccountID, message.ID, relatedErr)
 			} else {
 				result = append(result, related...)
 			}

@@ -95,6 +95,14 @@ type NewMessageEvent struct {
 	InputPeer        tg.InputPeerClass
 	ReplyToMessageID int
 	ReplyToTopID     int
+	// Message is the message the update carried.
+	//
+	// Telegram sends the whole thing - media, entities and all - and the
+	// consumer used to keep only its id and then ask for it back: one history
+	// read per received message, to learn what had just been handed over. It is
+	// nil only for an event rebuilt from a stored row, where there is no update
+	// to carry it.
+	Message *tg.Message
 }
 
 // NewMessageEventFor builds the event the dispatcher would have produced for a
@@ -115,6 +123,7 @@ func NewMessageEventFor(accountID, dialogKey, dialogName string, dialogID int64,
 		DialogID:         dialogID,
 		DialogName:       dialogName,
 		InputPeer:        peer,
+		Message:          message,
 		ReplyToMessageID: replyMessageID(message),
 		ReplyToTopID:     replyTopID(message),
 	}

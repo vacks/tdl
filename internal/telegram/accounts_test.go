@@ -487,3 +487,32 @@ func TestPendingLoginIgnoresAccountsWithNoLoginRunning(t *testing.T) {
 		t.Fatal("an account with no login job was reported as a login in flight, which would block every new login")
 	}
 }
+
+// Telegram sends the whole message in the update that announces it. Keeping
+// only its id and asking for the message back is one history request per
+// received message - the largest avoidable source of requests this application
+// had, and the reason a busy listener could not be paced.
+//
+// The field is asserted here rather than the read that consumes it: the
+// consumer needs a live account, and what can be pinned without one is that the
+// message survives the trip from the dispatcher to the event.
+func TestNewMessageEventCarriesTheMessageTheUpdateDelivered(t *testing.T) {
+	message := &tg.Message{ID: 4242, Message: "a post"}
+	peer := &tg.InputPeerChannel{ChannelID: 5, AccessHash: 9}
+
+	event := NewMessageEventFor("account-1", "channel:5", "a channel", 5, message, peer)
+	if event.Message != message {
+		t.Fatal("the event dropped the message, so its consumer has to read it back from Telegram")
+	}
+	if event.MessageID != message.ID {
+		t.Fatalf("the event names message %d but carried %d", event.MessageID, message.ID)
+	}
+
+	// A synthesised event stands in for an update the application did not
+	// receive - a message recovered from a history page - and is the one case
+	// where there is nothing to carry. It must still be usable.
+	empty := NewMessageEventFor("account-1", "channel:5", "a channel", 5, nil, peer)
+	if empty.Message != nil || empty.MessageID != 0 {
+		t.Fatalf("an event built without a message invented one: %+v", empty)
+	}
+}

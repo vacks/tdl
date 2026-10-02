@@ -2623,7 +2623,21 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 			// A listener learns the discussion root of a newly received post
 			// even when it has no comments yet, so the first comment can be
 			// attributed without a second lookup.
-			resolved[includeReplies], resolvedErr[includeReplies] = m.resolvePeerWithReplies(context.Background(), event.AccountID, event.InputPeer, event.DialogID, event.MessageID, target.DialogName, includeReplies, true, id)
+			// event.Message is the message the update carried, so this resolve
+			// reads nothing: the post that just arrived is what it names. Only a
+			// rebuilt event - one replayed from the durable inbox, which has no
+			// update behind it - leaves it nil and pays for a read.
+			resolved[includeReplies], resolvedErr[includeReplies] = m.resolveSourcesFor(context.Background(), resolveTarget{
+				AccountID:      event.AccountID,
+				Peer:           event.InputPeer,
+				DialogID:       event.DialogID,
+				MessageID:      event.MessageID,
+				DialogName:     target.DialogName,
+				Message:        event.Message,
+				IncludeReplies: includeReplies,
+				LearnRoot:      true,
+				ChatJobID:      id,
+			})
 		}
 		if resolveErr := resolvedErr[includeReplies]; resolveErr != nil {
 			// A resolution that did not complete is not the same answer as "this
