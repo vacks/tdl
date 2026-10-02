@@ -837,7 +837,18 @@ func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
 			}
 			continue
 		}
-		if status != "" {
+		// Only an active claim keeps this item waiting. "claimed" means another
+		// task holds the media right now, and it will either publish it - a later
+		// round adopts the result - or release it, and the item moves then.
+		//
+		// A completed row whose file is gone is the opposite of that: its owner
+		// is finished, and nothing else will ever publish it. Skipping it left
+		// the item in "waiting" for good and pinned its task in 下载中, with no
+		// error and nothing for the user to act on. That is what deleting a
+		// downloaded file by hand produced - the ownership row still said
+		// completed, the file was gone, and this pass refused the row on every
+		// round. Falling through is what lets the claim below retire it.
+		if status != "" && status != "completed" {
 			continue
 		}
 		var messageStatus, messagePath string
@@ -850,10 +861,17 @@ func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
 						m.touch()
 					}
 				}
+				continue
 			}
 			// Only a message task that is still working on this file keeps it.
 			// Its own status is the question here, and the states listed are the
-			// ones that mean work is in progress or already finished.
+			// ones that mean work is in progress.
+			//
+			// A completed message item is not among them. Its file is the one the
+			// branch above just tried to adopt, so reaching here with that status
+			// means the file it published is gone - the same stale row as the
+			// ownership one, seen from the other table, and it has to fall
+			// through for the same reason.
 			//
 			// Paused is deliberately not among them. A paused task has already
 			// released its claim in downloaded_media for exactly this reason, so
@@ -870,7 +888,7 @@ func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
 			// - if the transfer already finished - adopts the published file
 			// instead of fetching it again. A resumed message task therefore still
 			// completes, it just finds the file already done.
-			if messageStatus == "queued" || messageStatus == "running" || messageStatus == "downloaded" || messageStatus == "completed" {
+			if messageStatus == "queued" || messageStatus == "running" || messageStatus == "downloaded" {
 				continue
 			}
 		}
@@ -883,15 +901,24 @@ func (m *Manager) reconcileChatClaims(cursor chatClaimCursor) chatClaimCursor {
 		if !chatRunnable(parentStatus) {
 			continue
 		}
-		result, claimErr := m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, key, messageID, chatID, time.Now().UTC().Format(time.RFC3339Nano))
-		if claimErr == nil {
-			if changed, _ := result.RowsAffected(); changed == 1 {
-				if result, err := m.db.Exec(`UPDATE chat_download_items SET status = 'queued', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, chatID, key, messageID); err == nil {
-					if updated, _ := result.RowsAffected(); updated == 1 {
-						m.touch()
-						m.signalChat()
-					}
-				}
+		// The claim goes through claimMediaOn rather than a bare INSERT because
+		// a row that is already there has to be judged, not inserted around. A
+		// bare INSERT ... ON CONFLICT DO NOTHING reports no rows affected and
+		// leaves a stale completed row exactly where it was, so the item it
+		// blocks stays blocked however often this pass runs. claimMediaOn is the
+		// single copy of the claim rule, and its guarded replace is what retires
+		// that row.
+		state, _, retry, claimErr := claimMediaOn(m.db, "chat", chatID, source{Item: Item{DialogKey: key, MessageID: messageID}})
+		if claimErr != nil || retry || state != "queued" {
+			// "completed" here means someone published the file between the read
+			// above and the claim, and the next round adopts it. A retry means the
+			// row moved while it was being read, which the next round also settles.
+			continue
+		}
+		if result, err := m.db.Exec(`UPDATE chat_download_items SET status = 'queued', error = '' WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'waiting'`, chatID, key, messageID); err == nil {
+			if updated, _ := result.RowsAffected(); updated == 1 {
+				m.touch()
+				m.signalChat()
 			}
 		}
 	}

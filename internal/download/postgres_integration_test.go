@@ -2428,6 +2428,108 @@ func TestPostgresChatReconcileRefusesToClaimForANonRunnableTask(t *testing.T) {
 	}
 }
 
+// A published file that the user deleted by hand leaves an ownership row that
+// still says completed. Nothing will ever publish that file again, so an item
+// waiting behind the row could only stay in "waiting" forever while its task
+// stayed pinned in 下载中 — with no error, no timeout and nothing to act on.
+//
+// The row has to be retired rather than respected, and retiring it takes two
+// things that were each missing: the pass must let a completed-but-fileless row
+// fall through to the claim, and the claim must be able to replace the row it
+// finds. Both are exercised here, along with the two neighbours that must keep
+// their old behaviour — a completed row whose file is still there is adopted,
+// and a live claim is still waited on.
+func TestPostgresChatReconcileRetiresAStaleCompletedClaim(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), progress: newProgressStore(), chatWake: make(chan struct{}, 1)}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	seedChatJobWithStatus(t, db, "chat-stale", "channel:chatstale", ChatStatusDownloading)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	missing := filepath.Join(t.TempDir(), "deleted-by-hand.bin")
+	present := filepath.Join(t.TempDir(), "still-here.bin")
+	if err := os.WriteFile(present, []byte("published"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale row a deleted file leaves behind, owned by a chat task that has
+	// since finished.
+	seedWaitingChatItem(t, db, "chat-stale", "channel:chatstale", 41, "")
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES ('channel:chatstale', 41, ?, 'completed', 'chat', 'finished-chat', ?)`, missing, now); err != nil {
+		t.Fatal(err)
+	}
+	// The same staleness seen from the message table: a message task published
+	// this file and its own item row says completed, but the file is gone. That
+	// row must not keep the session item waiting either.
+	seedWaitingChatItem(t, db, "chat-stale", "channel:chatstale", 42, "")
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES ('channel:chatstale', 42, ?, 'completed', 'message', 'finished-message', ?)`, missing, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, status, created_at, updated_at) VALUES ('finished-message','tg://stale','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, final_path) VALUES ('finished-message','channel','channel:chatstale',1,42,'stale.bin','completed',?)`, missing); err != nil {
+		t.Fatal(err)
+	}
+	// Adopted, not re-downloaded: the file is there.
+	seedWaitingChatItem(t, db, "chat-stale", "channel:chatstale", 43, "")
+	if _, err := db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES ('channel:chatstale', 43, ?, 'completed', 'chat', 'finished-chat', ?)`, present, now); err != nil {
+		t.Fatal(err)
+	}
+	// Held right now by another task: waiting is the correct answer.
+	seedWaitingChatItem(t, db, "chat-stale", "channel:chatstale", 44, "live-chat")
+
+	m.reconcileChatClaims(chatClaimCursor{})
+
+	states := map[int]string{}
+	rows, err := db.Query(`SELECT message_id, status FROM chat_download_items WHERE chat_job_id = 'chat-stale'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id int
+		var state string
+		if err := rows.Scan(&id, &state); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		states[id] = state
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int{41, 42} {
+		if states[id] != "queued" {
+			t.Fatalf("item %d is %q after the pass; a completed ownership row whose file is gone has to be retired so the item can be fetched again", id, states[id])
+		}
+	}
+	if states[43] != "completed" {
+		t.Fatalf("item 43 is %q; a completed row whose file is still on disk must be adopted, not re-downloaded", states[43])
+	}
+	if states[44] != "waiting" {
+		t.Fatalf("item 44 is %q; media another task holds right now must still be waited on", states[44])
+	}
+	var ownerKind, ownerID, ownerStatus string
+	if err := db.QueryRow(`SELECT owner_kind, owner_id, status FROM downloaded_media WHERE dialog_key = 'channel:chatstale' AND message_id = 41`).Scan(&ownerKind, &ownerID, &ownerStatus); err != nil {
+		t.Fatal(err)
+	}
+	if ownerKind != "chat" || ownerID != "chat-stale" || ownerStatus != "claimed" {
+		t.Fatalf("the stale row is now %s/%s/%s; the task that can transfer it must hold the claim", ownerKind, ownerID, ownerStatus)
+	}
+}
+
 // Pausing a message task must release the media it holds, exactly as PauseChat
 // does. A parked task transfers nothing, and a claim it keeps is released by
 // nothing else, so every other task wanting that media waits until the user
