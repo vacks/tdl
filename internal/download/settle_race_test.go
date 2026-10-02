@@ -22,7 +22,7 @@ func settleRaceManager(t *testing.T, status string) *Manager {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), chatWatched: map[string]map[string]struct{}{}}
+	m := &Manager{db: db, events: newEventBus(), chatWatched: map[string]map[string]struct{}{}, progress: newProgressStore()}
 	if err := m.migratePostgres(); err != nil {
 		t.Fatal(err)
 	}

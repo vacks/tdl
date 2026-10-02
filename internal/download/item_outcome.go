@@ -89,3 +89,19 @@ func transferOutcomeMessage(err error, outcome transferOutcome) string {
 		return fmt.Sprintf("下载中断，将自动重试: %v", err)
 	}
 }
+
+// transferOutcomeDetail is the cause alone, with no verdict around it.
+//
+// transferOutcomeMessage wraps a retryable cause in "下载中断，将自动重试"; the
+// sentence that reports giving up on that retry needs the cause, not the
+// promise, or the row reads "已停止自动重试: 将自动重试: …".
+func transferOutcomeDetail(err error, outcome transferOutcome) string {
+	switch {
+	case err == nil:
+		return "消息中已没有可下载的内容"
+	case errors.Is(err, tmsg.ErrMessageDeleted):
+		return "消息已删除"
+	default:
+		return err.Error()
+	}
+}

@@ -105,6 +105,14 @@ func (i *iterator) process(ctx context.Context) (ready bool, skip bool) {
 			i.report(id, tmsg.ErrMessageDeleted)
 			return false, true
 		}
+		// A batch the caller stopped did not refuse anything - the same rule the
+		// transfer workers follow. A read cancelled by a pause arrives here as a
+		// context error, and reporting it would give the caller a failure to
+		// write onto rows the pause is in the middle of settling.
+		if ctx.Err() != nil {
+			i.err = ctx.Err()
+			return false, false
+		}
 		// A read failure stops the batch, so every message after this one has no
 		// outcome to report. It is still reported for this one: without it the
 		// caller's row stays wherever the last callback left it, and the batch

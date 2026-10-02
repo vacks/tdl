@@ -38,7 +38,7 @@ func TestPostgresTransferOutcomesSettleBothTaskTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1)}
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), progress: newProgressStore()}
 	if err := m.migratePostgres(); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestPostgresARepeatedTransportFailureStopsAtTheBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1)}
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), progress: newProgressStore()}
 	if err := m.migratePostgres(); err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestPostgresATaskWithARetryIsNotSettledAsFinished(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1)}
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), progress: newProgressStore()}
 	if err := m.migratePostgres(); err != nil {
 		t.Fatal(err)
 	}
@@ -521,4 +521,81 @@ func TestPostgresPausingLeavesNoFileBehindOnEitherTable(t *testing.T) {
 	if held != 0 {
 		t.Fatalf("%d claims are still held by paused tasks; the release travels with the state change", held)
 	}
+}
+
+// A batch must not write over a control action that landed while it ran.
+//
+// A pause moves the task's files to paused and then cancels the running batch.
+// The batch, when it comes back, settles whatever the engine reported about it -
+// and a read cancelled by that very pause comes back as a failure. Writing that
+// failure onto the row the pause just settled undoes the pause for that file:
+// 恢复 looks for paused rows, and this one is no longer one of them, so the file
+// is not resumed and not retried. When its attempt budget happened to be spent,
+// the row was written as failed outright, and the pause had cost a file.
+func TestPostgresSettlingAFailureLeavesStoppedFilesAlone(t *testing.T) {
+	m := openChatItemTestManager(t, "settle-stopped-chat", ChatStatusDownloading, []chatTestItem{
+		{messageID: 71, status: "queued"},
+		{messageID: 72, status: "queued", attempts: maxStalledAttempts},
+	})
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('settle-stopped-job','tg://x','channel','channel:stopped2','test','account','queued',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int{71, 72} {
+		if _, err := m.db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status) VALUES ('settle-stopped-job','channel:stopped2',1,?,'f.bin','queued')`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := m.Pause("settle-stopped-job"); err != nil {
+		t.Fatalf("Pause(): %v", err)
+	}
+	if err := m.PauseChat("settle-stopped-chat"); err != nil {
+		t.Fatalf("PauseChat(): %v", err)
+	}
+
+	// The batch comes back with the failures the pause caused.
+	byMessage := map[int]source{
+		71: {Item: Item{DialogKey: "channel:stopped2", MessageID: 71}},
+		72: {Item: Item{DialogKey: "channel:stopped2", MessageID: 72}},
+	}
+	failures := planItemFailures([]transfer.FileOutcomeUpdate{
+		{MessageID: 71, Err: errors.New("context canceled")},
+		{MessageID: 72, Err: errors.New("context canceled")},
+	}, byMessage)
+
+	for _, table := range []struct {
+		t          itemTable
+		owner, key string
+	}{
+		{messageItems, "settle-stopped-job", "channel:stopped2"},
+		{chatItems, "settle-stopped-chat", "channel:items"},
+	} {
+		_, requeued, err := m.applyItemFailures(table.t, table.owner, planItemFailures([]transfer.FileOutcomeUpdate{
+			{MessageID: 71, Err: errors.New("context canceled")},
+			{MessageID: 72, Err: errors.New("context canceled")},
+		}, map[int]source{
+			71: {Item: Item{DialogKey: table.key, MessageID: 71}},
+			72: {Item: Item{DialogKey: table.key, MessageID: 72}},
+		}))
+		if err != nil {
+			t.Fatalf("%s: %v", table.t.items, err)
+		}
+		if requeued {
+			t.Errorf("%s: a settled failure reported work returned to the queue, but every row it "+
+				"could have touched was paused", table.t.items)
+		}
+		for _, id := range []int{71, 72} {
+			var status string
+			if err := m.db.QueryRow(`SELECT status FROM `+table.t.items+` WHERE `+table.t.owner+` = ? AND message_id = ?`, table.owner, id).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "paused" {
+				t.Errorf("%s: file %d is %q after a failed batch settled, want it left paused - "+
+					"恢复 asks for paused rows, so this file is now neither resumed nor retried",
+					table.t.items, id, status)
+			}
+		}
+	}
+	_ = failures
 }

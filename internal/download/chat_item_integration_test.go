@@ -19,7 +19,7 @@ func openChatItemTestManager(t *testing.T, jobID, status string, items []chatTes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1)}
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), reconcileWake: make(chan struct{}, 1), progress: newProgressStore()}
 	if err := m.migratePostgres(); err != nil {
 		t.Fatal(err)
 	}

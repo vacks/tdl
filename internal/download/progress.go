@@ -48,6 +48,11 @@ func newProgressStore() *progressStore {
 	return &progressStore{files: make(map[string]liveFileProgress), jobs: make(map[string]liveJobProgress)}
 }
 
+// jobSpeedIdleGap is how long a task may be quiet before its rate sample stops
+// describing it. It is the same window Aggregate uses to decide a task is no
+// longer transferring.
+const jobSpeedIdleGap = 3 * time.Second
+
 func progressKey(dialogKey string, messageID int) string {
 	return fmt.Sprintf("%s:%d", dialogKey, messageID)
 }
@@ -75,6 +80,11 @@ func (p *progressStore) Update(jobID string, item Item, update transfer.Progress
 	job := p.jobs[jobID]
 	if job.lastSampleAt.IsZero() {
 		job.lastSampleAt = now
+	} else if now.Sub(job.lastActivity) > jobSpeedIdleGap {
+		// A task that has been quiet starts a new window. The bytes counted
+		// before the gap are not what it is receiving now, and dividing them by
+		// the length of the gap reports a rate nobody is achieving.
+		job = liveJobProgress{lastSampleAt: now}
 	}
 	if delta := update.Downloaded - previousBytes; delta > 0 {
 		job.windowBytes += delta
@@ -117,6 +127,22 @@ func (p *progressStore) Snapshot() []FileProgress {
 }
 
 func (p *progressStore) ClearJob(jobID string) {
+	p.ClearJobFiles(jobID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.jobs, jobID)
+}
+
+// ClearJobFiles removes every live file of a task and leaves the task's own rate
+// sample alone.
+//
+// The two are cleared at different times, and conflating them is why a session
+// task's rate never accumulated: a session task runs in batches, and the end of
+// a batch is not the end of the task - but it was clearing the task's sample
+// with the files'. The sample is a one-second window, so a task that downloads
+// small files in short batches started a new window every time and reported a
+// rate that was mostly zero.
+func (p *progressStore) ClearJobFiles(jobID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for key, state := range p.files {
@@ -124,7 +150,6 @@ func (p *progressStore) ClearJob(jobID string) {
 			delete(p.files, key)
 		}
 	}
-	delete(p.jobs, jobID)
 }
 
 // ClearItem removes a finished file from the live set immediately. Its bytes

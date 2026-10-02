@@ -673,12 +673,21 @@ func adoptMessageTaskFiles(q querier, adopted map[mediaClaimKey]string, now stri
 	}
 	return forEachKeyChunk(keys, func(chunk []mediaClaimKey) error {
 		values := make([]string, 0, len(chunk))
-		args := make([]any, 0, len(chunk)*3)
+		// The timestamp goes first, because it is the select list's placeholder
+		// and the select list is written before the values list. Placeholders are
+		// numbered in the order they appear in the statement, not in the order
+		// the arguments were assembled.
+		args := []any{now}
 		for _, key := range chunk {
-			values = append(values, "(?,?,?)")
+			// message_id is cast for the reason tupleInList casts it: a values
+			// list has no column to give a bare parameter a type, so the server
+			// decides one for it, and it decides text. Without the cast the whole
+			// statement is refused, and the caller - the ingest transaction for a
+			// page of a channel - fails the scan rather than leaving one file
+			// unadopted.
+			values = append(values, "(?, ?::integer, ?)")
 			args = append(args, key.dialogKey, key.messageID, adopted[key])
 		}
-		args = append(args, now)
 		_, err := q.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
  SELECT v.dialog_key, v.message_id, v.final_path, 'completed', 'message', '', ? FROM (VALUES `+strings.Join(values, ",")+`) AS v(dialog_key, message_id, final_path)
  ON CONFLICT(dialog_key, message_id) DO NOTHING`, args...)
@@ -1122,7 +1131,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	// upstream transfer outside that action's reach.
 	ctx, release := m.beginChatExecution(id)
 	lock.Unlock()
-	defer func() { release(); m.progress.ClearJob(id) }()
+	defer func() { release(); m.progress.ClearJobFiles(id) }()
 	transferCtx, stopTransfer := context.WithCancel(ctx)
 	defer stopTransfer()
 	config := m.settings.Get()
@@ -1251,18 +1260,19 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		return runErr
 	})
 	publishWG.Wait()
-	if reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch)); reconcileErr != nil {
-		return false, fmt.Errorf("核对已移动文件: %w", reconcileErr)
-	}
-	// Settled before the batch decides it is over: a file that went back on the
-	// queue is work the task still has, and the remaining checks below all
-	// assume the rows they read are final.
+	// Settled first, and before anything that can return: it is the write that
+	// keeps a file from staying in "running" for ever, and a reconciliation
+	// that failed - a database blip, on a path that only exists to repair one -
+	// must not be what decides whether the batch's own failures are recorded.
 	outcomesMu.Lock()
 	batchOutcomes := outcomes
 	outcomesMu.Unlock()
 	_, requeued, settleErr := m.applyItemFailures(chatItems, id, planItemFailures(batchOutcomes, byMessage))
 	if settleErr != nil {
 		return false, fmt.Errorf("记录文件下载结果: %w", settleErr)
+	}
+	if reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch)); reconcileErr != nil {
+		return false, fmt.Errorf("核对已移动文件: %w", reconcileErr)
 	}
 	if requeued {
 		m.signalChat()
@@ -3503,7 +3513,7 @@ func (m *Manager) ResumeChat(id string) error {
 	// away from being given up on, so pressing 恢复 would hand back a file with
 	// no attempts left. Starting a task again is the person saying the earlier
 	// failures were circumstances, not the file.
-	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", chatItems.requeueStatement(true), nil, id); err != nil {
+	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", chatItems.requeueStatement(requeuePaused), nil, id); err != nil {
 		return err
 	}
 	m.signalChat()
@@ -3529,7 +3539,7 @@ func (m *Manager) RetryChat(id string) error {
 	// A file's attempts counter bounds the automatic stall retries. A click is a
 	// new budget - leaving the counter at the cap made the next stall fail the
 	// file immediately with "已停止自动重试", so asking for a retry did nothing.
-	if err := m.transitionChatItems(id, target.Status, next, "", chatItems.requeueStatement(false), nil, id); err != nil {
+	if err := m.transitionChatItems(id, target.Status, next, "", chatItems.requeueStatement(requeueUnfinished), nil, id); err != nil {
 		return err
 	}
 	m.signalChat()

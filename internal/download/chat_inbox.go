@@ -214,13 +214,20 @@ FROM chat_message_inbox WHERE status = 'pending' AND next_attempt_at::timestampt
 
 // inboxPeer rebuilds the peer an inbox event was admitted with.
 //
-// The session inbox's copy of this was the same function without the user case,
-// which it never produces: its rows are written from a listener's dialog, and
-// a dialog is a channel, a group or the account's own saved messages.
+// Every kind an event can be admitted with has to be here, and user is one of
+// them: a reaction on a message in a private chat arrives as an InputPeerUser,
+// and the reaction listener does not care which kind of dialog it came from. A
+// peer this cannot build is not a smaller peer - the claim that reads the row
+// refuses it and rolls the transaction back, so the row stays pending for ever
+// and every event behind it waits. Merging this with the session inbox's copy,
+// which never produces a user, dropped the case silently: a missing branch is
+// not a compile error.
 func inboxPeer(kind string, id, hash int64) tg.InputPeerClass {
 	switch kind {
 	case "self":
 		return &tg.InputPeerSelf{}
+	case "user":
+		return &tg.InputPeerUser{UserID: id, AccessHash: hash}
 	case "chat":
 		return &tg.InputPeerChat{ChatID: id}
 	case "channel":

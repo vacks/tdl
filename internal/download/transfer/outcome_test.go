@@ -126,3 +126,45 @@ func TestRunReportsNothingForATransferTheCallerStopped(t *testing.T) {
 		t.Fatalf("a stopped batch reported %d outcomes: %+v", len(outcomes), outcomes)
 	}
 }
+
+// cancellingSource drops the batch's context and then fails the read, which is
+// what a pause does to a read that is already in flight.
+type cancellingSource struct{ cancel context.CancelFunc }
+
+func (s *cancellingSource) Message(_ context.Context, _ int) (*tg.Message, error) {
+	s.cancel()
+	return nil, errors.New("read tcp 10.0.0.2:52418->149.154.167.51:443: read: connection reset by peer")
+}
+
+// A read the caller's own cancellation interrupted is not a message that failed.
+//
+// The guard on the transfer workers covers a file being fetched; this covers the
+// message being read for the file after it, which is the same pause arriving one
+// step earlier. Without it the pause produced a failure for a message nothing
+// was wrong with - and the caller, which is settling the rows that pause just
+// moved, wrote it onto them.
+func TestAReadCancelledByTheCallerIsNotAMessageThatFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	deps, _ := testDeps(newFakeAPI())
+	var outcomes []FileOutcomeUpdate
+	stats, _ := Run(ctx, deps, Options{
+		Dir:      t.TempDir(),
+		Peer:     testPeer,
+		Messages: []int{1, 2, 3},
+		Threads:  1,
+		Tasks:    1,
+		Source:   &cancellingSource{cancel: cancel},
+		OnFileOutcome: func(update FileOutcomeUpdate) {
+			outcomes = append(outcomes, update)
+		},
+	})
+
+	if len(outcomes) != 0 {
+		t.Fatalf("a batch the caller stopped reported %d outcomes: %+v", len(outcomes), outcomes)
+	}
+	if stats.Files != 0 {
+		t.Fatalf("a stopped batch reports %d files", stats.Files)
+	}
+}

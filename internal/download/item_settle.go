@@ -18,9 +18,13 @@ import (
 // itemFailure is one message of a batch that produced no file, turned into the
 // write its row needs.
 type itemFailure struct {
-	item    source
-	retry   bool
+	item  source
+	retry bool
+	// message is what the row says. detail is the reason on its own, for the
+	// sentence that reports giving up - composing it from message produced
+	// "已停止自动重试: 将自动重试: ...", which reads as two outcomes at once.
 	message string
+	detail  string
 }
 
 // planItemFailures turns the engine's per-message report into per-row decisions.
@@ -43,6 +47,7 @@ func planItemFailures(outcomes []transfer.FileOutcomeUpdate, byMessage map[int]s
 			item:    item,
 			retry:   kind == transferRetryable,
 			message: transferOutcomeMessage(outcome.Err, kind),
+			detail:  transferOutcomeDetail(outcome.Err, kind),
 		})
 	}
 	return planned
@@ -85,6 +90,16 @@ type itemTable struct {
 var (
 	messageItems = itemTable{items: "download_items", owner: "job_id", ownerKind: "message", emitsItemEvents: true}
 	chatItems    = itemTable{items: "chat_download_items", owner: "chat_job_id", ownerKind: "chat", scoped: true, releasesOnFailure: true}
+)
+
+// The scopes a requeue can ask for. They are named because the difference
+// between them is the difference between 恢复, 重试, and a batch settling a file
+// that failed - and the third must leave a control action's work alone.
+const (
+	// requeuePaused hands back what a pause took.
+	requeuePaused = "status = 'paused'"
+	// requeueUnfinished hands back everything that did not finish.
+	requeueUnfinished = "status != 'completed'"
 )
 
 // ownerPredicate names every file one task owns.
@@ -206,6 +221,13 @@ func (m *Manager) setItemState(t itemTable, ownerID string, item source, status,
 // is another request against a budget that is already the scarce thing. The
 // budget is the same one the stall and flood paths use, and it is read from the
 // row's own attempts column so all three share one counter.
+//
+// The rows it refuses are the whole of its safety. paused and cancelled are
+// excluded because a control action that landed while this batch was running
+// owns those rows: handing one of them back to the queue would undo the pause
+// for that file, and 恢复 - which asks for paused rows - would never look at it
+// again. When the attempts are spent the same statement writes "failed", which
+// is how a pause came to cost a file outright.
 func (t itemTable) retryStatement() string {
 	// RETURNING is how the caller learns which branch the CASE took. A row count
 	// cannot say it: the statement writes either way, and "was a row touched" is
@@ -218,20 +240,17 @@ SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'queued' END,
     started_at = '',
     finished_at = CASE WHEN attempts >= ? AND finished_at = '' THEN ? ELSE finished_at END
 WHERE %[2]s = ? AND dialog_key = ? AND message_id = ?
-  AND status NOT IN ('completed', 'downloaded')
+  AND status NOT IN ('completed', 'downloaded', 'paused', 'cancelled')
 RETURNING status`, t.items, t.owner)
 }
 
-// terminalStatement is the same write for a failure no attempt can clear.
-//
-// Completed and downloaded rows are excluded for the reason fail() excludes
-// them: a file that was published is not un-published by a report about a
-// different attempt at it.
+// terminalStatement is the same write for a failure no attempt can clear, and
+// it refuses the same rows for the same reasons - see retryStatement.
 func (t itemTable) terminalStatement() string {
 	return fmt.Sprintf(`UPDATE %[1]s
 SET status = 'failed', error = ?, finished_at = ?
 WHERE %[2]s = ? AND dialog_key = ? AND message_id = ?
-  AND status NOT IN ('completed', 'downloaded')`, t.items, t.owner)
+  AND status NOT IN ('completed', 'downloaded', 'paused', 'cancelled')`, t.items, t.owner)
 }
 
 // applyItemFailures writes back every file a batch could not deliver.
@@ -251,7 +270,7 @@ func (m *Manager) applyItemFailures(table itemTable, ownerID string, failures []
 			queryErr := m.db.QueryRow(table.retryStatement(),
 				maxStalledAttempts, // attempts >= ? -> the budget is spent
 				maxStalledAttempts, // attempts >= ? -> which of the two messages
-				fmt.Sprintf("下载中断，已停止自动重试: %s", failure.message),
+				fmt.Sprintf("下载中断，已停止自动重试: %s", failure.detail),
 				failure.message,
 				maxStalledAttempts, now,
 				ownerID, failure.item.DialogKey, failure.item.MessageID).Scan(&status)
@@ -273,6 +292,7 @@ func (m *Manager) applyItemFailures(table itemTable, ownerID string, failures []
 			return settled, requeued, execErr
 		}
 		settled++
+		m.progress.ClearItem(ownerID, failure.item.Item)
 	}
 	if settled > 0 {
 		m.touch()
@@ -381,17 +401,16 @@ WHERE %[2]s AND status IN ('queued', 'waiting', 'running', 'downloaded')`, t.ite
 
 // requeueStatement hands a task's files back to the queue.
 //
-// pausedOnly is the one place the two task kinds ask for different things, and
-// it is a decision rather than a difference in the tables: 恢复 gives back what
-// the pause took, while 重试 gives back everything that did not finish, because
-// the person asking for a retry is asking about the failures. Both reset the
-// attempt budget, for the same reason - leaving the counter at its cap made the
-// next stall give up on the file at once, so the click changed nothing.
-func (t itemTable) requeueStatement(pausedOnly bool) string {
-	scope := "status != 'completed'"
-	if pausedOnly {
-		scope = "status = 'paused'"
-	}
+// scope names which rows are handed back, and it is a parameter because the
+// callers genuinely ask different things: 恢复 gives back what a pause took,
+// 重试 gives back everything that did not finish because the person asking for a
+// retry is asking about the failures, and a settlement for a file the engine
+// could not deliver must not reach a row a control action has already settled -
+// handing a paused file back to the queue would undo the pause for that file,
+// and 恢复 would never look at it again. All of them reset the attempt budget,
+// for the same reason: leaving the counter at its cap made the next stall give
+// up on the file at once, so the click changed nothing.
+func (t itemTable) requeueStatement(scope string) string {
 	return fmt.Sprintf(`UPDATE %[1]s SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE %[2]s AND %[3]s`, t.items, t.ownerPredicate(), scope)
 }
 

@@ -7,82 +7,65 @@ import (
 	transfer "github.com/vacks/tdl/internal/download/transfer"
 )
 
-func TestProgressStoreTracksRateAndClearsOnlyRequestedJob(t *testing.T) {
-	store := newProgressStore()
-	item := Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 7}
-	started, completed := store.Update("job-a", item, transfer.ProgressUpdate{DialogID: 42, MessageID: 7, Downloaded: 100, Total: 1000})
-	if !started || completed {
-		t.Fatalf("initial Update() = started:%v completed:%v, want true:false", started, completed)
+// The task's rate sample outlives the batch; the files in it do not.
+//
+// A session task runs in batches, and the end of a batch is not the end of the
+// task. Clearing both together - which is what ClearJob did at the end of every
+// batch - meant the task's one-second rate window was thrown away and restarted
+// each time, so a task downloading small files in short batches reported a rate
+// that was mostly zero and often never produced one at all.
+func TestAChatTaskKeepsItsRateAcrossBatches(t *testing.T) {
+	p := newProgressStore()
+	item := Item{DialogType: "channel", DialogKey: "channel:1", DialogID: 1, MessageID: 7}
+
+	// One batch's worth of progress, over enough time for the window to close.
+	p.Update("chat-1", item, transfer.ProgressUpdate{DialogID: 1, MessageID: 7, Downloaded: 0, Total: 1000})
+	time.Sleep(1100 * time.Millisecond)
+	p.Update("chat-1", item, transfer.ProgressUpdate{DialogID: 1, MessageID: 7, Downloaded: 1000, Total: 1000})
+	_, before := p.Aggregate("chat-1")
+	if before <= 0 {
+		t.Fatalf("the task reported no rate while it was transferring: %v", before)
 	}
 
-	// Simulate a later upstream callback without making this unit test sleep.
-	key := progressKey(item.DialogKey, item.MessageID)
-	store.mu.Lock()
-	state := store.files[key]
-	state.lastMeasuredAt = time.Now().Add(-2 * time.Second)
-	state.lastMeasuredByte = 100
-	store.files[key] = state
-	store.mu.Unlock()
-	started, completed = store.Update("job-a", item, transfer.ProgressUpdate{DialogID: 42, MessageID: 7, Downloaded: 500, Total: 1000})
-	if started || completed {
-		t.Fatalf("later Update() = started:%v completed:%v, want false:false", started, completed)
+	// The batch ends. Its finished file goes; the task's rate stays.
+	p.ClearJobFiles("chat-1")
+	if files, _ := p.Aggregate("chat-1"); files != 0 {
+		t.Fatalf("%d files survived the end of their batch", files)
 	}
-	snapshot := store.Snapshot()
-	if len(snapshot) != 1 || snapshot[0].Downloaded != 500 || snapshot[0].SpeedBPS <= 0 {
-		t.Fatalf("progress snapshot = %#v, want updated bytes and positive rate", snapshot)
+	if _, after := p.Aggregate("chat-1"); after != before {
+		t.Fatalf("the task's rate was thrown away at the end of a batch: %v became %v", before, after)
 	}
 
-	other := Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 8}
-	store.Update("job-b", other, transfer.ProgressUpdate{DialogID: 42, MessageID: 8, Downloaded: 1, Total: 1, Completed: true})
-	store.ClearJob("job-a")
-	snapshot = store.Snapshot()
-	if len(snapshot) != 1 || snapshot[0].MessageID != 8 {
-		t.Fatalf("ClearJob removed wrong progress entries: %#v", snapshot)
+	// The task itself ending does clear it.
+	p.ClearJob("chat-1")
+	if _, after := p.Aggregate("chat-1"); after != 0 {
+		t.Fatalf("a finished task still reports %v", after)
 	}
 }
 
-func TestProgressStoreRestartsMeasurementWhenBytesReset(t *testing.T) {
-	store := newProgressStore()
-	item := Item{DialogKey: "channel:42", MessageID: 7}
-	store.Update("job-a", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 900, Total: 1000})
-	started, _ := store.Update("job-a", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 10, Total: 1000})
-	if !started {
-		t.Fatal("progress reset was not treated as a new measurement")
-	}
-	progress := store.Snapshot()[0]
-	if progress.Downloaded != 10 || progress.SpeedBPS != 0 {
-		t.Fatalf("reset progress = %#v, want 10 bytes and no inherited speed", progress)
-	}
-}
+// A gap makes the previous window describe nothing.
+//
+// The sample is cumulative over the task, so a task that was quiet for ten
+// seconds and then sent a kilobyte would divide the bytes counted before the
+// gap by the length of the gap - a rate nothing is achieving, in either
+// direction.
+func TestATaskThatWasQuietStartsANewWindow(t *testing.T) {
+	p := newProgressStore()
+	item := Item{DialogKey: "channel:1", DialogID: 1, MessageID: 7}
+	p.Update("job-1", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 0, Total: 100})
+	time.Sleep(1100 * time.Millisecond)
+	p.Update("job-1", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 100000, Total: 200000})
 
-func TestProgressStoreUsesTaskWideRateAndDropsFinishedFiles(t *testing.T) {
-	store := newProgressStore()
-	first := Item{DialogKey: "channel:42", MessageID: 7}
-	second := Item{DialogKey: "channel:42", MessageID: 8}
-	store.Update("chat-a", first, transfer.ProgressUpdate{MessageID: 7, Downloaded: 100, Total: 100})
+	// Quiet for longer than the window Aggregate itself trusts.
+	time.Sleep(jobSpeedIdleGap + 100*time.Millisecond)
+	p.Update("job-1", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 150000, Total: 200000})
+	time.Sleep(1100 * time.Millisecond)
+	p.Update("job-1", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 160000, Total: 200000})
 
-	// Advance the shared sample window without sleeping. The second small file
-	// completes in its first callback, which previously had no per-file rate at
-	// all; the task-wide meter must still account for both files.
-	store.mu.Lock()
-	job := store.jobs["chat-a"]
-	job.lastSampleAt = time.Now().Add(-2 * time.Second)
-	store.jobs["chat-a"] = job
-	store.mu.Unlock()
-	store.Update("chat-a", second, transfer.ProgressUpdate{MessageID: 8, Downloaded: 100, Total: 100, Completed: true})
-
-	files, speed := store.Aggregate("chat-a")
-	if files != 2 || speed <= 0 {
-		t.Fatalf("aggregate files=%d speed=%f, want two live files and positive task rate", files, speed)
-	}
-	store.ClearItem("chat-a", first)
-	files, afterClear := store.Aggregate("chat-a")
-	if files != 1 || afterClear != speed {
-		t.Fatalf("after ClearItem files=%d speed=%f, want one live file and retained task sample=%f", files, afterClear, speed)
-	}
-	store.ClearJob("chat-a")
-	files, speed = store.Aggregate("chat-a")
-	if files != 0 || speed != 0 {
-		t.Fatalf("after ClearJob files=%d speed=%f, want zeroes", files, speed)
+	_, speed := p.Aggregate("job-1")
+	// 60000 bytes over ~1.1s. The previous window's 100000 bytes must not be in
+	// it: that would report about 145000/s.
+	if speed > 100000 {
+		t.Fatalf("the rate after a quiet gap is %v, which still counts bytes from before it", speed)
 	}
 }

@@ -1906,9 +1906,12 @@ func (m *Manager) run(job Job, sources []source) {
 					outcomesMu.Unlock()
 				},
 			})
-			if err != nil {
-				return err
-			}
+			// Settled before the batch's own error is looked at. A batch that
+			// gave up partway still has per-file news: a message it found
+			// deleted before it failed to read the next one is an answer about
+			// that message, and returning on the error first threw it away -
+			// after which the task-level sentence was written onto every
+			// unfinished row, including the one whose reason was already known.
 			outcomesMu.Lock()
 			batchOutcomes := outcomes
 			outcomesMu.Unlock()
@@ -1921,6 +1924,9 @@ func (m *Manager) run(job Job, sources []source) {
 				settled += settledHere
 				requeued = requeued || requeuedHere
 				requeuedMu.Unlock()
+			}
+			if err != nil {
+				return err
 			}
 			applog.Info("download", "batch_transferred", "job_id", job.ID, "requested", len(messageIDs),
 				"files", stats.Files, "deleted", stats.Deleted, "without_media", stats.Empty,
@@ -3466,7 +3472,7 @@ func (m *Manager) Resume(id string) error {
 	if m.status(id) != "paused" {
 		return errors.New("当前任务不能恢复")
 	}
-	if err := m.transitionItems(id, "paused", "queued", "", messageItems.requeueStatement(false), nil, id); err != nil {
+	if err := m.transitionItems(id, "paused", "queued", "", messageItems.requeueStatement(requeueUnfinished), nil, id); err != nil {
 		return fmt.Errorf("恢复任务: %w", err)
 	}
 	m.resetAttempts(id)
@@ -3492,7 +3498,7 @@ func (m *Manager) Retry(id string) error {
 	// which is the point, but a click is a new budget: leaving the counter at the
 	// cap made the next flood or stall fail the task on its first recurrence with
 	// "已停止自动重试", so the retry the user asked for changed nothing.
-	if err := m.transitionItems(id, status, "queued", "", messageItems.requeueStatement(false), nil, id); err != nil {
+	if err := m.transitionItems(id, status, "queued", "", messageItems.requeueStatement(requeueUnfinished), nil, id); err != nil {
 		return fmt.Errorf("重试任务: %w", err)
 	}
 	m.resetAttempts(id)
