@@ -84,6 +84,9 @@ type Service struct {
 	// downloadWake receives coalesced domain events. It shortens lifecycle
 	// updates without making the Bot poll the task table more aggressively.
 	downloadWake chan struct{}
+	// networkProbe is the last observed reachability of Telegram, kept by its
+	// own background loop and only read by /status.
+	networkProbe telegramProbe
 	// dispatch hands commands to workers and tracks which of them the stored
 	// offset may move past. See updateDispatch.
 	dispatch *updateDispatch
@@ -189,7 +192,56 @@ const (
 	// conversation's commands, so an unbounded retry there did not merely fail
 	// to make progress: it blocked every later acknowledge behind it.
 	cursorSaveAttempts = 5
+	// telegramProbeInterval is how often the path to Telegram is re-asked. It is
+	// short enough to catch a proxy that just went away and long enough not to
+	// add load to one that is struggling.
+	telegramProbeInterval = 30 * time.Second
+	// telegramProbeTimeout bounds one probe. The probe runs in the background,
+	// so this only decides how quickly the status card stops claiming a
+	// connection that is not there.
+	telegramProbeTimeout = 10 * time.Second
 )
+
+// telegramProbeURL is what the probe asks for. It is the Bot API root, which
+// answers without credentials - the reply is not read, because reaching it at
+// all is the whole answer: a completed TLS session with api.telegram.org over
+// the configured proxy means the path carried a handshake, a certificate and a
+// round trip, which is exactly what "the network works" means here. A captive
+// portal or an intercepting proxy fails that handshake rather than answering
+// for Telegram.
+const telegramProbeURL = "https://api.telegram.org/"
+
+// telegramProbe holds the last answer to "can this process reach Telegram right
+// now", asked through the same proxy everything else uses.
+//
+// It is deliberately independent of the accounts. A probe that reported the
+// session instead would say "not connected" for an expired account on a
+// perfectly good network - the opposite of what this line is for - and the
+// account record says nothing at all about a proxy that stopped forwarding,
+// which is the failure this exists to make visible. Nor is it a probe of the
+// Bot's own channel: a Bot that cannot answer is a Bot that cannot answer.
+type telegramProbe struct {
+	mu      sync.Mutex
+	status  string // "ok" or "failed"; empty until the first sample
+	latency time.Duration
+}
+
+func (p *telegramProbe) record(ok bool, latency time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ok {
+		p.status = "ok"
+	} else {
+		p.status = "failed"
+	}
+	p.latency = latency
+}
+
+func (p *telegramProbe) snapshot() (string, time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.status, p.latency
+}
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,11 +254,62 @@ func New(store *settings.Store, downloads *download.Manager, telegram *telegram.
 	applog.Info("bot", "service_started")
 	events, unsubscribe := downloads.SubscribeEvents()
 	s.unsubscribe = unsubscribe
-	s.wg.Add(3)
+	s.wg.Add(4)
 	go func() { defer s.wg.Done(); s.watchDownloadEvents(events) }()
 	go func() { defer s.wg.Done(); s.loop() }()
 	go func() { defer s.wg.Done(); s.refreshLoop() }()
+	go func() { defer s.wg.Done(); s.probeTelegramNetwork(ctx) }()
 	return s
+}
+
+// probeTelegramNetwork keeps the network line's answer current. It runs whether
+// or not the Bot itself is enabled: whether this host can reach Telegram is a
+// fact about the network, and it is the same network the downloads use.
+func (s *Service) probeTelegramNetwork(ctx context.Context) {
+	s.runTelegramProbe(ctx, telegramProbeURL, telegramProbeInterval)
+}
+
+func (s *Service) runTelegramProbe(ctx context.Context, url string, interval time.Duration) {
+	probe := func() {
+		start := time.Now()
+		reqCtx, cancel := context.WithTimeout(ctx, telegramProbeTimeout)
+		defer cancel()
+		request, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+		if err == nil {
+			var response *http.Response
+			response, err = s.httpClient().Do(request)
+			if response != nil {
+				// The body carries nothing this needs, but it has to be drained
+				// and closed for the connection to be reusable at all.
+				_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+				_ = response.Body.Close()
+			}
+		}
+		previous, _ := s.networkProbe.snapshot()
+		s.networkProbe.record(err == nil, time.Since(start))
+		// Only a change is logged, plus the first sample. A line per probe would
+		// be thirty an hour of "still fine"; what a person looking into an
+		// unstable proxy needs is when it went away and when it came back, and
+		// the reason it gave.
+		if status, latency := s.networkProbe.snapshot(); status != previous {
+			fields := []any{"status", status, "previous", previous, "latency_ms", latency.Milliseconds()}
+			if err != nil {
+				fields = append(fields, "error", err.Error())
+			}
+			applog.Info("bot", "telegram_network_changed", fields...)
+		}
+	}
+	probe()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probe()
+		}
+	}
 }
 
 func (s *Service) watchDownloadEvents(events <-chan download.Event) {
@@ -2644,6 +2747,9 @@ func (s *Service) statusText() string {
 		list, currentID := s.telegram.List()
 		accounts = accountsStatusText(list, currentID)
 	}
+	// Read, never measured here: a status card that probes Telegram is a card
+	// that hangs exactly when Telegram is what is broken.
+	network := telegramNetworkLabel(s.networkProbe.snapshot())
 	// The database is read from the health the manager already samples every
 	// five seconds rather than by pinging here: a ping that has to wait out a
 	// timeout is exactly what this command must not do, since the Bot answers
@@ -2687,7 +2793,22 @@ func (s *Service) statusText() string {
 			failuresLine = fmt.Sprintf("最近下载失败：%d", recentFailures)
 		}
 	}
-	return statusCard(accounts, database, []string{eventsLine, downloadsLine, failuresLine}, cpu, memory, receive, transmit)
+	return statusCard(accounts, database, network, []string{eventsLine, downloadsLine, failuresLine}, cpu, memory, receive, transmit)
+}
+
+// telegramNetworkLabel names the last probe result. The latency is part of the
+// answer rather than decoration: "working" covers both a path with room to
+// spare and one that took eight seconds, and the difference between those two
+// is what a person watching an unstable proxy is actually trying to see.
+func telegramNetworkLabel(status string, latency time.Duration) string {
+	switch status {
+	case "ok":
+		return fmt.Sprintf("连接正常（%dms）", latency.Milliseconds())
+	case "failed":
+		return "连接失败"
+	default:
+		return "检测中"
+	}
 }
 
 // databaseStatusLabel uses the same wording as the Web sidebar for the same
@@ -2708,11 +2829,12 @@ func databaseStatusLabel(health download.DatabaseHealth) string {
 // each one has its own "could not be read" form that must survive to the
 // screen, and it is a function of its arguments alone so the layout - the one
 // thing in this command a person reads as a whole - is pinned by a test.
-func statusCard(accounts, database string, counts []string, cpu, memory, receive, transmit float64) string {
+func statusCard(accounts, database, network string, counts []string, cpu, memory, receive, transmit float64) string {
 	lines := []string{
 		"<b>当前状态</b>",
 		fmt.Sprintf("版本：TDL 管理 %s · 上游 TDL %s", buildinfo.Version, upstream.Version),
 		"数据库状态：" + database,
+		"Telegram网络：" + network,
 		accounts,
 	}
 	lines = append(lines, counts...)

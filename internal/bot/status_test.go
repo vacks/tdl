@@ -1,14 +1,19 @@
 package bot
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vacks/tdl/internal/adapter/upstream"
 	"github.com/vacks/tdl/internal/buildinfo"
 	"github.com/vacks/tdl/internal/download"
+	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/telegram"
 )
 
@@ -42,6 +47,7 @@ func TestStatusTextReadsEveryAccountFromTheManager(t *testing.T) {
 		"<b>当前状态</b>",
 		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + upstream.Version,
 		"数据库状态：未知",
+		"Telegram网络：检测中",
 		"登录账号（2）：",
 		"- 张三 (@zhangsan)",
 		"- 李四 · 当前账户",
@@ -131,7 +137,7 @@ func TestStatusCardLayout(t *testing.T) {
 		{ID: "a", TelegramID: 6807640357, FirstName: "rapalw", Username: "rapalw", State: "expired"},
 	}, "")
 	got := statusCard(
-		accounts, "已连接",
+		accounts, "已连接", "连接正常",
 		[]string{"监听事件：0 处理中 · 0 等待重试", "当前正在下载：0", "最近下载失败：0"},
 		0.2, 5.4, 1064, 2621,
 	)
@@ -139,6 +145,7 @@ func TestStatusCardLayout(t *testing.T) {
 		"<b>当前状态</b>",
 		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + upstream.Version,
 		"数据库状态：已连接",
+		"Telegram网络：连接正常",
 		"登录账号（1）：",
 		"- rapalw (@rapalw) · 会话失效",
 		"监听事件：0 处理中 · 0 等待重试",
@@ -150,6 +157,91 @@ func TestStatusCardLayout(t *testing.T) {
 	}, "\n")
 	if got != want {
 		t.Fatalf("the status card does not match the documented layout:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// The network line answers one question - is the path to Telegram working - so
+// no two states may share a word, and the answer carries the latency, which is
+// the part that tells a proxy with room to spare from one taking eight seconds.
+func TestTelegramNetworkLabel(t *testing.T) {
+	cases := []struct {
+		status  string
+		latency time.Duration
+		want    string
+	}{
+		{"ok", 12 * time.Millisecond, "连接正常（12ms）"},
+		{"failed", 10 * time.Second, "连接失败"},
+		{"", 0, "检测中"},
+	}
+	seen := make(map[string]string, len(cases))
+	for _, testCase := range cases {
+		got := telegramNetworkLabel(testCase.status, testCase.latency)
+		if got != testCase.want {
+			t.Fatalf("probe result (%q, %s) rendered as %q, want %q", testCase.status, testCase.latency, got, testCase.want)
+		}
+		if other, repeated := seen[got]; repeated {
+			t.Fatalf("results %q and %q both render as %q", other, testCase.status, got)
+		}
+		seen[got] = testCase.status
+	}
+}
+
+// The probe has to be able to say "failed", and it has to be able to say it
+// again after saying "ok" - a proxy that comes and goes is the case this whole
+// line exists for, and a state that only ever improves would report the outage
+// before the recovery and never the next outage.
+func TestTelegramProbeRecordsBothOutcomes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound) // what the API root actually answers
+	}))
+	// The probe goes through the service's own client so that it travels the
+	// configured proxy, which is the only reason its answer is worth anything.
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open settings: %v", err)
+	}
+	service := &Service{settings: store}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); service.runTelegramProbe(ctx, server.URL, 10*time.Millisecond) }()
+
+	if !waitForProbe(t, service, "ok") {
+		cancel()
+		<-done
+		t.Fatalf("a probe against a reachable server did not record success: %s", service.statusText())
+	}
+
+	// The same probe, with the far end gone. Nothing about the service changes.
+	server.Close()
+	if !waitForProbe(t, service, "failed") {
+		cancel()
+		<-done
+		t.Fatalf("a probe against an unreachable server did not record failure")
+	}
+	cancel()
+	<-done
+}
+
+func waitForProbe(t *testing.T, service *Service, want string) bool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if status, _ := service.networkProbe.snapshot(); status == want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// Whatever the probe last saw has to reach the card, and the card must read it
+// rather than measure anything: the read is what /status does.
+func TestStatusTextReadsTheProbeResult(t *testing.T) {
+	service := &Service{}
+	service.networkProbe.record(true, 34*time.Millisecond)
+
+	if got := service.statusText(); !strings.Contains(got, "Telegram网络：连接正常（34ms）") {
+		t.Fatalf("the card does not carry the probe result:\n%s", got)
 	}
 }
 
