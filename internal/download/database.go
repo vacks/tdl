@@ -18,6 +18,21 @@ type database struct {
 	db *sql.DB
 }
 
+// querier is the part of a database handle a statement needs.
+//
+// A pooled connection and an open transaction both have it, and the difference
+// between them is not something most statements should have to say out loud.
+// The claim rules are the reason this exists: they have to run inside the
+// transaction that ingests a page of indexed media, and again on the pool for
+// everything else, and before this they were written twice because of it - once
+// as a set-based pass over the pool and once inline, per item, inside the
+// ingest transaction. Two copies of "who owns this file" is two answers to it.
+type querier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*databaseRows, error)
+	QueryRow(query string, args ...any) *databaseRow
+}
+
 type databaseTx struct {
 	tx *sql.Tx
 }

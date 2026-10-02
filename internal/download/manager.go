@@ -1711,7 +1711,7 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 		candidates = append(candidates, item)
 	}
-	claims, claimErr := m.claimMediaBatch("message", job.ID, candidates)
+	claims, claimErr := m.claimMediaBatch(m.db, "message", job.ID, candidates)
 	if claimErr != nil {
 		m.fail(job.ID, fmt.Errorf("确认文件归属失败: %w", claimErr))
 		return
@@ -2306,63 +2306,78 @@ func (m *Manager) claimMedia(ownerKind, ownerID string, item source) (string, st
 		if err != nil {
 			return "", "", err
 		}
-		var status, path, currentKind, currentID string
-		err = tx.QueryRow(`SELECT status, final_path, owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&status, &path, &currentKind, &currentID)
-		if errors.Is(err, sql.ErrNoRows) {
-			result, insertErr := tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', ?, ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, item.DialogKey, item.MessageID, ownerKind, ownerID, time.Now().UTC().Format(time.RFC3339Nano))
-			if insertErr != nil {
-				_ = tx.Rollback()
-				return "", "", insertErr
-			}
-			changed, _ := result.RowsAffected()
-			if changed == 1 {
-				if err = tx.Commit(); err != nil {
-					return "", "", err
-				}
-				return "queued", "", nil
-			}
-			_ = tx.Rollback()
-			continue
-		}
+		state, path, retry, err := claimMediaOn(tx, ownerKind, ownerID, item)
 		if err != nil {
 			_ = tx.Rollback()
 			return "", "", err
 		}
-		if status == "completed" && path != "" && regularFileExists(path) {
-			if err = tx.Commit(); err != nil {
-				return "", "", err
-			}
-			return "completed", path, nil
-		}
-		if status == "claimed" && currentKind == ownerKind && currentID == ownerID {
-			if err = tx.Commit(); err != nil {
-				return "", "", err
-			}
-			return "queued", "", nil
-		}
-		if status == "claimed" {
-			if err = tx.Commit(); err != nil {
-				return "", "", err
-			}
-			return "waiting", "", nil
-		}
-		// A completed row whose file was removed is no longer proof of a
-		// successful download. Replace it only if its observed state did not
-		// change while this transaction was running.
-		result, updateErr := tx.Exec(`UPDATE downloaded_media SET final_path = '', status = 'claimed', owner_kind = ?, owner_id = ?, updated_at = ? WHERE dialog_key = ? AND message_id = ? AND status = ?`, ownerKind, ownerID, time.Now().UTC().Format(time.RFC3339Nano), item.DialogKey, item.MessageID, status)
-		if updateErr != nil {
+		if retry {
+			// Somebody else won the insert between the read and the write. The
+			// transaction holds nothing worth keeping.
 			_ = tx.Rollback()
-			return "", "", updateErr
+			continue
 		}
-		changed, _ := result.RowsAffected()
-		if err = tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return "", "", err
 		}
-		if changed == 1 {
-			return "queued", "", nil
-		}
+		return state, path, nil
 	}
 	return "", "", errors.New("文件归属竞争过于频繁，请重试")
+}
+
+// claimMediaOn is the claim rule itself: one media identity, one verdict, on
+// whichever handle the caller is already using.
+//
+// It is the only copy of the rule. The per-item claim below wraps it in a
+// transaction of its own; the set-based pass calls it for the handful of
+// identities its bulk statements could not classify; and the ingest path calls
+// that set-based pass with its own transaction. Before this, the ingest path
+// had the rule written out a third time, inline and per item, which is how a
+// rule about who owns a file comes to have three answers.
+//
+// retry reports that the read and the write disagreed - the row was inserted or
+// changed underneath - and the caller should look again rather than run on a
+// stale observation. It is not an error: it is the ordinary outcome of two
+// tasks meeting at the same file.
+func claimMediaOn(q querier, ownerKind, ownerID string, item source) (state string, path string, retry bool, err error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var status, currentPath, currentKind, currentID string
+	err = q.QueryRow(`SELECT status, final_path, owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&status, &currentPath, &currentKind, &currentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		result, insertErr := q.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', ?, ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, item.DialogKey, item.MessageID, ownerKind, ownerID, now)
+		if insertErr != nil {
+			return "", "", false, insertErr
+		}
+		changed, _ := result.RowsAffected()
+		if changed == 1 {
+			return "queued", "", false, nil
+		}
+		return "", "", true, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	if status == "completed" && currentPath != "" && regularFileExists(currentPath) {
+		return "completed", currentPath, false, nil
+	}
+	if status == "claimed" && currentKind == ownerKind && currentID == ownerID {
+		return "queued", "", false, nil
+	}
+	if status == "claimed" {
+		return "waiting", "", false, nil
+	}
+	// A completed row whose file was removed is no longer proof of a successful
+	// download. Replace it only if its observed state did not change since it
+	// was read; the guard is what makes a single statement enough.
+	result, updateErr := q.Exec(`UPDATE downloaded_media SET final_path = '', status = 'claimed', owner_kind = ?, owner_id = ?, updated_at = ? WHERE dialog_key = ? AND message_id = ? AND status = ?`, ownerKind, ownerID, now, item.DialogKey, item.MessageID, status)
+	if updateErr != nil {
+		return "", "", false, updateErr
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 1 {
+		return "queued", "", false, nil
+	}
+	return "", "", true, nil
 }
 
 // mediaClaimKey is one media identity: the pair claimMedia claims on.
@@ -2470,7 +2485,7 @@ func forEachKeyChunk(keys []mediaClaimKey, run func([]mediaClaimKey) error) erro
 // it is what reconcileChatClaims and reconcileMessageClaims exist to promote,
 // and a "queued" verdict for media the owner still holds is caught by the
 // guard on the next state write for that row.
-func (m *Manager) claimMediaBatch(ownerKind, ownerID string, items []source) (map[mediaClaimKey]mediaClaim, error) {
+func (m *Manager) claimMediaBatch(q querier, ownerKind, ownerID string, items []source) (map[mediaClaimKey]mediaClaim, error) {
 	seen := make(map[mediaClaimKey]struct{}, len(items))
 	keys := make([]mediaClaimKey, 0, len(items))
 	for _, item := range items {
@@ -2483,14 +2498,14 @@ func (m *Manager) claimMediaBatch(ownerKind, ownerID string, items []source) (ma
 	}
 	results := make(map[mediaClaimKey]mediaClaim, len(keys))
 	if err := forEachKeyChunk(keys, func(chunk []mediaClaimKey) error {
-		return m.claimMediaChunk(ownerKind, ownerID, chunk, results)
+		return m.claimMediaChunk(q, ownerKind, ownerID, chunk, results)
 	}); err != nil {
 		return nil, err
 	}
 	return results, nil
 }
 
-func (m *Manager) claimMediaChunk(ownerKind, ownerID string, keys []mediaClaimKey, results map[mediaClaimKey]mediaClaim) error {
+func (m *Manager) claimMediaChunk(q querier, ownerKind, ownerID string, keys []mediaClaimKey, results map[mediaClaimKey]mediaClaim) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -2499,7 +2514,7 @@ func (m *Manager) claimMediaChunk(ownerKind, ownerID string, keys []mediaClaimKe
 	// The select list is written before the VALUES list, so its three parameters
 	// are bound first.
 	claimArgs := append([]any{ownerKind, ownerID, now}, pairs...)
-	rows, err := m.db.Query(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) SELECT v.dialog_key, v.message_id, 'claimed', ?, ?, ? FROM (VALUES `+list+`) AS v(dialog_key, message_id) ON CONFLICT(dialog_key, message_id) DO NOTHING RETURNING dialog_key, message_id`, claimArgs...)
+	rows, err := q.Query(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) SELECT v.dialog_key, v.message_id, 'claimed', ?, ?, ? FROM (VALUES `+list+`) AS v(dialog_key, message_id) ON CONFLICT(dialog_key, message_id) DO NOTHING RETURNING dialog_key, message_id`, claimArgs...)
 	if err != nil {
 		return err
 	}
@@ -2526,7 +2541,7 @@ func (m *Manager) claimMediaChunk(ownerKind, ownerID string, keys []mediaClaimKe
 		return nil
 	}
 	lost, lostArgs := tupleInList(losers)
-	existing, err := m.db.Query(`SELECT dialog_key, message_id, status, final_path, owner_kind, owner_id FROM downloaded_media WHERE (dialog_key, message_id) IN (`+lost+`)`, lostArgs...)
+	existing, err := q.Query(`SELECT dialog_key, message_id, status, final_path, owner_kind, owner_id FROM downloaded_media WHERE (dialog_key, message_id) IN (`+lost+`)`, lostArgs...)
 	if err != nil {
 		return err
 	}
@@ -2569,9 +2584,18 @@ func (m *Manager) claimMediaChunk(ownerKind, ownerID string, keys []mediaClaimKe
 		}
 	}
 	for _, key := range replace {
-		state, path, err := m.claimMedia(ownerKind, ownerID, source{Item: Item{DialogKey: key.dialogKey, MessageID: key.messageID}})
+		state, path, retry, err := claimMediaOn(q, ownerKind, ownerID, source{Item: Item{DialogKey: key.dialogKey, MessageID: key.messageID}})
 		if err != nil {
 			return err
+		}
+		if retry {
+			// The row moved while this pass was reading it. One more look is
+			// enough: the set-based pass owns the common case, and this is the
+			// rare end of it.
+			state, path, _, err = claimMediaOn(q, ownerKind, ownerID, source{Item: Item{DialogKey: key.dialogKey, MessageID: key.messageID}})
+			if err != nil {
+				return err
+			}
 		}
 		results[key] = mediaClaim{state: state, path: path}
 	}

@@ -3302,7 +3302,7 @@ func TestPostgresBatchClaimMatchesPerItemClaim(t *testing.T) {
 			if err != nil {
 				t.Fatalf("claimMedia(): %v", err)
 			}
-			claims, err := m.claimMediaBatch("chat", "batch-chat", []source{{Item: Item{DialogKey: batchKey.dialogKey, MessageID: batchKey.messageID}}})
+			claims, err := m.claimMediaBatch(m.db, "chat", "batch-chat", []source{{Item: Item{DialogKey: batchKey.dialogKey, MessageID: batchKey.messageID}}})
 			if err != nil {
 				t.Fatalf("claimMediaBatch(): %v", err)
 			}
@@ -3354,7 +3354,7 @@ func TestPostgresBatchClaimSpansMoreThanOneChunk(t *testing.T) {
 	for index := 0; index < total; index++ {
 		items = append(items, source{Item: Item{DialogKey: "channel:wide", MessageID: index + 1}})
 	}
-	claims, err := m.claimMediaBatch("chat", "wide-chat", items)
+	claims, err := m.claimMediaBatch(m.db, "chat", "wide-chat", items)
 	if err != nil {
 		t.Fatalf("claimMediaBatch(): %v", err)
 	}
@@ -3365,7 +3365,7 @@ func TestPostgresBatchClaimSpansMoreThanOneChunk(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_id = 'wide-chat'`).Scan(&owned); err != nil || owned != total {
 		t.Fatalf("owned rows=%d err=%v, want %d", owned, err, total)
 	}
-	again, err := m.claimMediaBatch("chat", "wide-chat", items)
+	again, err := m.claimMediaBatch(m.db, "chat", "wide-chat", items)
 	if err != nil {
 		t.Fatalf("claimMediaBatch() resumed: %v", err)
 	}
@@ -3376,7 +3376,7 @@ func TestPostgresBatchClaimSpansMoreThanOneChunk(t *testing.T) {
 	}
 	// Repeating an identity inside one call is the same claim, not a second one.
 	repeated := append(append([]source(nil), items...), items...)
-	deduped, err := m.claimMediaBatch("chat", "wide-chat", repeated)
+	deduped, err := m.claimMediaBatch(m.db, "chat", "wide-chat", repeated)
 	if err != nil {
 		t.Fatalf("claimMediaBatch() with repeats: %v", err)
 	}

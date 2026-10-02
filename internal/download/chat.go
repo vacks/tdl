@@ -552,53 +552,61 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 			return nil
 		}
 	}
-	for _, item := range candidates {
-		var existingStatus, finalPath, ownerKind, ownerID string
-		err := tx.QueryRow(`SELECT status, final_path, owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&existingStatus, &finalPath, &ownerKind, &ownerID)
-		if errors.Is(err, sql.ErrNoRows) {
-			// An absent global claim is the normal first-seen case. The
-			// following branch either adopts an existing message task or creates
-			// a new chat claim, so the original ErrNoRows must not escape this
-			// loop as a fatal indexing error.
-			err = nil
-			// Ordinary message tasks predate the global claim table while they
-			// are running. Treat one as an owner until it reaches a terminal
-			// state; otherwise a newly indexed chat would download it again.
-			var messageStatus, messagePath string
-			messageErr := tx.QueryRow(`SELECT status, final_path FROM download_items WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&messageStatus, &messagePath)
-			if messageErr == nil {
-				if messageStatus == "completed" && messagePath != "" && regularFileExists(messagePath) {
-					if _, err = tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'message', '', ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, item.DialogKey, item.MessageID, messagePath, now); err != nil {
-						return err
-					}
-					existingStatus, finalPath = "completed", messagePath
-				} else {
-					existingStatus, ownerKind, ownerID = "claimed", "message", ""
-				}
-			} else if !errors.Is(messageErr, sql.ErrNoRows) {
-				return messageErr
-			}
-		}
+	// A message task writes its file rows when the link is submitted and claims
+	// the media when it first runs, so there is a window in which this media has
+	// a download_items row and no ownership row. Claiming it here would have both
+	// tasks transfer the same file; the implementation this replaces waited, and
+	// so does this. A completed message task whose file is still on disk is not
+	// waited for - it is adopted, by writing the ownership record the message
+	// task would have written had it finished under the current rules.
+	//
+	// Both questions are asked once per page. The per-item form asked them once
+	// per candidate, inside the ingest transaction, on the path whose whole job
+	// is to walk a channel that may hold a million posts.
+	deferred := make(map[mediaClaimKey]struct{})
+	adopted := make(map[mediaClaimKey]string)
+	if err := forEachKeyChunk(mediaKeys(candidates), func(chunk []mediaClaimKey) error {
+		observed, err := messageTaskRows(tx, chunk)
 		if err != nil {
 			return err
 		}
-		if existingStatus == "" {
-			result, claimErr := tx.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO NOTHING`, item.DialogKey, item.MessageID, chatID, now)
-			if claimErr != nil {
-				return claimErr
+		for key, row := range observed {
+			if row.status == "completed" && row.path != "" && regularFileExists(row.path) {
+				adopted[key] = row.path
+				continue
 			}
-			claimed, _ := result.RowsAffected()
-			if claimed == 1 {
-				existingStatus, ownerKind, ownerID = "claimed", "chat", chatID
-			} else if err = tx.QueryRow(`SELECT status, final_path, owner_kind, owner_id FROM downloaded_media WHERE dialog_key = ? AND message_id = ?`, item.DialogKey, item.MessageID).Scan(&existingStatus, &finalPath, &ownerKind, &ownerID); err != nil {
-				return err
-			}
+			deferred[key] = struct{}{}
 		}
-		status := "queued"
-		if existingStatus == "completed" && finalPath != "" && regularFileExists(finalPath) {
-			status = "completed"
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := adoptMessageTaskFiles(tx, adopted, now); err != nil {
+		return err
+	}
+	claimable := make([]source, 0, len(candidates))
+	for _, item := range candidates {
+		if _, waiting := deferred[mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}]; waiting {
+			continue
 		}
-		if existingStatus == "claimed" && (ownerKind != "chat" || ownerID != chatID) {
+		claimable = append(claimable, item)
+	}
+	claims, err := m.claimMediaBatch(tx, "chat", chatID, claimable)
+	if err != nil {
+		return err
+	}
+	for _, item := range candidates {
+		key := mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}
+		status, finalPath := "queued", ""
+		claim, claimed := claims[key]
+		switch {
+		case adopted[key] != "":
+			status, finalPath = "completed", adopted[key]
+		case claimed:
+			status, finalPath = claim.state, claim.path
+		default:
+			// No ownership row is written for a file another task is working on,
+			// and this is the only verdict that leaves the row alone.
 			status = "waiting"
 		}
 		result, err := tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, final_path, status, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size, finalPath, status, now)
@@ -620,6 +628,64 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 	m.touch()
 	m.signalChat()
 	return nil
+}
+
+// messageTaskRow is what a message task's own file table says about one media
+// identity, as far as the ingest path has to care.
+type messageTaskRow struct {
+	status string
+	path   string
+}
+
+// messageTaskRows reads the message task's file rows for a chunk of identities,
+// in one statement.
+//
+// It exists because a message task's claim is written when it first runs rather
+// than when it is submitted, so its rows are visible here before its claim is.
+// The other task is treated as an owner until it reaches a terminal state.
+func messageTaskRows(q querier, keys []mediaClaimKey) (map[mediaClaimKey]messageTaskRow, error) {
+	list, args := tupleInList(keys)
+	rows, err := q.Query(`SELECT dialog_key, message_id, status, final_path FROM download_items WHERE (dialog_key, message_id) IN (`+list+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	observed := make(map[mediaClaimKey]messageTaskRow, len(keys))
+	for rows.Next() {
+		var key mediaClaimKey
+		var row messageTaskRow
+		if err := rows.Scan(&key.dialogKey, &key.messageID, &row.status, &row.path); err != nil {
+			return nil, err
+		}
+		observed[key] = row
+	}
+	return observed, rows.Err()
+}
+
+// adoptMessageTaskFiles records the ownership a finished message task never
+// wrote, so that every later reader learns the file is already here instead of
+// downloading it a second time.
+func adoptMessageTaskFiles(q querier, adopted map[mediaClaimKey]string, now string) error {
+	if len(adopted) == 0 {
+		return nil
+	}
+	keys := make([]mediaClaimKey, 0, len(adopted))
+	for key := range adopted {
+		keys = append(keys, key)
+	}
+	return forEachKeyChunk(keys, func(chunk []mediaClaimKey) error {
+		values := make([]string, 0, len(chunk))
+		args := make([]any, 0, len(chunk)*3)
+		for _, key := range chunk {
+			values = append(values, "(?,?,?)")
+			args = append(args, key.dialogKey, key.messageID, adopted[key])
+		}
+		args = append(args, now)
+		_, err := q.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
+ SELECT v.dialog_key, v.message_id, v.final_path, 'completed', 'message', '', ? FROM (VALUES `+strings.Join(values, ",")+`) AS v(dialog_key, message_id, final_path)
+ ON CONFLICT(dialog_key, message_id) DO NOTHING`, args...)
+		return err
+	})
 }
 
 // chatWorker is deliberately single-threaded. Telegram's search pagination is
@@ -1015,7 +1081,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		lock.Unlock()
 		return false, nil
 	}
-	claims, err := m.claimMediaBatch("chat", id, batch)
+	claims, err := m.claimMediaBatch(m.db, "chat", id, batch)
 	if err != nil {
 		lock.Unlock()
 		return false, err
