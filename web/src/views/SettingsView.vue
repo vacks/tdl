@@ -11,7 +11,7 @@ type Settings = {
   bot: { enabled: boolean; token: string; controlUserIds: number[]; notifications: { taskCreated: boolean; taskCompleted: boolean; taskPartial: boolean; taskFailed: boolean } }
   reaction: { enabled: boolean; emojis: string[] }
 }
-type ConfigResponse = { settings: Settings; downloadDir: string; upstreamVersion: string }
+type ConfigResponse = { settings: Settings; downloadDir: string }
 const router = useRouter()
 const form = reactive<Settings>({ proxyUrl: '', download: { threads: 4, taskLimit: 2, concurrentJobs: 1, poolSize: 8, delayMs: 0, finalFilenameTemplate: '{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ if .MessageText }}_{{ .MessageText }}{{ end }}{{ .FileExt }}', minFileSizeMB: 0, maxFileSizeMB: 0, fileTypes: ['image', 'video'], includeReplies: true }, bot: { enabled: false, token: '', controlUserIds: [], notifications: { taskCreated: true, taskCompleted: true, taskPartial: true, taskFailed: true } }, reaction: { enabled: false, emojis: ['👍'] } })
 const downloadDir = ref('')

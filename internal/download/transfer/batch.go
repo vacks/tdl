@@ -125,6 +125,30 @@ func (s *batchSource) Message(ctx context.Context, id int) (*tg.Message, error) 
 	return nil, tmsg.ErrMessageDeleted
 }
 
+// Refresh reads one message past the cache.
+//
+// It is the repair for an expired file reference: the media this batch holds
+// was read up to TTL ago - or, for a task that waited in the queue, much
+// longer - and Telegram will not serve a file with a spent reference. Reading
+// the message again is the whole fix, and it is one request rather than the
+// task-level retry it replaces, which re-reads every message of the task and
+// costs a round of database writes besides.
+//
+// It is deliberately the single-message read and not a window: the point is to
+// get a reference that is new *now*, and a window would hand out the same
+// mixture of ages the cache already holds.
+func (s *batchSource) Refresh(ctx context.Context, id int) (*tg.Message, error) {
+	message, err := tmsg.GetSingleMessage(ctx, s.pool.Default(ctx), s.peer, id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.cached[id] = cachedMessage{message: message, fetched: time.Now()}
+	s.stats.singleCalls++
+	s.mu.Unlock()
+	return message, nil
+}
+
 func (s *batchSource) entry(entry cachedMessage) (*tg.Message, error) {
 	if entry.missing {
 		return nil, tmsg.ErrMessageDeleted

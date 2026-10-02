@@ -12,7 +12,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/gotd/td/telegram/downloader"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/vacks/tdl/internal/tmedia"
 
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/tmsg"
@@ -29,8 +33,9 @@ type engine struct {
 	opts Options
 	iter *iterator
 
-	files  atomic.Int64
-	failed atomic.Int64
+	files     atomic.Int64
+	failed    atomic.Int64
+	refreshed atomic.Int64
 }
 
 // download runs the batch to completion.
@@ -80,6 +85,7 @@ func (e *engine) stats() Stats {
 		Deleted:     e.iter.deleted,
 		Empty:       e.iter.empty,
 		Failed:      int(e.failed.Load()),
+		Refreshed:   int(e.refreshed.Load()),
 		BatchCalls:  counts.batchCalls,
 		SingleCalls: counts.singleCalls,
 	}
@@ -96,7 +102,20 @@ func (e *engine) transfer(ctx context.Context, item *element) {
 	// work begins on it, rather than only once a chunk has landed.
 	e.progress(item, 0)
 
-	if err := e.fetch(ctx, item); err != nil {
+	err := e.fetch(ctx, item)
+	if err != nil && isStaleReference(err) && e.refresh(ctx, item) {
+		// Telegram expires file references. The remedy its own clients use is to
+		// read the message again and retry - they keep a table mapping a file to
+		// where it was found for exactly this. Repairing the one file here costs
+		// a single read; the alternative is failing it, which returns the task to
+		// the queue and re-reads every message of it on the next attempt.
+		//
+		// A fresh writer, because the retry starts at offset zero and the byte
+		// counter would otherwise report the first attempt's bytes a second time.
+		e.progress(item, 0)
+		err = e.fetch(ctx, item)
+	}
+	if err != nil {
 		e.failed.Add(1)
 		// The partial file is removed rather than left in place. The engine this
 		// replaced renamed it out of its temporary name and reported success,
@@ -125,6 +144,47 @@ func (e *engine) transfer(ctx context.Context, item *element) {
 			Path:      path,
 		})
 	}
+}
+
+// isStaleReference reports whether Telegram refused because the file reference
+// has to be renewed.
+//
+// The three spellings are the states a spent reference can be in: expired,
+// invalid, and empty - an empty one is what a message whose media was never
+// fully populated carries. All three are cured the same way, by reading the
+// message again.
+func isStaleReference(err error) bool {
+	return tgerr.Is(err, tg.ErrFileReferenceExpired, tg.ErrFileReferenceInvalid, tg.ErrFileReferenceEmpty)
+}
+
+// refresh re-reads the message a file came from, so the transfer has a
+// reference Telegram will accept.
+//
+// A source that cannot read past its cache leaves the error alone: the transfer
+// fails and the task's own retry picks it up, which is what happened before this
+// existed.
+func (e *engine) refresh(ctx context.Context, item *element) bool {
+	source, ok := e.iter.source.(Refresher)
+	if !ok {
+		return false
+	}
+	message, err := source.Refresh(ctx, item.message.ID)
+	if err != nil {
+		applog.Warn("download", "message_refresh_failed", "account_id", e.deps.AccountID,
+			"dialog_id", item.dialogID, "message_id", item.message.ID, "error", err.Error())
+		return false
+	}
+	media, ok := tmedia.GetMedia(message)
+	if !ok {
+		// The media is gone from the message between the two reads. There is no
+		// reference to renew because there is nothing to fetch.
+		return false
+	}
+	item.message, item.media = message, media
+	e.refreshed.Add(1)
+	applog.Info("download", "stale_reference_repaired", "account_id", e.deps.AccountID,
+		"dialog_id", item.dialogID, "message_id", message.ID)
+	return true
 }
 
 // fetch pulls the bytes onto disk.

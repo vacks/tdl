@@ -8,6 +8,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/vacks/tdl/internal/kv"
 )
@@ -33,6 +34,11 @@ type fakeAPI struct {
 	file []byte
 	// failFileFor marks document ids whose transfer fails partway.
 	failFileFor map[int64]bool
+	// staleOnce marks document ids whose first byte request is refused as an
+	// expired file reference and whose later ones succeed, which is what a
+	// reference that aged out looks like once the client has read the message
+	// again.
+	staleOnce map[int64]bool
 }
 
 func newFakeAPI() *fakeAPI {
@@ -40,6 +46,7 @@ func newFakeAPI() *fakeAPI {
 		missing:     map[int]bool{},
 		messages:    map[int]*tg.Message{},
 		failFileFor: map[int64]bool{},
+		staleOnce:   map[int64]bool{},
 	}
 }
 
@@ -137,8 +144,16 @@ func (f *fakeAPI) Invoke(_ context.Context, input bin.Encoder, output bin.Decode
 		if !ok {
 			return fmt.Errorf("unexpected output %T", output)
 		}
-		if location, ok := request.Location.(*tg.InputDocumentFileLocation); ok && f.failFileFor[location.ID] {
-			return fmt.Errorf("FILE_REFERENCE_EXPIRED")
+		if location, ok := request.Location.(*tg.InputDocumentFileLocation); ok {
+			if f.failFileFor[location.ID] {
+				return fmt.Errorf("FILE_REFERENCE_EXPIRED")
+			}
+			if f.staleOnce[location.ID] {
+				f.mu.Lock()
+				delete(f.staleOnce, location.ID)
+				f.mu.Unlock()
+				return &tgerr.Error{Code: 400, Type: tg.ErrFileReferenceExpired, Message: tg.ErrFileReferenceExpired}
+			}
 		}
 		offset := int(request.Offset)
 		if offset >= len(f.file) {

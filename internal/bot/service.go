@@ -3123,7 +3123,7 @@ func messageFullText(value string) string {
 }
 
 func helpText() string {
-	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version, buildinfo.UpstreamVersion)
+	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version)
 }
 
 // statusAccountBudget bounds the account block in the status card, in runes.
@@ -3314,7 +3314,7 @@ func databaseStatusLabel(health download.DatabaseHealth) string {
 func statusCard(accounts, database, network string, counts []string, cpu, memory, receive, transmit float64) string {
 	lines := []string{
 		"<b>当前状态</b>",
-		fmt.Sprintf("版本：TDL 管理 %s · 上游 TDL %s", buildinfo.Version, buildinfo.UpstreamVersion),
+		fmt.Sprintf("版本：TDL 管理 %s", buildinfo.Version),
 		"数据库状态：" + database,
 		"Telegram网络：" + network,
 		accounts,

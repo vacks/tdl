@@ -1760,6 +1760,12 @@ func (m *Manager) run(job Job, sources []source) {
 	// controlled by pause/cancel and graceful application shutdown instead of a
 	// fixed wall-clock deadline.
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", job.ID)
+	// Removed however this task ends. It used to be removed only on the paths
+	// that finished everything, so a paused, cancelled, requeued or failed task
+	// left its half-written files behind for a resume that never read them again,
+	// and they accumulated one per interruption. A resumed task rebuilds its own
+	// directory, so there is nothing here worth keeping.
+	defer func() { _ = os.RemoveAll(tmpRoot) }()
 	config := m.settings.Get()
 	if snapshot, snapshotErr := m.downloadConfigForJob(job.ConfigJSON); snapshotErr != nil {
 		m.fail(job.ID, snapshotErr)
@@ -1928,12 +1934,11 @@ func (m *Manager) run(job Job, sources []source) {
 		if !m.runningOrUnknown(job.ID) {
 			return
 		}
-		// Upstream can return an error while persisting resume metadata after all
-		// media callbacks have already completed and every final move succeeded.
-		// The observable task result is still successful in that case.
+		// An error can arrive after every file has already been published - the
+		// iterator failing on a message past the last media one, say. What the
+		// task actually did is what decides its outcome, and it did everything.
 		if m.allItemsCompleted(job.ID) {
 			_ = m.setJob(job.ID, "completed", "")
-			_ = os.RemoveAll(tmpRoot)
 			return
 		}
 		if m.recordTelegramRPCError(job.AccountID, err) {
@@ -1943,11 +1948,12 @@ func (m *Manager) run(job Job, sources []source) {
 		m.fail(job.ID, err)
 		return
 	}
-	// A cancellation can race with the upstream call finishing. Never publish a
+	// A cancellation can race with the transfer finishing. Never publish a
 	// completed temporary file after the user has paused or cancelled its job.
-	// The temporary file and upstream resume state stay intact for a later resume.
-	// A status that cannot be read is not a cancellation: returning here would
-	// abandon the task in 下载中 with its files already on disk.
+	// Resuming rebuilds the file from the message, so nothing here is worth
+	// keeping for it. A status that cannot be read is not a cancellation:
+	// returning here would abandon the task in 下载中 with its files already on
+	// disk.
 	if status, ok := m.jobStatus(job.ID); ok && status != "running" {
 		if status == "paused" {
 			for _, item := range pending {
@@ -1964,7 +1970,6 @@ func (m *Manager) run(job Job, sources []source) {
 		m.fail(job.ID, errors.New("部分文件未收到收尾完成回调或移动失败"))
 	} else {
 		_ = m.setJob(job.ID, "completed", "")
-		_ = os.RemoveAll(tmpRoot)
 	}
 }
 

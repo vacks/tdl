@@ -17,7 +17,7 @@ import (
 func TestHelpTextIsTheDocumentedCommandList(t *testing.T) {
 	want := []string{
 		"<b>TDL帮助</b>",
-		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + buildinfo.UpstreamVersion,
+		"版本：TDL 管理 " + buildinfo.Version,
 		"",
 		"发送 Telegram 消息链接或转发消息即可创建消息下载任务。",
 		"",

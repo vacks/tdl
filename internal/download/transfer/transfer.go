@@ -59,6 +59,18 @@ type MessageSource interface {
 	Message(ctx context.Context, id int) (*tg.Message, error)
 }
 
+// Refresher is a MessageSource that can read a message past its own cache.
+//
+// It exists for one error: Telegram hands out a file reference with a lifetime,
+// and once it is spent the media cannot be fetched with it. The documented
+// remedy is to go back to where the media was found and read it again - which
+// is why every official client keeps a table mapping a file to its source, and
+// why the source here is the message. A source that can answer this question
+// lets the engine repair one file instead of failing it.
+type Refresher interface {
+	Refresh(ctx context.Context, id int) (*tg.Message, error)
+}
+
 // ProgressUpdate is one file's byte progress. Completed is set when the file
 // reaches its media byte total.
 type ProgressUpdate struct {
@@ -125,6 +137,11 @@ type Stats struct {
 	// healthy batch has SingleCalls at zero.
 	BatchCalls  int
 	SingleCalls int
+	// Refreshed counts files whose file reference had expired and was renewed by
+	// reading the message again. It is zero on an ordinary batch, and worth
+	// seeing when it is not: it means the batch waited long enough between
+	// reading and transferring for Telegram to retire the references.
+	Refreshed int
 }
 
 // Run transfers every message in the batch and reports what it cost.

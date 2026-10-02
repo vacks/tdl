@@ -198,6 +198,88 @@ func TestRunSkipsDeletedAndMediaLessMessages(t *testing.T) {
 	}
 }
 
+// A file reference has a lifetime, and Telegram retires it. Its own clients
+// answer that by reading the message the file came from and trying again - they
+// keep a table of exactly that mapping - and this engine does the same, so one
+// stale file costs one read rather than a failed task that re-reads every
+// message of the batch.
+func TestRunRenewsAnExpiredFileReference(t *testing.T) {
+	api := newFakeAPI()
+	api.file = byteFile(4000)
+	api.messages[1] = documentMessage(1, testDate, len(api.file))
+	// The first byte request is refused as expired; the ones after it are not.
+	api.staleOnce[1000] = true
+	deps, _ := testDeps(api)
+
+	dir := t.TempDir()
+	var completed []FileCompletedUpdate
+	stats, err := Run(context.Background(), deps, Options{
+		Dir:      dir,
+		Peer:     testPeer,
+		Messages: []int{1},
+		Threads:  1,
+		Tasks:    1,
+		OnFileCompleted: func(update FileCompletedUpdate) {
+			completed = append(completed, update)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if stats.Failed != 0 {
+		t.Fatalf("an expired reference was reported as a failure: %+v", stats)
+	}
+	if stats.Refreshed != 1 {
+		t.Fatalf("%d files were repaired, want 1 (%+v)", stats.Refreshed, stats)
+	}
+	if len(completed) != 1 {
+		t.Fatalf("%d files were published, want 1", len(completed))
+	}
+	// One read of the message to renew the reference, and the file itself
+	// retried rather than abandoned.
+	if got := api.count("MessagesGetHistoryRequest"); got != 1 {
+		t.Fatalf("the refresh cost %d message reads, want 1 (all: %v)", got, api.names())
+	}
+	if got := api.count("UploadGetFileRequest"); got < 2 {
+		// One refused, then the retry. A transfer that gave up would have asked
+		// exactly once.
+		t.Fatalf("the file was requested %d times, want the retry to have happened", got)
+	}
+	if content, err := os.ReadFile(completed[0].Path); err != nil || !bytes.Equal(content, api.file) {
+		t.Fatalf("the repaired file is wrong: %v", err)
+	}
+}
+
+// A reference that cannot be renewed is still a failure - the engine must not
+// report a file it never fetched.
+func TestRunFailsAFileWhoseReferenceCannotBeRenewed(t *testing.T) {
+	api := newFakeAPI()
+	api.file = byteFile(4000)
+	api.messages[1] = documentMessage(1, testDate, len(api.file))
+	// Every request is refused as expired, so the refresh cannot help.
+	api.failFileFor[1000] = true
+	deps, _ := testDeps(api)
+
+	var completed int
+	stats, err := Run(context.Background(), deps, Options{
+		Dir:      t.TempDir(),
+		Peer:     testPeer,
+		Messages: []int{1},
+		Threads:  1,
+		Tasks:    1,
+		OnFileCompleted: func(FileCompletedUpdate) {
+			completed++
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Failed != 1 || completed != 0 {
+		t.Fatalf("stats are %+v with %d published, want one failure and none published", stats, completed)
+	}
+}
+
 // The whole point of the batched reader: the request count follows the batch,
 // not the message count. This is the number that made pacing the account's
 // metadata traffic possible at all.

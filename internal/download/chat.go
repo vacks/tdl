@@ -1084,6 +1084,10 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	}
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
 	tmpDir, err := temporaryDialogDirectory(tmpRoot, batch[0].DialogKey)
+	// Removed however this batch ends. The batch is the unit that creates it, and
+	// a later batch of the same task builds its own - so a failed batch used to
+	// leave its half-written files under a directory nothing would ever clean.
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 	if err != nil {
 		// A filesystem that refuses the task's working directory is an
 		// environment fault, and it is terminal here for the same reason as the

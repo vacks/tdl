@@ -2,6 +2,10 @@ package download
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/vacks/tdl/internal/applog"
@@ -32,7 +36,11 @@ func (m *Manager) cleanupLoop(ctx context.Context) {
 			applog.Error("cleanup", "scheduled_cleanup_failed", "error", err.Error())
 			return
 		}
-		applog.Info("cleanup", "scheduled_cleanup_completed", "retention_days", auxiliaryHistoryRetentionDays, "chat_messages", result.ChatMessages)
+		removed, err := m.cleanupWorkingDirectories()
+		if err != nil {
+			applog.Error("cleanup", "working_directory_sweep_failed", "error", err.Error())
+		}
+		applog.Info("cleanup", "scheduled_cleanup_completed", "retention_days", auxiliaryHistoryRetentionDays, "chat_messages", result.ChatMessages, "working_directories_removed", removed)
 	}
 	run()
 	ticker := time.NewTicker(24 * time.Hour)
@@ -45,6 +53,113 @@ func (m *Manager) cleanupLoop(ctx context.Context) {
 			run()
 		}
 	}
+}
+
+// workingDirectoryBackstopAge is when a working directory is removed although
+// its task cannot be identified at all. It is the last resort for a directory
+// whose name matches no task: a week of it is cheaper than the chance of
+// deleting one a live transfer is using.
+const workingDirectoryBackstopAge = 7 * 24 * time.Hour
+
+// terminalTaskStatuses are the states in which no transfer is running for a
+// task. A working directory whose task is in one of them is finished with.
+//
+// The list is written out rather than expressed as "not running", because a
+// status added later would silently be treated as live and its directories
+// would never be swept.
+var terminalTaskStatuses = []string{"completed", "failed", "cancelled", "deleted", "partial"}
+
+// cleanupWorkingDirectories removes download working directories whose task has
+// finished or no longer exists.
+//
+// A transfer now removes its own directory however it ends, so what this finds
+// is what a crash or a kill left behind: the files of a transfer that never
+// finished, under the id of a task that is over. Nothing else ever removed
+// those, so they accumulated one per interrupted task, forever.
+//
+// Each directory costs one primary-key lookup and nothing else. The sweep must
+// not scan the job tables: at the scale this is built for they hold tens of
+// millions of rows, while the directories number however many tasks were
+// interrupted, which is a handful.
+func (m *Manager) cleanupWorkingDirectories() (int, error) {
+	root := filepath.Join(m.downloadDir, ".tdl-tmp")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// A chat task's directory is named "chat-<id>"; a message task's is its
+		// id. The name does not say which kind it is, so both are asked.
+		id := strings.TrimPrefix(entry.Name(), "chat-")
+		switch m.taskLiveness(id) {
+		case taskLive:
+			continue
+		case taskUnknown:
+			// Nothing identifies this directory. It is left alone until it is old
+			// enough that no transfer could still be writing into it.
+			if info, err := entry.Info(); err == nil && time.Since(info.ModTime()) < workingDirectoryBackstopAge {
+				continue
+			}
+		}
+		path := filepath.Join(root, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			applog.Warn("cleanup", "working_directory_not_removed", "path", path, "error", err.Error())
+			continue
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+type taskLiveness int
+
+const (
+	// taskFinished means every row for the id is in a terminal state.
+	taskFinished taskLiveness = iota
+	// taskLive means at least one row for the id is still working.
+	taskLive
+	// taskUnknown means there is no row for the id under that name. It is what a
+	// directory belonging to a deleted task looks like, and what a directory
+	// nobody can account for looks like.
+	taskUnknown
+)
+
+// taskLiveness reports what the database knows about one id.
+func (m *Manager) taskLiveness(id string) taskLiveness {
+	rows, err := m.db.Query(`SELECT status FROM download_jobs WHERE id = ? UNION ALL SELECT status FROM chat_download_jobs WHERE id = ?`, id, id)
+	if err != nil {
+		// An unreadable database is not evidence that a task is over. The
+		// directory is left where it is and swept on the next pass.
+		return taskLive
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			return taskLive
+		}
+		found = true
+		if !slices.Contains(terminalTaskStatuses, status) {
+			return taskLive
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return taskLive
+	}
+	if !found {
+		return taskUnknown
+	}
+	return taskFinished
 }
 
 func (m *Manager) cleanupPostgresHistory(retentionDays int) (CleanupResult, error) {

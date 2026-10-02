@@ -47,7 +47,7 @@ func TestStatusTextReadsEveryAccountFromTheManager(t *testing.T) {
 	// a zero, and the order of the three lines is the one the card documents.
 	want := strings.Join([]string{
 		"<b>当前状态</b>",
-		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + buildinfo.UpstreamVersion,
+		"版本：TDL 管理 " + buildinfo.Version,
 		"数据库状态：未知",
 		"Telegram网络：检测中",
 		"登录账号（2）：",
@@ -179,7 +179,7 @@ func TestStatusCardLayout(t *testing.T) {
 	)
 	want := strings.Join([]string{
 		"<b>当前状态</b>",
-		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + buildinfo.UpstreamVersion,
+		"版本：TDL 管理 " + buildinfo.Version,
 		"数据库状态：已连接",
 		"Telegram网络：连接正常",
 		"登录账号（1）：",
