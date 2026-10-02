@@ -2974,8 +2974,9 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 				if !ok {
 					continue
 				}
-				memberGroup, _ := member.GetGroupedID()
-				candidates = append(candidates, source{Item: Item{DialogType: target.DialogType, DialogKey: target.DialogKey, DialogID: target.DialogID, MessageID: member.ID, GroupedID: memberGroup, MessageText: caption, OriginalName: media.Name, Size: media.Size, OriginDialogName: target.DialogName, OriginMessageID: originID}, DialogName: target.DialogName, MediaType: messageMediaType(member), Direct: makeDirectPeer(target.inputPeer())})
+				item := sourceFromMessage(Item{DialogType: target.DialogType, DialogKey: target.DialogKey, DialogID: target.DialogID, MessageText: caption, OriginDialogName: target.DialogName, OriginMessageID: originID}, member, media, target.DialogName)
+				item.Direct = makeDirectPeer(target.inputPeer())
+				candidates = append(candidates, item)
 			}
 		}
 		if err := m.registerChatMedia(target.ID, candidates, false); err != nil {

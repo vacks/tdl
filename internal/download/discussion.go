@@ -196,9 +196,10 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 					continue
 				}
 				seen[member.ID] = struct{}{}
-				groupedID, _ := member.GetGroupedID()
 				direct := makeDirectPeer(threadPeer)
-				items = append(items, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: member.ID, GroupedID: groupedID, MessageText: caption, OriginalName: media.Name, Size: media.Size, OriginDialogName: originName, OriginMessageID: originMessageID, IsComment: true, SourcePeerType: direct.kind, SourcePeerID: direct.id, SourcePeerHash: direct.hash, ReplyRootID: threadMessageID}, DialogName: dialogName, MediaType: messageMediaType(member), Direct: direct})
+				item := sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageText: caption, OriginDialogName: originName, OriginMessageID: originMessageID, IsComment: true, SourcePeerType: direct.kind, SourcePeerID: direct.id, SourcePeerHash: direct.hash, ReplyRootID: threadMessageID}, member, media, dialogName)
+				item.Direct = direct
+				items = append(items, item)
 			}
 		}
 		if nextOffset == 0 || nextOffset == offset {

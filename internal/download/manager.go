@@ -3045,9 +3045,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			return err
 		}
 		messages := []*tg.Message{message}
-		groupedID := int64(0)
-		if group, ok := message.GetGroupedID(); ok {
-			groupedID = group
+		if _, ok := message.GetGroupedID(); ok {
 			// ?single asks for the one message the link points at rather than the
 			// album it belongs to. Telegram's own clients put the marker on a link
 			// copied from a single member, and the upstream link parser reads
@@ -3072,7 +3070,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			if !ok {
 				continue
 			}
-			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: peer.VisibleName(), MediaType: messageMediaType(msg)})
+			result = append(result, sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageText: messageText}, msg, media, peer.VisibleName()))
 		}
 		originID := firstMessageID(messages, message.ID)
 		result = setOrigin(result, peer.VisibleName(), originID, false)
@@ -3174,9 +3172,7 @@ func (m *Manager) resolveSourcesFor(ctx context.Context, target resolveTarget) (
 			message = read
 		}
 		messages := []*tg.Message{message}
-		groupedID := int64(0)
-		if group, ok := message.GetGroupedID(); ok {
-			groupedID = group
+		if _, ok := message.GetGroupedID(); ok {
 			expanded, err := tmsg.GetGroupedMessages(ctx, client.API(), target.Peer, message)
 			if err != nil {
 				m.recordTelegramRPCError(target.AccountID, err)
@@ -3209,7 +3205,7 @@ func (m *Manager) resolveSourcesFor(ctx context.Context, target resolveTarget) (
 			if !ok {
 				continue
 			}
-			result = append(result, source{Item: Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageID: msg.ID, GroupedID: groupedID, MessageText: messageText, OriginalName: media.Name, Size: media.Size}, DialogName: dialogName, MediaType: messageMediaType(msg)})
+			result = append(result, sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageText: messageText}, msg, media, dialogName))
 		}
 		originID := firstMessageID(messages, message.ID)
 		result = setOrigin(result, dialogName, originID, false)
