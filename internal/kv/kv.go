@@ -16,7 +16,8 @@ package kv
 
 import (
 	"context"
-	"errors"
+
+	upstreamStorage "github.com/iyear/tdl/core/storage"
 )
 
 // Storage is a byte-oriented key-value store.
@@ -29,4 +30,20 @@ type Storage interface {
 // ErrNotFound is what Get returns for a key that was never written or has been
 // deleted. Callers distinguish it from a read failure, because "no session yet"
 // is the ordinary first-run case and "cannot read the session" is not.
-var ErrNotFound = errors.New("key not found")
+//
+// It is, for now, the same value the upstream storage package uses, and that
+// identity is load-bearing rather than tidy-minded. This store is handed to
+// code that predates it: the upstream downloader reads its resume state through
+// it and decides whether the read failed or merely found nothing with
+// errors.Is(err, storage.ErrNotFound). A store answering with a sentinel of its
+// own made every first download look like a failed read - the resume key is
+// absent in the ordinary case - and the transfer was abandoned with "key not
+// found" before it started.
+//
+// It is one value, not two aliases, because both sides have to agree: our own
+// session and peer storage compare against this too, and they are handed errors
+// by the same store.
+//
+// When the upstream downloader is gone this becomes its own sentinel, which is
+// a one-line change with no caller to update.
+var ErrNotFound = upstreamStorage.ErrNotFound
