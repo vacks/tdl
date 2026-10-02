@@ -83,11 +83,24 @@
 
 ---
 
-## 三、解耦过程中的临时状态（会随阶段推进消失）
+## 三、解耦进度（已完成的部分）
 
-- `internal/adapter/upstream`：**已删除**（v1.11.5）。它自称是"唯一可以 import 上游的层"，
-  实际每个上游 import 都在别处，包本身只为提供 `upstream.Version` 一个字符串，
-  却把 `app/login`（连同 bbolt、校验器三件套）拖进二进制。
-- `internal/buildinfo.UpstreamVersion`：临时保留，见上文第 4 条。
-- `patches/`、`.upstream/`、`scripts/prepare-upstream-progress.sh`、`go.work` 的 replace、
-  `Dockerfile` 里的 3 行 COPY：**仍在**，随下载引擎自建（P3）一并删除。
+上游 TDL 的依赖已经**完全移除**（v1.11.9）：
+
+- `internal/adapter/upstream`：已删除（v1.11.5）。
+- `internal/tgclient`（客户端构造 / 连接池 / 中间件）、`internal/kv`（存储契约）、
+  `internal/tmedia`、`internal/tmsg`、`internal/download/transfer`（下载引擎）：
+  都是本仓库自己的实现，见各包顶部的注释。
+- `patches/`、`.upstream/`、`scripts/`、`go.work` 的 replace、`Dockerfile` 里的 3 行 COPY：
+  **已全部删除**。构建闭包的第三方模块从 69 降到 30。
+- `go.mod` 里不再有 `github.com/iyear/tdl`（含 `/core`）。
+  **`github.com/iyear/connectproxy` 保留**：`golang.org/x/net/proxy` 只认 socks5，
+  `http` / `https` 代理靠它注册，且它不是上游应用的一部分。
+
+仍待处理：
+
+- `internal/buildinfo.UpstreamVersion`：上游已经不存在了，但 Web 与 Bot 仍在显示
+  "上游 TDL v0.20.4"。这个字段现在指向一个我们不再依赖的模块，应当删掉。
+- `downloads/.tdl-tmp/<job>` 在**失败**的任务上会残留（成功路径会 `RemoveAll`）。
+  现存几个是历史遗留，其中 `c7e648f1054a6c151d0125d547fa3a4e`
+  是 v1.11.6 那个 `key not found` 缺陷留下的。
