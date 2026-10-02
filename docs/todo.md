@@ -153,18 +153,34 @@
 成员条件）；`reconcile` 的 WHERE 不新增 `owner_kind`；列表/分页游标；认领保持 256/块 +
 行值谓词 `(?,?::integer)`；不加迁移版本。
 
-## 五、P6 剩余工作
+## 五、P6：大规模执行计划复核（v1.11.14 已完成，5M 档）
 
-在 `tdl_test` 用合成数据把三张表灌到 5M 与 50M 两档，对下面这些改过的语句做
-`EXPLAIN (ANALYZE, BUFFERS)`，与小库基线对比，确认**无 Seq Scan、无计划翻转**：
+临时库 `tdl_scale`，真实 schema + 合成数据：`download_items` 500 万、
+`downloaded_media` 500 万、`chat_download_items` 300 万、`download_jobs` 2500 个（其中 2000 个排队）。
+`EXPLAIN (ANALYZE, BUFFERS)` 结果：
 
-- `claimMediaBatch` 的 `INSERT…SELECT…RETURNING`（走 `(dialog_key,message_id)` 主键 seek）
-- `setItem` / `setChatItem` 的完成 CTE（一条语句搞定，不该退化成两条）
-- `reconcileMessageClaims` / `reconcileChatClaims` 的游标轮转
-- `ItemsPage`（v1.11.13 新增 `download_items(job_id, id)`，实测 265 万行下 366ms → 0.14ms）
-- `nextQueued`（`download_jobs_queued_created_id`）
-- `nextChatBatch` / 聊天调度查询
+| 语句 | 计划 | 耗时 | Buffers |
+|---|---|---|---|
+| `claimMediaBatch` 认领（256 个身份，全部命中已有行） | `Values Scan` → `Insert`，冲突仲裁走主键 | **4.7 ms** | 1039 |
+| 同上（256 个全部新插入） | 同上 | 15 ms | — |
+| `claimMediaChunk` 败者读取（256 个身份） | `BitmapOr` over 256 次主键 probe | 3.6 ms | 949 |
+| `messageTaskRows`（v1.11.14 新增，256 个身份） | `BitmapOr` over 主键 | 2.9 ms | 768 |
+| `setItem` 完成 CTE（单行） | `CTE Scan` → `Insert ... ON CONFLICT DO UPDATE` | **2.0 ms** | 49 |
+| `ItemsPage`（**分散**任务：每 500 条一条，横跨整个 id 空间） | `Index Scan using download_items_job_id_id` | **0.34 ms** | 107 |
+| 同上，换个计划作对照（`enable_indexscan=off` → 排序） | `Sort` | **114 ms** | 9863 read |
+| `applyItemFailures` 的重试写回 | `Index Scan using download_items_dialog_key_message_id_key` | 0.024 ms | 3 |
+| `nextQueued`（2000 个排队任务） | `Nested Loop Anti Join` | 0.062 ms | 55 |
+| 会话取批（`status='queued' ORDER BY message_id DESC LIMIT 64`） | `Index Scan Backward using chat_download_items_work` | 0.28 ms | 67 |
+| `reconcileChatClaims` 等待项轮转 | `Index Only Scan using chat_download_items_waiting_rotation` | 0.47 ms | 261 |
 
-⚠️ 小库上的计划会误导（schema 注释已警告），必须以实际 EXPLAIN 为准。
-⚠️ 造数时注意：`download_items.id` 是序列，晚插入的行自然落在末尾 —— 想造"分散"的 id 必须显式指定 id。
-⚠️ 灌数据前要 `ALTER TABLE ... DISABLE TRIGGER USER` 并临时去掉 `download_item_stats` 的外键。
+**结论：全部走索引，无 Seq Scan，无全表排序。**
+
+⚠️ **只测到 500 万，没测 5000 万**（本机磁盘余量约 20G，加载 5000 万不现实）。
+判断依据是：这些计划里**没有任何节点的代价随表增大而线性增长** —— `ItemsPage` 是
+`(job_id, id)` 上的 seek（107 buffers）、认领是 `VALUES` 驱动的 256 次主键 probe、
+调度是 anti join。真正会随规模翻转的是"优化器选了全表扫描或全表排序"，
+上面每一个都能直接排除。若生产上出现翻转变慢，第一个要看的是这几条的 `EXPLAIN`。
+
+⚠️ 造数三个坑：`docker exec` 必须带 `-i` 否则 heredoc 不进 psql；`download_items.id` 是序列，
+晚插入的行自然落在末尾，想造"分散"必须显式指定 id；灌数据前要
+`ALTER TABLE ... DISABLE TRIGGER USER` 并去掉 `download_item_stats` 的外键。
