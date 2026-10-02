@@ -1472,53 +1472,7 @@ func (m *Manager) chatItemStatus(chatID string, item source) string {
 }
 
 func (m *Manager) setChatItem(chatID string, item source, status, path, message string) error {
-	finished := ""
-	if status == "completed" || status == "failed" || status == "cancelled" {
-		finished = time.Now().UTC().Format(time.RFC3339Nano)
-	}
-	// Completion writes two rows that must agree: the item's terminal state and
-	// the global ownership record every other task consults before deciding
-	// whether this media still has to be downloaded. They travel in one
-	// statement, so a failure leaves neither written rather than an item that
-	// claims to be finished while nothing owns the file.
-	//
-	// The message path has written it this way since the divergence was found
-	// there, and the reason it is written out a second time instead of shared is
-	// the table descriptor the two callers still keep apart - see itemTable,
-	// which is where merging them starts. Writing it separately was wrong in
-	// both directions: an ownership write that failed on its own left a task
-	// reporting success over a file nothing owned, and every other task then
-	// downloaded that file again because the index said nobody had it.
-	if status == "completed" && path != "" {
-		if _, err := m.db.Exec(`WITH updated AS (
- UPDATE chat_download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? RETURNING chat_job_id
-)
-INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
- SELECT ?, ?, ?, 'completed', 'chat', chat_job_id, ? FROM updated
- ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`,
-			status, path, message, finished, finished, chatID, item.DialogKey, item.MessageID,
-			item.DialogKey, item.MessageID, path, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-			return err
-		}
-		m.touch()
-		// This ownership row is exactly what a waiting message task adopts, so it
-		// must be told to look now instead of on its next idle pass.
-		m.signalReconcile()
-		return nil
-	}
-	if _, err := m.db.Exec(`UPDATE chat_download_items SET status=?, final_path=?, error=?, finished_at=CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id=? AND dialog_key=? AND message_id=?`, status, path, message, finished, finished, chatID, item.DialogKey, item.MessageID); err != nil {
-		return err
-	}
-	m.touch()
-	if status == "failed" || status == "cancelled" {
-		if _, err := m.db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, item.DialogKey, item.MessageID, chatID); err != nil {
-			return err
-		}
-		// Releasing the claim hands this media to whichever task is waiting on it.
-		m.signalReconcile()
-		return nil
-	}
-	return nil
+	return m.setItemState(chatItems, chatID, item, status, path, message)
 }
 
 // reconcileChatPublishedItems closes the crash window after a final file move

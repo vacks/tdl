@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/vacks/tdl/internal/applog"
 	transfer "github.com/vacks/tdl/internal/download/transfer"
 )
 
@@ -42,22 +43,149 @@ func planItemFailures(outcomes []transfer.FileOutcomeUpdate, byMessage map[int]s
 	return planned
 }
 
-// itemTable names one task's file table and the column holding its owner.
+// itemTable names one task's file table, the column holding its owner, and the
+// three ways the two tables genuinely differ.
 //
-// The two tables are the same shape and their statements have to agree about
-// every state string they mention, so the names are parameters of one builder
-// instead of being typed out once per table. This is the smallest piece of the
-// duplication between the two state machines, kept here because the failure
-// write is the one that has to be right under a dropped connection.
+// They are the same shape, and every statement written against them has to
+// agree about the state strings it mentions and about what completing a file
+// means. Writing those statements out once per table is how the two state
+// machines came to disagree: the completion write was one atomic statement on
+// one side and two independent ones on the other, and the session half could
+// record an item as finished while writing no ownership for it.
 type itemTable struct {
 	items string
 	owner string
+	// ownerKind is what the ownership record calls this kind of task.
+	ownerKind string
+	// scoped is whether the owning task is part of the row's identity. The
+	// message table is keyed by the media alone - one file has one row, in one
+	// task - while a session task keys its rows by (chat_job_id, dialog_key,
+	// message_id), because the same media can be indexed by several tasks.
+	scoped bool
+	// emitsItemEvents is whether a single file's state change is published to
+	// the interface. The message view renders per-file rows and reacts to them;
+	// the session view is a summary that redraws on the shared revision
+	// counter, so an event naming a session task would be addressed to a stream
+	// that has no such task in it.
+	emitsItemEvents bool
+	// releasesOnFailure is whether a file that fails gives up its ownership
+	// claim at that moment. A session batch continues after one file fails, so
+	// the claim has to be released there or the file it names waits for a task
+	// that has already given up on it. A message task ends when its files do -
+	// fail() releases everything a failed task holds - so its claims are
+	// released a moment later, at task level.
+	releasesOnFailure bool
 }
 
 var (
-	messageItems = itemTable{items: "download_items", owner: "job_id"}
-	chatItems    = itemTable{items: "chat_download_items", owner: "chat_job_id"}
+	messageItems = itemTable{items: "download_items", owner: "job_id", ownerKind: "message", emitsItemEvents: true}
+	chatItems    = itemTable{items: "chat_download_items", owner: "chat_job_id", ownerKind: "chat", scoped: true, releasesOnFailure: true}
 )
+
+// predicate names one file row, with the owning task in it when the table's
+// identity includes one.
+func (t itemTable) predicate() string {
+	if t.scoped {
+		return t.owner + " = ? AND dialog_key = ? AND message_id = ?"
+	}
+	return "dialog_key = ? AND message_id = ?"
+}
+
+// predicateArgs are predicate's placeholders, in its order.
+func (t itemTable) predicateArgs(ownerID string, item source) []any {
+	if t.scoped {
+		return []any{ownerID, item.DialogKey, item.MessageID}
+	}
+	return []any{item.DialogKey, item.MessageID}
+}
+
+// completeStatement writes an item's terminal state and the ownership record
+// every other task consults, in one statement.
+//
+// One statement, so a failure leaves neither written rather than an item that
+// claims to be finished while nothing owns the file. The message path has been
+// written this way since the divergence was found there; the session path wrote
+// two statements, of which the second ran whether or not the first had matched
+// a row, and could therefore record ownership of a file nobody has.
+func (t itemTable) completeStatement() string {
+	return fmt.Sprintf(`WITH updated AS (
+ UPDATE %[1]s SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE %[2]s RETURNING %[3]s
+)
+INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
+ SELECT ?, ?, ?, 'completed', '%[4]s', %[3]s, ? FROM updated
+ ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at
+RETURNING owner_id`, t.items, t.predicate(), t.owner, t.ownerKind)
+}
+
+// statement is the same write for every state but completion.
+func (t itemTable) statement() string {
+	return fmt.Sprintf(`UPDATE %[1]s SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE %[2]s RETURNING %[3]s`, t.items, t.predicate(), t.owner)
+}
+
+// setItemState is the one writer of a file's state.
+//
+// ownerID is only read by the tables whose rows name their task. It is returned
+// by the statement from the row itself, which is why a write that matched
+// nothing is not an error: the state changed under the caller, and there is
+// nothing left to say about it.
+func (m *Manager) setItemState(t itemTable, ownerID string, item source, status, path, message string) error {
+	finished := ""
+	if status == "completed" || status == "failed" || status == "cancelled" {
+		finished = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	args := []any{status, path, message, finished, finished}
+	args = append(args, t.predicateArgs(ownerID, item)...)
+
+	var rowOwner string
+	var err error
+	if status == "completed" && path != "" {
+		// The select list of the ownership insert is written before its own
+		// values, so its two identity parameters come next.
+		args = append(args, item.DialogKey, item.MessageID, path, time.Now().UTC().Format(time.RFC3339Nano))
+		err = m.db.QueryRow(t.completeStatement(), args...).Scan(&rowOwner)
+	} else {
+		err = m.db.QueryRow(t.statement(), args...).Scan(&rowOwner)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		applog.Error("download", "item_state_save_failed", "dialog_key", item.DialogKey, "message_id", item.MessageID, "status", status, "error", err.Error())
+		return err
+	}
+	m.touch()
+	if t.emitsItemEvents && rowOwner != "" {
+		m.emit(rowOwner, "", "item_status_changed", status)
+	}
+	if status == "failed" || status == "cancelled" {
+		if !t.releasesOnFailure {
+			return nil
+		}
+		// The owner comes back from the row the statement just wrote, not from
+		// the caller. A table whose rows do not carry their task - the message
+		// table, keyed by the media alone - has no owner to hand in, and a
+		// release that names the wrong one deletes nothing and reports success
+		// while the claim a waiting task is stuck behind stays exactly where it
+		// was.
+		if _, err := m.db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'claimed' AND owner_kind = ? AND owner_id = ?`, item.DialogKey, item.MessageID, t.ownerKind, rowOwner); err != nil {
+			return err
+		}
+		// Releasing the claim hands this media to whichever task is waiting on it.
+		m.signalReconcile()
+		return nil
+	}
+	if status == "completed" && path != "" {
+		// The ownership row is what a waiting task adopts, whichever kind it is:
+		// a session item waits on a claim a message task holds, and the other way
+		// round. Both halves have to say so, or the one that stays quiet is
+		// promoted only on the reconciler's next pass. The message half did stay
+		// quiet, which is a difference this merge had to resolve rather than
+		// preserve - signalling is one coalesced wake-up, and the reconciler it
+		// wakes is already running on its own cadence.
+		m.signalReconcile()
+	}
+	return nil
+}
 
 // retryStatement returns a file to the queue, unless it has spent its attempts.
 //

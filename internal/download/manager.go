@@ -3771,65 +3771,7 @@ func (m *Manager) setJobWhileRunning(jobID, status, message string) error {
 	return nil
 }
 func (m *Manager) setItem(item source, status, path, message string) error {
-	finishedAt := ""
-	if status == "completed" || status == "failed" || status == "cancelled" {
-		finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	}
-	// Completion writes two rows that must agree: the item's terminal state and
-	// the global ownership record every other task consults before deciding
-	// whether this media still has to be downloaded. They travel in one
-	// statement, so a failure leaves neither written rather than an item that
-	// claims to be finished while nothing owns the file.
-	//
-	// Writing them separately was wrong in both directions. The ownership write
-	// was issued after the item update and its error discarded, so a transient
-	// failure produced exactly the state above and the task still reported
-	// success; and a second round trip on the completion path of every file is
-	// the one write amplification this path can least afford.
-	//
-	// A statement matching no row is the ordinary case of a state that already
-	// changed, not an error. RETURNING owner_id carries the owning task id back
-	// so the caller does not need a follow-up query to learn what it belongs to;
-	// on the conflict branch it is EXCLUDED.owner_id, which is the same task.
-	if status == "completed" && path != "" {
-		var jobID string
-		err := m.db.QueryRow(`WITH updated AS (
- UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ? RETURNING job_id
-)
-INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
- SELECT ?, ?, ?, 'completed', 'message', job_id, ? FROM updated
- ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at
-RETURNING owner_id`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID, item.DialogKey, item.MessageID, path, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&jobID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			applog.Error("download", "item_state_save_failed", "dialog_key", item.DialogKey, "message_id", item.MessageID, "status", status, "error", err.Error())
-			return err
-		}
-		m.touch()
-		if jobID != "" {
-			m.emit(jobID, "", "item_status_changed", status)
-		}
-		return nil
-	}
-	// One statement carries the change, names the owning task and the status
-	// that goes with it. The ownership row below needs that task id, which used
-	// to cost a second query on the completion path alone.
-	var jobID string
-	err := m.db.QueryRow(`UPDATE download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE dialog_key = ? AND message_id = ? RETURNING job_id`, status, path, message, finishedAt, finishedAt, item.DialogKey, item.MessageID).Scan(&jobID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		applog.Error("download", "item_state_save_failed", "dialog_key", item.DialogKey, "message_id", item.MessageID, "status", status, "error", err.Error())
-		return err
-	}
-	m.touch()
-	if jobID != "" {
-		m.emit(jobID, "", "item_status_changed", status)
-	}
-	return nil
+	return m.setItemState(messageItems, "", item, status, path, message)
 }
 
 // beginItemAttempts records one transfer attempt for every pending file, in one

@@ -326,3 +326,61 @@ func TestPostgresATaskWithARetryIsNotSettledAsFinished(t *testing.T) {
 		t.Fatalf("the file is %q, want queued", itemStatus)
 	}
 }
+
+// The two tables differ in exactly two ways, and both are decisions rather than
+// accidents. This pins them, because the merge that gave them one writer is
+// exactly the change that could quietly level them.
+//
+// A file that fails gives up its ownership claim immediately on the session
+// side, where a batch carries on past one failure and the file it names would
+// otherwise wait for a task that has already given up on it. On the message
+// side the claim is released a moment later, at task level, by fail() - and
+// releasing it here as well would be a second writer of the same decision.
+func TestPostgresTheTwoTablesReleaseClaimsDifferentlyOnFailure(t *testing.T) {
+	m := openChatItemTestManager(t, "rel-chat", ChatStatusDownloading, nil)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('rel-job','tg://x','channel','channel:rel','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status) VALUES ('rel-job','channel:rel',1,1,'f','running')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, dialog_id, message_id, original_name, status, discovered_at) VALUES ('rel-chat','channel:rel',1,2,'f','running',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		key, kind, owner string
+		messageID        int
+	}{
+		{"channel:rel", "message", "rel-job", 1},
+		{"channel:rel", "chat", "rel-chat", 2},
+	} {
+		if _, err := m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', ?, ?, ?)`, row.key, row.messageID, row.kind, row.owner, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := m.setItemState(messageItems, "", source{Item: Item{DialogKey: "channel:rel", MessageID: 1}}, "failed", "", "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.setItemState(chatItems, "rel-chat", source{Item: Item{DialogKey: "channel:rel", MessageID: 2}}, "failed", "", "boom"); err != nil {
+		t.Fatal(err)
+	}
+
+	var messageClaim, chatClaim int
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_kind = 'message' AND owner_id = 'rel-job'`).Scan(&messageClaim); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE owner_kind = 'chat' AND owner_id = 'rel-chat'`).Scan(&chatClaim); err != nil {
+		t.Fatal(err)
+	}
+	if chatClaim != 0 {
+		t.Fatal("a failed session file kept its claim; the task it belongs to has given up on it, " +
+			"and every other task wanting that media waits behind a claim nothing will release")
+	}
+	if messageClaim != 1 {
+		t.Fatal("a failed message file released its claim here, which is not this writer's decision: " +
+			"the task releases everything it holds when it fails, and two writers of one decision is what " +
+			"this merge exists to remove")
+	}
+}
