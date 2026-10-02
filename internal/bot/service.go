@@ -85,7 +85,7 @@ type Service struct {
 	// updates without making the Bot poll the task table more aggressively.
 	downloadWake chan struct{}
 	// networkProbe is the last observed reachability of Telegram, kept by its
-	// own background loop and only read by /status.
+	// own background loop and read by /status and by the Web sidebar.
 	networkProbe telegramProbe
 	// dialTimeout bounds one dial through the proxy; zero means
 	// telegramDialTimeout. It is settable so a test can watch the bound being
@@ -2737,6 +2737,17 @@ func helpText() string {
 	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version, upstream.Version)
 }
 
+// statusAccountBudget bounds the account block in the status card, in runes.
+//
+// The card grows with the number of logged-in sessions, which is the one part
+// of it with no natural length, and Telegram rejects anything past botCardLimit
+// outright - so an unbounded list does not produce a shorter card, it produces
+// no card, and /status stops answering at all. Names have no bound either, so
+// the budget is measured on the rendered lines rather than on a count of
+// accounts. It is set well clear of the limit: the rest of the card is about a
+// thousand runes, and reaching this takes some forty sessions.
+const statusAccountBudget = 2000
+
 // accountsStatusText renders one line per account record.
 //
 // The Bot's /status used to name only the selected account - and only when it
@@ -2755,6 +2766,8 @@ func accountsStatusText(accounts []telegram.Account, currentID string) string {
 	}
 	lines := make([]string, 0, len(accounts)+1)
 	lines = append(lines, fmt.Sprintf("登录账号（%d）：", len(accounts)))
+	used := len([]rune(lines[0]))
+	shown := 0
 	for _, account := range accounts {
 		line := "- " + accountDisplayName(account)
 		if account.State != "authorized" {
@@ -2763,7 +2776,19 @@ func accountsStatusText(accounts []telegram.Account, currentID string) string {
 		if account.ID == currentID {
 			line += " · 当前账户"
 		}
+		if used+len([]rune(line)) > statusAccountBudget {
+			break
+		}
+		used += len([]rune(line)) + 1
+		shown++
 		lines = append(lines, line)
+	}
+	// A truncated list says that it is truncated. Nothing here is cut
+	// mid-string: the lines are HTML-escaped already, and cutting inside an
+	// escape sequence produces markup Telegram rejects, which turns a list that
+	// is merely long into a card that never arrives.
+	if hidden := len(accounts) - shown; hidden > 0 {
+		lines = append(lines, fmt.Sprintf("…另有 %d 个账号未显示", hidden))
 	}
 	return html.EscapeString(strings.Join(lines, "\n"))
 }
@@ -3165,13 +3190,14 @@ func (s *Service) httpClient() *http.Client {
 			}
 			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 				// The bound is put on here because nothing upstream supplies
-				// one: the transport detaches this context from the request and
+				// one. The transport detaches this context from the request and
 				// gives it no deadline, on purpose, so that a slow dial can
-				// still be reused by a later request. Without this, a proxy that
-				// accepts the connection and never answers the handshake holds
-				// the socket and its goroutine until TCP times out on its own,
-				// which a proxy flapping every few minutes turns into a steady
-				// leak of both.
+				// still be reused by a later request; and unlike the CONNECT an
+				// http proxy gets - which the transport bounds at a minute of
+				// its own - a SOCKS5 handshake is done inside this dialer, where
+				// nobody was timing it. A proxy that accepts the connection and
+				// never answers therefore held the socket and its goroutine for
+				// as long as TCP allowed, once per attempt.
 				ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 				defer cancel()
 				if contextDialer, ok := dialer.(proxy.ContextDialer); ok {

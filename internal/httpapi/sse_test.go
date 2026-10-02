@@ -363,6 +363,7 @@ func TestStatusStreamSendsTheCurrentStatesOnConnectAndEndsWithTheServer(t *testi
 // silent, and its keep-alive must not arrive as a message either.
 func TestStatusStreamStaysSilentWhileNothingChanges(t *testing.T) {
 	server, client, baseURL := sseTestServer(t)
+	waitForProbeState(t, server)
 	response, err := client.Get(baseURL + "/api/status/events")
 	if err != nil {
 		t.Fatal(err)
@@ -413,6 +414,23 @@ func TestStatusStreamStaysSilentWhileNothingChanges(t *testing.T) {
 	}
 }
 
+// waitForProbeState blocks until the network probe has published a state.
+//
+// The probe settles once, shortly after the process starts, and that settling
+// is a real change: the sidebar is meant to be told that 检测中 became 已连接.
+// A test that opens a stream before it lands is measuring the startup, not the
+// steady state it is about.
+func waitForProbeState(t *testing.T, server *Server) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for server.bot.TelegramNetwork() == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("the network probe never produced a state")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // A stream is authorized once, at the handshake, and then lives on - so the
 // sidebar's stream re-checks the session on its own tick, as the download
 // stream does. Without it a page that is no longer logged in goes on being told
@@ -443,11 +461,18 @@ func TestStatusStreamEndsWhenTheSessionIsCleared(t *testing.T) {
 
 // The sidebar's network line is the probe's own state, not a second
 // measurement of it. The Web must be able to render it from the stream alone,
-// which means the field has to be on the wire from the first frame - and it has
-// to be the same answer the Bot's /status gives, since both read one probe and
-// the proxy pays for one set of requests.
+// which means the field has to be on the wire from the first frame.
+//
+// The wait is what keeps this from being a tautology. Comparing the frame with
+// TelegramNetwork() passes even when both are empty, and an empty state is
+// exactly what a wiring mistake looks like - the account state is empty too
+// before the first probe, and reading the wrong one would produce a frame that
+// matches itself. Waiting for a sampled state first means the assertion is made
+// against a value only a probe that actually ran can produce.
 func TestStatusStreamCarriesTheTelegramNetworkState(t *testing.T) {
 	server, client, baseURL := sseTestServer(t)
+	waitForProbeState(t, server)
+
 	response, err := client.Get(baseURL + "/api/status/events")
 	if err != nil {
 		t.Fatal(err)
@@ -471,5 +496,8 @@ func TestStatusStreamCarriesTheTelegramNetworkState(t *testing.T) {
 	}
 	if status.TelegramNetwork.Status != server.bot.TelegramNetwork() {
 		t.Fatalf("the frame reports network %q while the probe holds %q", status.TelegramNetwork.Status, server.bot.TelegramNetwork())
+	}
+	if status.TelegramNetwork.Status == "" {
+		t.Fatalf("the frame carries an empty network state after the probe has one:\n%s", payload)
 	}
 }

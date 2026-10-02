@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -130,6 +131,40 @@ func TestAccountsStatusTextWithNoAccounts(t *testing.T) {
 	}
 }
 
+// Telegram rejects a message longer than botCardLimit, so a list that grows
+// with the number of sessions has to stop somewhere. What matters is that it
+// stops visibly: a silently shortened list would read as the whole truth.
+func TestAccountsStatusTextStopsVisiblyAtTheBudget(t *testing.T) {
+	accounts := make([]telegram.Account, 0, 200)
+	for index := 0; index < 200; index++ {
+		accounts = append(accounts, telegram.Account{
+			ID:         fmt.Sprintf("account-%d", index),
+			TelegramID: int64(index),
+			FirstName:  strings.Repeat("名", 20),
+			State:      "authorized",
+		})
+	}
+	got := accountsStatusText(accounts, "account-0")
+
+	if len([]rune(got)) > botCardLimit {
+		t.Fatalf("the account block is %d runes, past the %d Telegram accepts:\n%s", len([]rune(got)), botCardLimit, got)
+	}
+	if !strings.Contains(got, "另有 200 个账号未显示") && !strings.Contains(got, "个账号未显示") {
+		t.Fatalf("the list was shortened without saying so:\n%s", got)
+	}
+	if strings.Contains(got, "account-199") {
+		t.Fatalf("the 200th account was rendered, so nothing was bounded:\n%s", got)
+	}
+	// Every retained line is whole: cutting inside an escape sequence would
+	// produce markup Telegram rejects.
+	name := strings.Repeat("名", 20)
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "- ") && !strings.Contains(line, name) {
+			t.Fatalf("a line was cut mid-account: %q", line)
+		}
+	}
+}
+
 // The card is read as a whole, so its layout is pinned line by line rather than
 // by keywords: a figure that moved to a different line, or a label that drifted
 // from the wording the Web UI uses, is a change the reader notices before any
@@ -196,6 +231,7 @@ func TestTelegramProbeRecordsBothOutcomes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound) // what the API root actually answers
 	}))
+	t.Cleanup(server.Close)
 	// The probe goes through the service's own client so that it travels the
 	// configured proxy, which is the only reason its answer is worth anything.
 	store, err := settings.Open(t.TempDir())
@@ -306,7 +342,7 @@ func TestStalledProxyDialIsAbandoned(t *testing.T) {
 	if err := store.Update(values); err != nil {
 		t.Fatalf("set proxy: %v", err)
 	}
-	client := (&Service{settings: store, dialTimeout: 300 * time.Millisecond}).httpClient()
+	client := (&Service{settings: store, dialTimeout: 1500 * time.Millisecond}).httpClient()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -325,22 +361,40 @@ func TestStalledProxyDialIsAbandoned(t *testing.T) {
 	select {
 	case conn := <-accepted:
 		defer func() { _ = conn.Close() }()
-		// The connection has to be released, and the dial's own bound outlives
-		// the request's deadline, so waiting past it is the check.
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		// The client opens with its SOCKS5 greeting, so the first read is data
-		// rather than the end. Reading until the error is the point: an end of
-		// file means the client gave up and closed, a timeout means it never did.
+		// Two properties, in order.
+		//
+		// The first is why the bound has to be here at all: the request's
+		// deadline does not reach the dial, so a moment after the request has
+		// given up the connection is still open and still being held. Reading
+		// until the deadline is how that shows - the smoke test for it would be
+		// an end of file, which is what the second read waits for.
 		buffer := make([]byte, 64)
-		var readErr error
-		for readErr == nil {
-			_, readErr = conn.Read(buffer)
+		if err := drainUntilSilence(conn, buffer, 200*time.Millisecond); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("the connection closed with the request (%v), so this test is not measuring a stalled dial", err)
 		}
-		if errors.Is(readErr, os.ErrDeadlineExceeded) {
+		// The second is the fix: the dial's own bound releases it, which shows
+		// as an end of file rather than another timeout.
+		if err := drainUntilSilence(conn, buffer, 3*time.Second); errors.Is(err, os.ErrDeadlineExceeded) {
 			t.Fatal("the dial was never abandoned: the stalled connection is still held")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the proxy was never dialed")
+	}
+}
+
+// drainUntilSilence reads until the connection reports something other than
+// data, and returns that error. A deadline error means the peer is still
+// holding the connection; anything else means it closed it.
+func drainUntilSilence(conn net.Conn, buffer []byte, wait time.Duration) error {
+	if err := conn.SetReadDeadline(time.Now().Add(wait)); err != nil {
+		return err
+	}
+	for {
+		// The client opens with its SOCKS5 greeting, so the first read is data
+		// rather than the end.
+		if _, err := conn.Read(buffer); err != nil {
+			return err
+		}
 	}
 }
 
