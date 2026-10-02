@@ -1,4 +1,4 @@
 // Package buildinfo defines the version of this TDL 管理 project.
 package buildinfo
 
-const Version = "v1.11.15"
+const Version = "v1.11.16"

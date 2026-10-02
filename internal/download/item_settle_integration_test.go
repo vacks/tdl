@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/gotd/td/tgerr"
 
 	transfer "github.com/vacks/tdl/internal/download/transfer"
+	"github.com/vacks/tdl/internal/settings"
 	"github.com/vacks/tdl/internal/tmsg"
 )
 
@@ -382,5 +384,141 @@ func TestPostgresTheTwoTablesReleaseClaimsDifferentlyOnFailure(t *testing.T) {
 		t.Fatal("a failed message file released its claim here, which is not this writer's decision: " +
 			"the task releases everything it holds when it fails, and two writers of one decision is what " +
 			"this merge exists to remove")
+	}
+}
+
+// A task a person has stopped does not publish.
+//
+// The final move is irreversible and leaves a file where a person looks for
+// their downloads, so the check that the task may still publish has to happen
+// under the same lock as the control action that stops it. It is also the one
+// thing about publishing that differs between the two task kinds - along with
+// which lock that is - so the merged writer takes both as parameters, and this
+// drives each kind through it rather than trusting that the parameters are
+// wired.
+func TestPostgresAStoppedTaskDoesNotPublish(t *testing.T) {
+	m := openChatItemTestManager(t, "stopped-chat", ChatStatusPaused, []chatTestItem{
+		{messageID: 41, status: "downloaded"},
+	})
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('stopped-job','tg://x','channel','channel:stopped','test','account','paused',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status) VALUES ('stopped-job','channel:stopped',1,40,'media.bin','downloaded')`); err != nil {
+		t.Fatal(err)
+	}
+	m.downloadDir = t.TempDir()
+
+	config := settings.Defaults()
+	config.Download.FinalFilenameTemplate = "{{ .MessageID }}_media.bin"
+	cases := []struct {
+		name   string
+		item   source
+		owner  string
+		paused string
+	}{
+		{"message task", source{Item: Item{DialogKey: "channel:stopped", DialogID: 1, MessageID: 40, OriginalName: "media.bin"}}, "stopped-job", "paused"},
+		{"session task", source{Item: Item{DialogKey: "channel:items", DialogID: 1, MessageID: 41, OriginalName: "media.bin"}}, "stopped-chat", "paused"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			incoming := filepath.Join(m.downloadDir, "incoming-"+testCase.owner+".bin")
+			if err := os.WriteFile(incoming, make([]byte, 16), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if testCase.owner == "stopped-job" {
+				err = m.publishItem(testCase.owner, incoming, testCase.item, config)
+			} else {
+				err = m.publishChatItem(testCase.owner, incoming, testCase.item, config)
+			}
+			if err != nil {
+				t.Fatalf("publishing for a %s returned %v, want it to decline quietly", testCase.paused, err)
+			}
+			if _, statErr := os.Stat(incoming); statErr != nil {
+				t.Fatalf("the working file was removed for a stopped task: %v", statErr)
+			}
+			finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, testCase.item)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, statErr := os.Stat(finalPath); statErr == nil {
+				t.Fatalf("a stopped task moved a file into %q", finalPath)
+			}
+		})
+	}
+}
+
+// Pausing a task pauses all of its work, on both tables, and a control action
+// that stops a task does not leave it owning media.
+//
+// The two halves of this were written separately and had already drifted: the
+// session list was missing 'waiting', so a file waiting on another task's claim
+// was left un-paused and 恢复 - which asks for paused rows - never picked it up.
+// The lists are one list now, and this drives both task kinds through their own
+// control entry point rather than through the shared statement, so a builder
+// that stops being used is caught as well.
+func TestPostgresPausingLeavesNoFileBehindOnEitherTable(t *testing.T) {
+	m := openChatItemTestManager(t, "pause-all-chat", ChatStatusDownloading, []chatTestItem{
+		{messageID: 51, status: "queued"},
+		{messageID: 52, status: "waiting"},
+		{messageID: 53, status: "running"},
+		{messageID: 54, status: "downloaded"},
+		{messageID: 55, status: "completed"},
+	})
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := m.db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('pause-all-job','tg://x','channel','channel:pauseall','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for id, status := range map[int]string{51: "queued", 52: "waiting", 53: "running", 54: "downloaded", 55: "completed"} {
+		if _, err := m.db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status) VALUES ('pause-all-job','channel:pauseall',1,?,'f.bin',?)`, id, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Both tasks hold a claim, so the release is part of what is being checked.
+	for _, row := range []struct {
+		kind, owner string
+		messageID   int
+	}{{"message", "pause-all-job", 53}, {"chat", "pause-all-chat", 53}} {
+		if _, err := m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, status, owner_kind, owner_id, updated_at) VALUES (?, ?, 'claimed', ?, ?, ?)`,
+			map[bool]string{true: "channel:pauseall", false: "channel:items"}[row.kind == "message"], row.messageID, row.kind, row.owner, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := m.Pause("pause-all-job"); err != nil {
+		t.Fatalf("Pause(): %v", err)
+	}
+	if err := m.PauseChat("pause-all-chat"); err != nil {
+		t.Fatalf("PauseChat(): %v", err)
+	}
+
+	for _, table := range []struct {
+		name, owner, key string
+		completed        int
+	}{{"download_items", "pause-all-job", "channel:pauseall", 55}, {"chat_download_items", "pause-all-chat", "channel:items", 55}} {
+		for id := 51; id <= 55; id++ {
+			var status string
+			if err := m.db.QueryRow(`SELECT status FROM `+table.name+` WHERE `+map[bool]string{true: "job_id", false: "chat_job_id"}[table.name == "download_items"]+` = ? AND message_id = ?`, table.owner, id).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if id == table.completed {
+				if status != "completed" {
+					t.Errorf("%s: the finished file is %q after a pause, want completed", table.name, status)
+				}
+				continue
+			}
+			if status != "paused" {
+				t.Errorf("%s: file %d is %q after a pause, want paused - a file the pause left behind "+
+					"is not returned by 恢复, which asks for paused rows", table.name, id, status)
+			}
+		}
+	}
+	var held int
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE status = 'claimed'`).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 0 {
+		t.Fatalf("%d claims are still held by paused tasks; the release travels with the state change", held)
 	}
 }

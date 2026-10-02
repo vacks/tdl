@@ -770,7 +770,7 @@ func (m *Manager) recoverStrandedRunningJobs() error {
 		// files are kept, and the upstream temporary files and resume keys are
 		// left in place for the next attempt.
 		err := m.transitionItems(candidate.id, "running", "queued", "任务长时间没有工作线程处理，已自动恢复",
-			`UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('running', 'downloaded')`, candidate.id)
+			`UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '' WHERE job_id = ? AND status IN ('running', 'downloaded')`, nil, candidate.id)
 		if err != nil {
 			applog.Error("download", "stranded_task_requeue_failed", "job_id", candidate.id, "error", err.Error())
 			continue
@@ -2126,7 +2126,7 @@ func (m *Manager) requeueStalledJob(id string) error {
 SET status = 'queued', error = '下载长时间无进度，已自动重试',
     elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END,
     started_at = '', finished_at = ''
-WHERE job_id = ? AND status IN ('queued', 'running')`, now, id)
+WHERE job_id = ? AND status IN ('queued', 'running')`, nil, now, id)
 }
 
 func regularFileExists(path string) bool {
@@ -3028,65 +3028,7 @@ func incompleteFileError(item source, path string) error {
 // publishItem moves a file only after upstream tdl has closed and finalized
 // its temporary file. It runs outside the upstream download worker.
 func (m *Manager) publishItem(jobID, path string, item source, config settings.Values) error {
-	lock := m.jobLock(jobID)
-	lock.Lock()
-	defer lock.Unlock()
-	if !m.runningOrUnknown(jobID) {
-		return nil
-	}
-	if problem := incompleteFileError(item, path); problem != nil {
-		if err := m.setItem(item, "failed", "", problem.Error()); err != nil {
-			return err
-		}
-		// The partial file is useless to a later attempt - upstream rewrites its
-		// temporary file from the first byte - so leaving it only leaves
-		// something a person would mistake for a download.
-		_ = os.Remove(path)
-		return problem
-	}
-	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
-	if err != nil {
-		if saveErr := m.setItem(item, "failed", "", err.Error()); saveErr != nil {
-			return saveErr
-		}
-		return err
-	}
-	if occupied, regularFile := destinationOccupied(finalPath); occupied {
-		message := "目标文件已存在，未覆盖"
-		if !regularFile {
-			message = blockedDestinationMessage(finalPath)
-		}
-		if err := m.setItem(item, "failed", "", message); err != nil {
-			return err
-		}
-		return errors.New(message)
-	}
-	// Persist the selected final path before the irreversible move. If the
-	// database disconnects after a successful move, reconciliation can verify
-	// the path instead of downloading this media again.
-	if err := m.setItem(item, "downloaded", finalPath, ""); err != nil {
-		return fmt.Errorf("保存待发布状态: %w", err)
-	}
-	if err := publishNoReplace(path, finalPath); err != nil {
-		if errors.Is(err, unix.EEXIST) {
-			// Something appeared between the check above and the move. Report it
-			// with the same distinction, because the item is now blocked exactly
-			// as it would have been by the earlier check.
-			message := "目标文件已存在，未覆盖"
-			if occupied, regularFile := destinationOccupied(finalPath); occupied && !regularFile {
-				message = blockedDestinationMessage(finalPath)
-			}
-			if saveErr := m.setItem(item, "failed", "", message); saveErr != nil {
-				return saveErr
-			}
-			return errors.New(message)
-		}
-		if saveErr := m.setItem(item, "failed", "", err.Error()); saveErr != nil {
-			return saveErr
-		}
-		return err
-	}
-	return m.setItem(item, "completed", finalPath, "")
+	return m.publish(messageItems, m.jobLock(jobID), func() bool { return m.runningOrUnknown(jobID) }, jobID, path, item, config)
 }
 
 func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]source, error) {
@@ -3502,13 +3444,13 @@ func (m *Manager) Pause(id string) error {
 		return errors.New("当前任务不能暂停")
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if err := m.transitionItems(id, status, "paused", "已暂停，可继续恢复", m.pauseItemsSQL(), now, id); err != nil {
+	if err := m.transitionItems(id, status, "paused", "已暂停，可继续恢复", messageItems.pauseStatement(), releaseClaimsIn(messageItems, id), now, id); err != nil {
 		return fmt.Errorf("暂停任务: %w", err)
 	}
 	// A paused task transfers nothing, so it must not keep owning media: a
 	// waiting task tests the claim, and a claim held by a task the user paused is
-	// released by nothing else. PauseChat does the same for the same reason.
-	m.releaseMessageClaims(id)
+	// released by nothing else. The release travels with the state change, in
+	// transitionItems' own transaction.
 	m.mu.Lock()
 	cancel := m.cancels[id]
 	m.mu.Unlock()
@@ -3528,7 +3470,7 @@ func (m *Manager) Resume(id string) error {
 	if m.status(id) != "paused" {
 		return errors.New("当前任务不能恢复")
 	}
-	if err := m.transitionItems(id, "paused", "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
+	if err := m.transitionItems(id, "paused", "queued", "", messageItems.requeueStatement(false), nil, id); err != nil {
 		return fmt.Errorf("恢复任务: %w", err)
 	}
 	m.resetAttempts(id)
@@ -3554,7 +3496,7 @@ func (m *Manager) Retry(id string) error {
 	// which is the point, but a click is a new budget: leaving the counter at the
 	// cap made the next flood or stall fail the task on its first recurrence with
 	// "已停止自动重试", so the retry the user asked for changed nothing.
-	if err := m.transitionItems(id, status, "queued", "", `UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE job_id = ? AND status != 'completed'`, id); err != nil {
+	if err := m.transitionItems(id, status, "queued", "", messageItems.requeueStatement(false), nil, id); err != nil {
 		return fmt.Errorf("重试任务: %w", err)
 	}
 	m.resetAttempts(id)
@@ -3578,10 +3520,9 @@ func (m *Manager) Cancel(id string) error {
 	if status != "queued" && status != "running" && status != "paused" {
 		return errors.New("当前任务不能取消")
 	}
-	if err := m.transitionItems(id, status, "cancelled", "已取消；临时文件保留，可手动清理", `UPDATE download_items SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status != 'completed'`, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if err := m.transitionItems(id, status, "cancelled", "已取消；临时文件保留，可手动清理", messageItems.cancelStatement(), releaseClaimsIn(messageItems, id), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 		return fmt.Errorf("取消任务: %w", err)
 	}
-	m.releaseFailedMessageClaims(id)
 	m.mu.Lock()
 	cancel := m.cancels[id]
 	m.mu.Unlock()
@@ -3595,7 +3536,7 @@ func (m *Manager) Cancel(id string) error {
 // transaction. A control request therefore never leaves a task marked as
 // paused/cancelled/queued while its file rows still describe a different
 // durable state.
-func (m *Manager) transitionItems(id, expected, next, message, itemSQL string, args ...any) error {
+func (m *Manager) transitionItems(id, expected, next, message, itemSQL string, after func(*databaseTx) error, args ...any) error {
 	tx, err := m.db.Begin()
 	if err != nil {
 		return err
@@ -3614,6 +3555,11 @@ func (m *Manager) transitionItems(id, expected, next, message, itemSQL string, a
 	}
 	if _, err := tx.Exec(itemSQL, args...); err != nil {
 		return err
+	}
+	if after != nil {
+		if err := after(tx); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err

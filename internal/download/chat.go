@@ -15,8 +15,6 @@ import (
 
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	"golang.org/x/sys/unix"
-
 	transfer "github.com/vacks/tdl/internal/download/transfer"
 	"github.com/vacks/tdl/internal/tmedia"
 	"github.com/vacks/tdl/internal/tmsg"
@@ -1580,59 +1578,7 @@ func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error
 }
 
 func (m *Manager) publishChatItem(chatID, path string, item source, config settings.Values) error {
-	// A control action waits for an in-flight final-file publish to reach one
-	// durable result. Later callbacks observe the paused/cancelled parent and
-	// return without moving files or changing item state.
-	lock := m.chatLock(chatID)
-	lock.Lock()
-	defer lock.Unlock()
-	if !m.chatRunningOrUnknown(chatID) {
-		return nil
-	}
-	if problem := incompleteFileError(item, path); problem != nil {
-		// The partial file is useless to a later attempt - upstream rewrites its
-		// temporary file from the first byte - so leaving it only leaves
-		// something a person would mistake for a download.
-		_ = os.Remove(path)
-		if err := m.setChatItem(chatID, item, "failed", "", problem.Error()); err != nil {
-			return err
-		}
-		// Reported rather than merely recorded, matching the message path: the
-		// batch logs it, and a silent refusal is the failure mode this check
-		// exists to end.
-		return problem
-	}
-	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
-	if err != nil {
-		return m.setChatItem(chatID, item, "failed", "", err.Error())
-	}
-	if occupied, regularFile := destinationOccupied(finalPath); occupied {
-		message := "目标文件已存在，未覆盖"
-		if !regularFile {
-			message = blockedDestinationMessage(finalPath)
-		}
-		return m.setChatItem(chatID, item, "failed", "", message)
-	}
-	if err := m.setChatItem(chatID, item, "downloaded", finalPath, ""); err != nil {
-		return err
-	}
-	if err := publishNoReplace(path, finalPath); err != nil {
-		// A name that was taken between the check above and the move is the same
-		// answer as one taken before it, and it is told the same way - the move
-		// is only atomic against other movers, not against a person dropping a
-		// file into the directory. Reporting the raw error instead loses the one
-		// distinction that tells an operator whether the destination holds an
-		// ordinary file or something the move must never replace.
-		if errors.Is(err, unix.EEXIST) {
-			message := "目标文件已存在，未覆盖"
-			if occupied, regularFile := destinationOccupied(finalPath); occupied && !regularFile {
-				message = blockedDestinationMessage(finalPath)
-			}
-			return m.setChatItem(chatID, item, "failed", "", message)
-		}
-		return m.setChatItem(chatID, item, "failed", "", err.Error())
-	}
-	return m.setChatItem(chatID, item, "completed", finalPath, "")
+	return m.publish(chatItems, m.chatLock(chatID), func() bool { return m.chatRunningOrUnknown(chatID) }, chatID, path, item, config)
 }
 
 // watchedDialogKeys returns the accounts that need an update connection and, per
@@ -3526,7 +3472,7 @@ func (m *Manager) PauseChat(id string) error {
 	// only what happens to be queued leaves it out of every later statement
 	// that selects by state - resuming asks for paused rows, and this one was
 	// never made one.
-	if err := m.transitionChatItems(id, target.Status, ChatStatusPaused, "", `UPDATE chat_download_items SET status = 'paused', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END, started_at = '', finished_at = '' WHERE chat_job_id = ? AND status IN ('queued','waiting','running','downloaded')`, releaseChatClaims(id), now, id); err != nil {
+	if err := m.transitionChatItems(id, target.Status, ChatStatusPaused, "", chatItems.pauseStatement(), releaseChatClaims(id), now, id); err != nil {
 		return err
 	}
 	m.cancelChatExecutions(id)
@@ -3556,7 +3502,7 @@ func (m *Manager) ResumeChat(id string) error {
 	// away from being given up on, so pressing 恢复 would hand back a file with
 	// no attempts left. Starting a task again is the person saying the earlier
 	// failures were circumstances, not the file.
-	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE chat_job_id = ? AND status = 'paused'`, nil, id); err != nil {
+	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", chatItems.requeueStatement(true), nil, id); err != nil {
 		return err
 	}
 	m.signalChat()
@@ -3582,7 +3528,7 @@ func (m *Manager) RetryChat(id string) error {
 	// A file's attempts counter bounds the automatic stall retries. A click is a
 	// new budget - leaving the counter at the cap made the next stall fail the
 	// file immediately with "已停止自动重试", so asking for a retry did nothing.
-	if err := m.transitionChatItems(id, target.Status, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE chat_job_id = ? AND status != 'completed'`, nil, id); err != nil {
+	if err := m.transitionChatItems(id, target.Status, next, "", chatItems.requeueStatement(false), nil, id); err != nil {
 		return err
 	}
 	m.signalChat()
@@ -3601,7 +3547,7 @@ func (m *Manager) CancelChat(id string) error {
 	if target.Status == ChatStatusCompleted || target.Status == ChatStatusFailed || target.Status == ChatStatusPartial || target.Status == ChatStatusCancelled {
 		return errors.New("当前会话任务不能取消")
 	}
-	if err := m.transitionChatItems(id, target.Status, ChatStatusCancelled, "已取消，可重新开始", `UPDATE chat_download_items SET status = 'cancelled', finished_at = ? WHERE chat_job_id = ? AND status != 'completed'`, releaseChatClaims(id), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+	if err := m.transitionChatItems(id, target.Status, ChatStatusCancelled, "已取消，可重新开始", chatItems.cancelStatement(), releaseChatClaims(id), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 		return err
 	}
 	m.cancelChatExecutions(id)
