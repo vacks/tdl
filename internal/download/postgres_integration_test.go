@@ -2012,6 +2012,225 @@ func TestPostgresPublishRefusesNonRegularDestinationWithActionableError(t *testi
 	}
 }
 
+// Upstream reports a failed per-file transfer as a success: its worker logs the
+// error and returns nil, and that return value is what drives the completion
+// callback. A download that stopped part-way - the media deleted or revoked
+// mid-transfer, an expired file reference, a dropped connection - therefore
+// arrives at publishing indistinguishable from a finished one, carrying a
+// truncated or zero-byte file that upstream has already renamed into place.
+//
+// Publishing it is what made a task whose media disappeared mid-transfer report
+// every file as downloaded: the item was marked downloaded, the partial file was
+// moved into the download directory and the task settled as completed. The size
+// Telegram advertised is the only evidence left, so publishing has to check it.
+func TestPostgresPublishRefusesIncompleteDownload(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	root := t.TempDir()
+	m := &Manager{db: db, downloadDir: root, events: newEventBus(), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	const pattern = "{{ .MessageID }}_media.bin"
+	config := settings.Defaults()
+	config.Download.FinalFilenameTemplate = pattern
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	// Two shapes of the same failure: a transfer that stopped part-way, and one
+	// that failed before the first byte. The second is what leaves a zero-byte
+	// file behind, and it is also the case that never fires a progress callback,
+	// so the item is still 'queued' when the completion callback arrives.
+	for _, testCase := range []struct {
+		id       string
+		message  int
+		status   string
+		onDisk   int
+		expected int64
+	}{
+		{id: "partial-publish", message: 11, status: "downloaded", onDisk: 4096, expected: 65536},
+		{id: "empty-publish", message: 12, status: "queued", onDisk: 0, expected: 65536},
+	} {
+		item := source{Item: Item{
+			DialogKey:    "channel:incomplete",
+			DialogID:     1,
+			MessageID:    testCase.message,
+			OriginalName: "media.bin",
+			Size:         testCase.expected,
+		}}
+		finalPath, destErr := finalDestination(root, pattern, item)
+		if destErr != nil {
+			t.Fatal(destErr)
+		}
+		if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES (?,'tg://m','channel','channel:incomplete','test','account','running',?,?)`, testCase.id, now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, size, status) VALUES (?,'channel','channel:incomplete',1,?,'media.bin',?,?)`, testCase.id, testCase.message, testCase.expected, testCase.status); err != nil {
+			t.Fatal(err)
+		}
+		// Upstream hands over its temporary file already renamed, so this is the
+		// path the completion callback reports.
+		incoming := filepath.Join(root, fmt.Sprintf("incoming-%d.bin", testCase.message))
+		if err := os.WriteFile(incoming, make([]byte, testCase.onDisk), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := m.publishItem(testCase.id, incoming, item, config)
+		if err == nil {
+			t.Fatalf("%s: publishItem() accepted an incomplete file as a download", testCase.id)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("实际 %d 字节", testCase.onDisk)) {
+			t.Fatalf("%s: error %q does not report the bytes actually on disk, so the operator cannot tell what happened", testCase.id, err.Error())
+		}
+		wantDownloadItemStatus(t, db, testCase.id, "failed")
+		var saved string
+		if err := db.QueryRow(`SELECT error FROM download_items WHERE job_id = ?`, testCase.id).Scan(&saved); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(saved, "文件未下载完整") {
+			t.Fatalf("%s: saved item error = %q; want it to say the file is incomplete rather than reporting a completed download", testCase.id, saved)
+		}
+		// The decisive outcomes: the partial file must not reach the download
+		// directory, and no task may be told it may adopt one.
+		if _, statErr := os.Stat(finalPath); statErr == nil {
+			t.Fatalf("%s: the incomplete file was published to %s", testCase.id, finalPath)
+		}
+		if _, statErr := os.Stat(incoming); statErr == nil {
+			t.Fatalf("%s: the incomplete file was left behind for a person to mistake for a download", testCase.id)
+		}
+		var owners int
+		if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:incomplete' AND message_id = ?`, testCase.message).Scan(&owners); err != nil {
+			t.Fatal(err)
+		}
+		if owners != 0 {
+			t.Fatalf("%s: an incomplete file was recorded as an owned, reusable download", testCase.id)
+		}
+	}
+
+	// The control that keeps this from passing by refusing everything: a file of
+	// exactly the advertised size still publishes and is still adoptable.
+	complete := source{Item: Item{
+		DialogKey:    "channel:incomplete",
+		DialogID:     1,
+		MessageID:    13,
+		OriginalName: "media.bin",
+		Size:         4096,
+	}}
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('complete-publish','tg://m','channel','channel:incomplete','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, size, status) VALUES ('complete-publish','channel','channel:incomplete',1,13,'media.bin',4096,'downloaded')`); err != nil {
+		t.Fatal(err)
+	}
+	completeIncoming := filepath.Join(root, "incoming-complete.bin")
+	if err := os.WriteFile(completeIncoming, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.publishItem("complete-publish", completeIncoming, complete, config); err != nil {
+		t.Fatalf("publishItem() refused a complete download: %v", err)
+	}
+	wantDownloadItemStatus(t, db, "complete-publish", "completed")
+	completeFinal, err := finalDestination(root, pattern, complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, statErr := os.Stat(completeFinal); statErr != nil || info.Size() != 4096 {
+		t.Fatalf("complete download not published to %s: stat=%v", completeFinal, statErr)
+	}
+	var owner string
+	if err := db.QueryRow(`SELECT owner_id FROM downloaded_media WHERE dialog_key = 'channel:incomplete' AND message_id = 13`).Scan(&owner); err != nil {
+		t.Fatalf("complete download has no ownership row: %v", err)
+	}
+	if owner != "complete-publish" {
+		t.Fatalf("ownership row owner = %q; want complete-publish", owner)
+	}
+}
+
+// The chat path publishes through its own function, so the same refusal has to
+// be wired there too: a session task that recorded a truncated file as completed
+// would report a finished batch and never download the media again.
+func TestPostgresPublishChatItemRefusesIncompleteDownload(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	root := t.TempDir()
+	m := &Manager{db: db, downloadDir: root, events: newEventBus(), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	const pattern = "{{ .MessageID }}_chatmedia.bin"
+	config := settings.Defaults()
+	config.Download.FinalFilenameTemplate = pattern
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, created_at, updated_at) VALUES ('incomplete-chat','tg://chat','channel','channel:incomplete-chat',1,'test','account','downloading','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	item := source{Item: Item{
+		DialogKey:    "channel:incomplete-chat",
+		DialogID:     1,
+		MessageID:    21,
+		OriginalName: "chatmedia.bin",
+		Size:         65536,
+	}}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, size, status, discovered_at) VALUES ('incomplete-chat','channel:incomplete-chat',21,'chatmedia.bin',65536,'downloaded',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	incoming := filepath.Join(root, "incoming-chat.bin")
+	if err := os.WriteFile(incoming, make([]byte, 1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finalPath, err := finalDestination(root, pattern, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.publishChatItem("incomplete-chat", incoming, item, config)
+	if err == nil {
+		t.Fatal("publishChatItem() accepted an incomplete file as a download")
+	}
+	if !strings.Contains(err.Error(), "文件未下载完整") {
+		t.Fatalf("publishChatItem() error %q; want it to say the file is incomplete", err.Error())
+	}
+	var status, saved string
+	if err := db.QueryRow(`SELECT status, error FROM chat_download_items WHERE chat_job_id = 'incomplete-chat' AND message_id = 21`).Scan(&status, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || !strings.Contains(saved, "文件未下载完整") {
+		t.Fatalf("chat item status=%q error=%q; want failed with an incomplete-file reason", status, saved)
+	}
+	if _, statErr := os.Stat(finalPath); statErr == nil {
+		t.Fatalf("the incomplete file was published to %s", finalPath)
+	}
+	if _, statErr := os.Stat(incoming); statErr == nil {
+		t.Fatal("the incomplete file was left behind for a person to mistake for a download")
+	}
+	var owners int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM downloaded_media WHERE dialog_key = 'channel:incomplete-chat' AND message_id = 21`).Scan(&owners); err != nil {
+		t.Fatal(err)
+	}
+	if owners != 0 {
+		t.Fatal("an incomplete file was recorded as an owned, reusable download")
+	}
+}
+
 // Stop has to end the worker loops. They are not driven by a task context, so
 // cancelling transfers leaves them polling — and the poll after Stop closes the
 // database is an error against a closed pool, repeated for the whole shutdown

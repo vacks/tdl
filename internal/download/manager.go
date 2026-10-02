@@ -2857,6 +2857,45 @@ func (m *Manager) publishCompletedItem(jobID, dialogKey string, messageID int, p
 	return tx.Commit()
 }
 
+// incompleteFileError reports whether a file upstream just finalized actually
+// holds the whole media.
+//
+// It exists because upstream reports success for transfers that failed. Its
+// per-file worker logs a download error and returns nil to its caller, and the
+// completion callback is driven by that return value, so a transfer that stopped
+// part-way - a message or its media deleted or revoked mid-download, an expired
+// file reference, a dropped connection - arrives here exactly like a finished
+// one. Upstream has then already renamed the temporary file, so what it hands
+// over is a partial file with the final name, or a zero-byte file when nothing
+// was ever written.
+//
+// Nothing downstream could tell the difference, which is how a task whose media
+// disappeared mid-transfer came to report every file as downloaded: the item was
+// marked downloaded, the truncated file was moved into the download directory
+// and the task settled as completed. The size Telegram advertised for the media
+// is the only surviving evidence, and this is the last moment where acting on it
+// keeps the file from being published and owned.
+//
+// A media with no advertised size cannot be checked and is published as before.
+// Refusing it would trade a silent false success for a loud false failure on
+// rows that predate the size column.
+func incompleteFileError(item source, path string) error {
+	if item.Size <= 0 {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("读取下载文件失败：%v", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("下载结果不是普通文件：%s", path)
+	}
+	if info.Size() != item.Size {
+		return fmt.Errorf("文件未下载完整，媒体可能已被删除或撤回：预期 %d 字节，实际 %d 字节", item.Size, info.Size())
+	}
+	return nil
+}
+
 // publishItem moves a file only after upstream tdl has closed and finalized
 // its temporary file. It runs outside the upstream download worker.
 func (m *Manager) publishItem(jobID, path string, item source, config settings.Values) error {
@@ -2865,6 +2904,16 @@ func (m *Manager) publishItem(jobID, path string, item source, config settings.V
 	defer lock.Unlock()
 	if !m.runningOrUnknown(jobID) {
 		return nil
+	}
+	if problem := incompleteFileError(item, path); problem != nil {
+		if err := m.setItem(item, "failed", "", problem.Error()); err != nil {
+			return err
+		}
+		// The partial file is useless to a later attempt - upstream rewrites its
+		// temporary file from the first byte - so leaving it only leaves
+		// something a person would mistake for a download.
+		_ = os.Remove(path)
+		return problem
 	}
 	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
 	if err != nil {

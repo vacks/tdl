@@ -1454,6 +1454,19 @@ func (m *Manager) publishChatItem(chatID, path string, item source, config setti
 	if status := m.chatStatus(chatID); status != ChatStatusScanning && status != ChatStatusDownloading && status != ChatStatusListening {
 		return nil
 	}
+	if problem := incompleteFileError(item, path); problem != nil {
+		// The partial file is useless to a later attempt - upstream rewrites its
+		// temporary file from the first byte - so leaving it only leaves
+		// something a person would mistake for a download.
+		_ = os.Remove(path)
+		if err := m.setChatItem(chatID, item, "failed", "", problem.Error()); err != nil {
+			return err
+		}
+		// Reported rather than merely recorded, matching the message path: the
+		// batch logs it, and a silent refusal is the failure mode this check
+		// exists to end.
+		return problem
+	}
 	finalPath, err := finalDestination(m.downloadDir, config.Download.FinalFilenameTemplate, item)
 	if err != nil {
 		return m.setChatItem(chatID, item, "failed", "", err.Error())
