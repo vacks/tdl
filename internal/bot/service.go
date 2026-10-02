@@ -30,6 +30,38 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// messageSubmitter is the download-manager surface the Bot's message path
+// needs. It exists so a test can drive the two attempts a forwarded post makes
+// without a Telegram session or a database; production binds the manager.
+type messageSubmitter interface {
+	Submit(context.Context, download.DownloadIntent) (download.Submission, error)
+	SubmitBotChatMessage(context.Context, download.BotChatIntent) (download.Submission, error)
+}
+
+// botIdentity is what getMe answered, remembered for the token it was read
+// under. The token is part of the record because it is the cache key: a changed
+// token is a different Bot, and the two must never be mixed.
+type botIdentity struct {
+	token    string
+	username string
+}
+
+// albumWindow is how long one member of an album speaks for the rest. The
+// updates of one album are delivered together, so this only has to outlast a
+// batch; it is generous so that a member redelivered behind a slow sibling is
+// still recognised as one already answered.
+const albumWindow = 5 * time.Minute
+
+// albumMemory bounds how many albums are remembered at once. An album is a few
+// bytes for a few minutes, so the bound is a backstop against a Bot being fed
+// invented group ids rather than a working limit.
+const albumMemory = 256
+
+// botUser is the part of the getMe result this service reads.
+type botUser struct {
+	Username string `json:"username"`
+}
+
 // Service is intentionally a small Telegram Bot API client. It is separate
 // from the user-account MTProto client used by tdl downloads.
 type Service struct {
@@ -91,6 +123,29 @@ type Service struct {
 	// telegramDialTimeout. It is settable so a test can watch the bound being
 	// enforced without waiting out the real one.
 	dialTimeout time.Duration
+	// submit is the download manager's submission entry point. It is an
+	// interface rather than the concrete manager so a test can drive the two
+	// attempts of a forwarded post - the origin, then the copy in this chat -
+	// without a Telegram session or a database. Production always binds the
+	// manager.
+	submit messageSubmitter
+	// botIdentityMu guards botIdentity and is deliberately not mu: what it
+	// guards is an HTTP call, and holding the service mutex across one would
+	// stall status rendering and event handling.
+	botIdentityMu sync.Mutex
+	// albums records the media groups whose download has already been started
+	// or reported, so the rest of an album's updates are answered without being
+	// resolved again. See handleMessage. It is keyed by Telegram's own group id
+	// rather than by anything of this service's, so a token change has nothing
+	// to clear here and every entry expires on its own.
+	albums map[string]time.Time
+	// botIdentity caches the Bot API getMe answer for the token it was read
+	// under. A message forwarded to the Bot can only be addressed in the chat
+	// the user sent it to if the Bot knows its own username, and asking on every
+	// forward would spend a request that never changes. See botUsername: the
+	// token is part of the record because it is the cache key, not because a
+	// separate step has to retire the old one.
+	botIdentity botIdentity
 	// dispatch hands commands to workers and tracks which of them the stored
 	// offset may move past. See updateDispatch.
 	dispatch *updateDispatch
@@ -297,7 +352,7 @@ func (p *telegramProbe) snapshot() (string, time.Duration) {
 
 func New(store *settings.Store, downloads *download.Manager, telegram *telegram.Manager, monitor *monitor.Monitor, dataDir string) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Service{settings: store, downloads: downloads, telegram: telegram, monitor: monitor, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]time.Time{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1), dispatch: newUpdateDispatch(), commandSlots: make(chan struct{}, commandWorkers)}
+	s := &Service{settings: store, downloads: downloads, submit: downloads, telegram: telegram, monitor: monitor, albums: map[string]time.Time{}, cursorPath: filepath.Join(dataDir, "bot-updates.json"), instanceID: downloads.InstanceID(), ctx: ctx, cancel: cancel, known: map[string]string{}, tracked: map[string]trackedRef{}, chatTracked: map[string]chatTrackedRef{}, listPages: map[string]listPageState{}, lifecycle: map[string]map[int64]messageRef{}, deleted: map[string]time.Time{}, dirty: map[string]struct{}{}, suppressedStatus: map[string]string{}, helpSent: map[int64]bool{}, helpRetry: map[int64]helpRetry{}, lastLiveEdit: map[string]time.Time{}, liveRendered: map[string]string{}, retryUpdates: map[int64]int{}, downloadWake: make(chan struct{}, 1), dispatch: newUpdateDispatch(), commandSlots: make(chan struct{}, commandWorkers)}
 	if data, err := os.ReadFile(s.cursorPath); err == nil {
 		if err := json.Unmarshal(data, &s.cursor); err != nil {
 			applog.Error("bot", "update_cursor_read_failed", "error", err.Error())
@@ -810,6 +865,60 @@ type message struct {
 	// reading both costs nothing.
 	ForwardFromChat      *forwardOriginChat `json:"forward_from_chat"`
 	ForwardFromMessageID int                `json:"forward_from_message_id"`
+	// forward_from and forward_sender_name are the other two pre-7.0 shapes,
+	// and they are the ones a forward from a private chat or from a hidden
+	// sender arrives in: neither carries a chat at all. Only their presence is
+	// read - see isForward.
+	ForwardFrom       json.RawMessage `json:"forward_from"`
+	ForwardSenderName string          `json:"forward_sender_name"`
+	// Date is when the message was sent, in unix seconds. It is how the copy of
+	// a forwarded message is found in the account's own view of this chat: the
+	// message id the Bot API reports belongs to the Bot's numbering, not the
+	// account's. See download.BotChatIntent.
+	Date int64 `json:"date"`
+	// MediaGroupID names the album this message belongs to, when Telegram sent
+	// it as one of several. Every file of a forwarded album arrives as its own
+	// update, so this is what lets one of them stand for the rest - see
+	// handleMessage.
+	MediaGroupID string `json:"media_group_id"`
+	// The file fields are decoded for presence only. They are RawMessage rather
+	// than the shapes they hold because a single update is parsed as a whole:
+	// modelling a photo size array or a document object would let any field this
+	// code does not read abort the decode of the entire update, and the Bot
+	// would then silently stop answering commands.
+	Photo     json.RawMessage `json:"photo"`
+	Video     json.RawMessage `json:"video"`
+	Animation json.RawMessage `json:"animation"`
+	Audio     json.RawMessage `json:"audio"`
+	Document  json.RawMessage `json:"document"`
+	Voice     json.RawMessage `json:"voice"`
+	VideoNote json.RawMessage `json:"video_note"`
+	Sticker   json.RawMessage `json:"sticker"`
+}
+
+// present reports whether a RawMessage field was actually sent. An explicit
+// JSON null unmarshals to the four bytes "null" rather than to nothing, and
+// Telegram does send nulls for fields it means as absent.
+func present(raw json.RawMessage) bool {
+	return len(raw) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// carriesFile reports whether this update holds something downloadable. It is
+// what separates a forwarded post from a forwarded remark: a forward without a
+// file is text, and text is a caption to be read as a command.
+func carriesFile(msg message) bool {
+	return present(msg.Photo) || present(msg.Video) || present(msg.Animation) ||
+		present(msg.Audio) || present(msg.Document) || present(msg.Voice) ||
+		present(msg.VideoNote) || present(msg.Sticker)
+}
+
+// isForward reports whether the Bot API described this message as a forward,
+// including the two shapes that name no chat at all. forwardedMessageURL only
+// recognises a forward it can address; a forward from a private chat or from a
+// hidden sender is still a forward, and its copy is the one the user meant.
+func isForward(msg message) bool {
+	return msg.ForwardOrigin != nil || msg.ForwardFromChat != nil ||
+		present(msg.ForwardFrom) || strings.TrimSpace(msg.ForwardSenderName) != ""
 }
 
 // forwardOrigin is narrowed to the fields a message link is made of. The
@@ -980,13 +1089,58 @@ func privateCallback(query callbackQuery) bool {
 	return query.Message != nil && query.Message.Chat.ID == query.From.ID
 }
 
+// handleMessage answers one update, collapsing the updates of an album first.
+//
+// Telegram sends a separate update for every file of a forwarded album, and each
+// one would otherwise be resolved, claimed and submitted on its own: a ten-file
+// album paid ten times over for one download, on the account's Telegram request
+// budget and in the database. One submission already queues the whole album,
+// because the downloader expands a message by its grouped id, so the first
+// update to succeed has spoken for all of them and the rest are answered without
+// being looked at.
+//
+// An album is remembered only after an attempt that will not be retried. A
+// retryable failure leaves this update to run again, and a memory that had
+// already claimed the album would swallow that retry - losing the download in
+// the very case the retry exists for.
 func (s *Service) handleMessage(cfg settings.Bot, msg message) bool {
+	if msg.MediaGroupID != "" && s.albumHandled(msg.MediaGroupID) {
+		applog.Info("bot", "album_member_skipped", "user_id", msg.From.ID, "message_id", msg.MessageID, "media_group_id", msg.MediaGroupID)
+		return true
+	}
+	handled := s.routeMessage(cfg, msg)
+	if handled && msg.MediaGroupID != "" {
+		s.rememberAlbum(msg.MediaGroupID)
+	}
+	return handled
+}
+
+// routeMessage decides what one message is asking for: a forwarded post, a
+// pasted link, or a command.
+func (s *Service) routeMessage(cfg settings.Bot, msg message) bool {
 	// A forwarded post is the thing the user wants downloaded, whatever its
 	// caption happens to say, so it is submitted before the caption is read as a
-	// command. Only a forward that names a channel post is taken this way; the
-	// rest fall through and are handled exactly as they were before.
+	// command.
 	if source, forwarded := forwardedMessageURL(msg); forwarded {
-		return s.submitMessageTask(cfg, msg, source)
+		return s.submitForwardedMessage(cfg, msg, source)
+	}
+	// A forward that names no addressable post still has a readable copy: the
+	// one sitting in this very chat, where the user forwarded it. That copy is
+	// what a reaction on the same message has always downloaded, and it is the
+	// only way to reach a post from a private chat, a hidden sender, or a basic
+	// group. Only a forward that carries a file is taken this way - a forwarded
+	// remark stays a caption, and is read as the command it may be.
+	if isForward(msg) && carriesFile(msg) {
+		addressed, copyErr := s.submitBotChatCopy(cfg, msg)
+		switch {
+		case addressed && copyErr == nil:
+			return true
+		case addressed:
+			return s.reportSubmitFailure(cfg, msg, copyErr)
+		case copyErr != nil:
+			applog.Error("bot", "forward_copy_address_failed", "user_id", msg.From.ID, "message_id", msg.MessageID, "error", redactBotError(cfg.Token, copyErr.Error()))
+			return !retryableSubmitError(copyErr)
+		}
 	}
 	kind, argument := parseCommand(normalizeCommand(strings.TrimSpace(msg.Text)))
 	switch kind {
@@ -1105,13 +1259,30 @@ func parseCommand(text string) (command, string) {
 // another attempt cannot change is reported as handled so the command is not
 // retried forever.
 func (s *Service) submitMessageTask(cfg settings.Bot, msg message, sourceURL string) bool {
+	err := s.submitMessageTaskQuietly(cfg, msg, sourceURL)
+	if err == nil {
+		return true
+	}
+	return s.reportSubmitFailure(cfg, msg, err)
+}
+
+// submitMessageTaskQuietly submits and says nothing. The two-attempt path needs
+// the first attempt to be silent: reporting the origin's failure before trying
+// the copy would send the user an error and then a task card for the same
+// message.
+func (s *Service) submitMessageTaskQuietly(cfg settings.Bot, msg message, sourceURL string) error {
 	ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
-	submission, err := s.downloads.Submit(ctx, download.DownloadIntent{Source: download.SourceBot, URL: sourceURL})
+	submission, err := s.submit.Submit(ctx, download.DownloadIntent{Source: download.SourceBot, URL: sourceURL})
 	cancel()
+	return recordSubmission(msg, submission, err)
+}
+
+// recordSubmission logs what a successful submission did and passes its error
+// through. It is shared by both ways of reaching a forwarded post, so the task
+// created by either is accounted for identically.
+func recordSubmission(msg message, submission download.Submission, err error) error {
 	if err != nil {
-		applog.Error("bot", "task_create_failed", "user_id", msg.From.ID, "error", err.Error())
-		s.send(cfg.Token, msg.Chat.ID, "❌ 创建下载任务失败："+html.EscapeString(err.Error()), nil)
-		return !retryableSubmitError(err)
+		return err
 	}
 	job := submission.Job
 	if submission.Duplicate {
@@ -1124,7 +1295,212 @@ func (s *Service) submitMessageTask(cfg settings.Bot, msg message, sourceURL str
 	// card for a job it has not seen yet — the same single path the Web UI and
 	// reactions already rely on. Sending a card from this handler as well raced
 	// with that loop and produced "下载任务已创建" plus a second progress card.
-	return true
+	return nil
+}
+
+// reportSubmitFailure tells the user what happened and returns the retry
+// decision the poll loop acts on.
+func (s *Service) reportSubmitFailure(cfg settings.Bot, msg message, err error) bool {
+	applog.Error("bot", "task_create_failed", "user_id", msg.From.ID, "error", err.Error())
+	s.send(cfg.Token, msg.Chat.ID, "❌ 创建下载任务失败："+html.EscapeString(err.Error()), nil)
+	return !retryableSubmitError(err)
+}
+
+// submitForwardedMessage downloads a forwarded post, taking the origin the
+// forward names first and falling back to the copy in the Bot's own chat.
+//
+// The two targets are not interchangeable. The origin is the post itself and
+// carries its comment section, but it is only readable when this account has
+// been let into that chat, and a forward says where a post came from without
+// saying whether the account can reach it. A forward from a channel that was
+// never joined therefore used to fail outright with CHAT_ID_INVALID - even
+// though the identical message was sitting in this chat, readable, which is
+// exactly what reacting to it downloads. Falling back is what makes forwarding
+// work as reliably as reacting already did.
+//
+// The copy is reached through the account rather than through a link, because
+// the Bot API exposes neither an access hash nor the message id the account
+// uses - see submitBotChatCopy. It lands in the same dialog with the same
+// message id a reaction on that message does, so the two triggers converge
+// instead of making two tasks for one file.
+func (s *Service) submitForwardedMessage(cfg settings.Bot, msg message, originURL string) bool {
+	err := s.submitMessageTaskQuietly(cfg, msg, originURL)
+	if err == nil {
+		return true
+	}
+	if shouldRetryFromBotChat(err) {
+		addressed, copyErr := s.submitBotChatCopy(cfg, msg)
+		switch {
+		case addressed && copyErr == nil:
+			applog.Info("bot", "forward_downloaded_from_bot_chat", "user_id", msg.From.ID, "message_id", msg.MessageID, "origin", originURL, "origin_error", err.Error())
+			return true
+		case addressed:
+			return s.reportSubmitFailure(cfg, msg, copyErr)
+		case copyErr != nil:
+			// There is no chat to read, so the reason the Bot could not be asked
+			// is the only thing left to report.
+			applog.Error("bot", "forward_copy_address_failed", "user_id", msg.From.ID, "message_id", msg.MessageID, "error", redactBotError(cfg.Token, copyErr.Error()))
+		}
+	}
+	return s.reportSubmitFailure(cfg, msg, err)
+}
+
+// albumHandled reports whether this album has already been answered, by an
+// update that is not going to be retried.
+func (s *Service) albumHandled(groupID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seenAt, ok := s.albums[groupID]
+	return ok && time.Since(seenAt) < albumWindow
+}
+
+// rememberAlbum records that one member of this album has been answered.
+func (s *Service) rememberAlbum(groupID string) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.albums == nil {
+		s.albums = map[string]time.Time{}
+	}
+	for group, seenAt := range s.albums {
+		if now.Sub(seenAt) >= albumWindow {
+			delete(s.albums, group)
+		}
+	}
+	if len(s.albums) >= albumMemory {
+		// Every entry is recent and there are a lot of them. Forget the oldest
+		// rather than grow without bound: two members of one album being handled
+		// twice costs a duplicate submission, which is what the download
+		// manager's own deduplication absorbs. Growing without bound costs the
+		// process.
+		oldestGroup, oldestAt := "", now
+		for group, seenAt := range s.albums {
+			if oldestGroup == "" || seenAt.Before(oldestAt) {
+				oldestGroup, oldestAt = group, seenAt
+			}
+		}
+		delete(s.albums, oldestGroup)
+	}
+	s.albums[groupID] = now
+}
+
+// shouldRetryFromBotChat reports whether a failed origin submission is worth a
+// second attempt against the copy in the Bot's chat.
+//
+// It is an allow-list on purpose. The download manager also fails for reasons
+// that have nothing to do with the origin being unreadable - a claim conflict,
+// a database write, a job that was committed and then could not be read back -
+// and answering any of those by submitting the same media again under a
+// different dialog key would leave the user with two downloads of one file.
+// Only the failures that mean "this account cannot read that post" get the
+// second attempt; everything else is reported exactly as it was before.
+func shouldRetryFromBotChat(err error) bool {
+	if err == nil || download.IsNothingToDo(err) {
+		// Answered rather than failed: the post holds no file this filter
+		// accepts, and the copy holds the same nothing.
+		return false
+	}
+	if retryableSubmitError(err) {
+		// Checked before the text below, and not only to keep the two
+		// classifications apart: a FLOOD_WAIT arrives wrapped inside a
+		// resolution failure often enough that both would match, and retrying a
+		// rate limit is always the right answer.
+		return false
+	}
+	return originUnreadable(err)
+}
+
+// originUnreadable reports whether the failure is this account being unable to
+// read the post the forward names.
+//
+// The error is matched as text because the chain has already lost the Telegram
+// error code by the time it gets here: the upstream resolver tries a channel, a
+// user and a chat in turn and folds the last failure into its message with %v,
+// so tgerr can no longer find it. The fragments below are the ones that
+// survive - the resolver's own wrappers, and the codes Telegram answers when a
+// peer or a message is out of reach. Anything unrecognised is left alone: a
+// fallback that is not taken reports the origin's error, which is what the user
+// saw before this existed, while one taken wrongly downloads the same file
+// twice.
+func originUnreadable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"input peer",
+		"get single message",
+		"message may be deleted",
+		"channel_invalid",
+		"chat_id_invalid",
+		"peer_id_invalid",
+		"user_id_invalid",
+		"msg_id_invalid",
+		"message_id_invalid",
+		"channel_private",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// submitBotChatCopy downloads the copy of a forwarded message that lives in the
+// user's own chat with the Bot.
+//
+// The message is identified by the time the Bot API reported rather than by the
+// id it reported, because a bot chat is numbered from the Bot's side and that
+// numbering is not the one the account sees - see download.BotChatIntent. It
+// reports ok=false with a nil error when the copy cannot be addressed at all,
+// the Bot having no username to name its chat with, and ok=false with an error
+// when the username could not be read right now.
+// It reports addressed=true with the outcome of the submission, or
+// addressed=false when there is no chat to read at all - a Bot with no username
+// names no dialog - in which case the error, if any, is why it could not be
+// asked.
+func (s *Service) submitBotChatCopy(cfg settings.Bot, msg message) (addressed bool, err error) {
+	username, err := s.botUsername(cfg)
+	if err != nil {
+		return false, err
+	}
+	if username == "" || msg.Date <= 0 {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+	submission, err := s.submit.SubmitBotChatMessage(ctx, download.BotChatIntent{Source: download.SourceBot, BotUsername: username, SentAt: msg.Date})
+	cancel()
+	return true, recordSubmission(msg, submission, err)
+}
+
+// botUsername returns the current Bot's username, reading it with getMe once
+// per token.
+//
+// The token is the cache key rather than something a token change has to go and
+// invalidate: a changed token is a different Bot whose username addresses a
+// different chat, and an entry recorded under the old one is simply not this
+// token's answer. The loop's reset block therefore has nothing to do here, and
+// a worker still finishing for the previous token cannot poison this one.
+//
+// A transport failure is deliberately not cached: one outage would otherwise
+// disable the fallback for the life of the process. An empty username is, since
+// a Bot without one will never have one.
+func (s *Service) botUsername(cfg settings.Bot) (string, error) {
+	s.botIdentityMu.Lock()
+	defer s.botIdentityMu.Unlock()
+	if s.botIdentity.token == cfg.Token {
+		return s.botIdentity.username, nil
+	}
+	var result apiResponse[botUser]
+	if err := s.call(cfg.Token, "getMe", map[string]any{}, &result); err != nil {
+		return "", err
+	}
+	if !result.OK {
+		return "", fmt.Errorf("Bot API: %s", result.Description)
+	}
+	name := strings.TrimPrefix(strings.TrimSpace(result.Result.Username), "@")
+	s.botIdentity = botIdentity{token: cfg.Token, username: name}
+	return name, nil
 }
 
 func retryableSubmitError(err error) bool {

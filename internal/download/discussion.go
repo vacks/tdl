@@ -57,15 +57,23 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 	if len(originMessages) == 0 || originPeer == nil || rootMessageID <= 0 || originMessageID <= 0 {
 		return nil, nil
 	}
-	// Saved Messages has no comment section to expand. Telegram draws none on a
-	// saved copy, the dialog can have no linked discussion group (see
-	// resolveChatDiscussionLink), and its peer is not merely reply-less:
-	// messages.getReplies rejects it outright with PEER_ID_INVALID. That error
-	// is not one of the ones that mean "no discussion", so the listener path -
-	// which asks about every new message - spent one paced request and one ERROR
-	// line per saved message on a question whose answer cannot change. Returning
-	// here states the fact instead of asking it.
-	if _, saved := originPeer.(*tg.InputPeerSelf); saved {
+	// A comment section belongs to a broadcast channel post, and
+	// messages.getReplies is the call that reads one. Saved Messages has none,
+	// and neither has a private chat or a basic group: the dialog can have no
+	// linked discussion group (see resolveChatDiscussionLink), and the peer is
+	// not merely reply-less but rejected - messages.getReplies answers
+	// PEER_ID_INVALID, which is not one of the errors that mean "no discussion".
+	// So every message read out of a private chat spent one paced request and
+	// one ERROR line on a question whose answer cannot change: the listener path
+	// asks about every new message, and both the reaction path and a message
+	// forwarded to the Bot read their copy from a user peer. Returning here
+	// states the fact instead of asking it.
+	//
+	// The test is on the peer types that cannot have a section rather than on
+	// the one that can, so a peer type this code has not seen yet is still
+	// asked about.
+	switch originPeer.(type) {
+	case *tg.InputPeerSelf, *tg.InputPeerUser, *tg.InputPeerChat:
 		return nil, nil
 	}
 	threadPeer := originPeer

@@ -108,6 +108,37 @@ func TestRelatedSourcesSkipsSavedMessages(t *testing.T) {
 	}
 }
 
+// Saved Messages is not the only peer that cannot have a comment section, and
+// the others are not edge cases: a reaction in a private chat, and a message
+// forwarded to the Bot - which is downloaded from the user's own chat with that
+// Bot - both arrive here as a user peer, and a basic group is one too. Asking
+// messages.getReplies about them answers PEER_ID_INVALID, which is not one of
+// the errors that mean "no discussion", so each one cost a paced request and an
+// ERROR line before this guard existed. The nil client is the assertion: a peer
+// that still reached the network would fault here.
+func TestRelatedSourcesSkipsPeersThatCannotHaveComments(t *testing.T) {
+	post := &tg.Message{ID: 100}
+	peers := []struct {
+		name string
+		peer tg.InputPeerClass
+	}{
+		{"a private chat with a user", &tg.InputPeerUser{UserID: 7, AccessHash: 11}},
+		{"a private chat with the Bot", &tg.InputPeerUser{UserID: 8704754608, AccessHash: 12}},
+		{"a basic group", &tg.InputPeerChat{ChatID: 5}},
+	}
+	for _, test := range peers {
+		t.Run(test.name, func(t *testing.T) {
+			items, err := relatedSources(&Manager{}, context.Background(), nil, "acct", test.peer, "私聊", []*tg.Message{post}, 100, 100, true, "job")
+			if err != nil {
+				t.Fatalf("a peer with no comment section must resolve without an error: %v", err)
+			}
+			if items != nil {
+				t.Fatalf("a peer with no comment section must yield no related items: %#v", items)
+			}
+		})
+	}
+}
+
 // The shortcut above must not swallow a post that declares a linked discussion,
 // even while it has no comments yet: that group is where the first comment will
 // land. It also must not swallow a post that declares a comment count, since
