@@ -1785,6 +1785,12 @@ func (m *Manager) run(job Job, sources []source) {
 	})
 	defer watchdog.Close()
 	var publishWG sync.WaitGroup
+	// Set when a file was returned to the queue for another attempt, which is
+	// what decides between a finished task and one that still has work.
+	var requeuedMu sync.Mutex
+	var requeued bool
+	// settled counts the files the batch gave a reason of their own.
+	var settled int
 	var stateMu sync.Mutex
 	var stateErr error
 	recordStateErr := func(err error) {
@@ -1839,6 +1845,8 @@ func (m *Manager) run(job Job, sources []source) {
 			byMessage := make(map[int]source, len(batch))
 			messageIDs := make([]int, 0, len(batch))
 			seenMessages := make(map[int]struct{}, len(batch))
+			var outcomesMu sync.Mutex
+			var outcomes []transfer.FileOutcomeUpdate
 			for _, item := range batch {
 				byMessage[item.MessageID] = item
 				// Every member of an album is listed, not just its first. The
@@ -1888,9 +1896,31 @@ func (m *Manager) run(job Job, sources []source) {
 						recordStateErr(m.publishItem(job.ID, path, item, config))
 					}(item, update.Path)
 				},
+				// Collected rather than written here: the engine calls this from
+				// a transfer worker or from the iterator, and a database round
+				// trip on that goroutine would hold up the files behind it. The
+				// batch settles its failures once, after it stops producing.
+				OnFileOutcome: func(update transfer.FileOutcomeUpdate) {
+					outcomesMu.Lock()
+					outcomes = append(outcomes, update)
+					outcomesMu.Unlock()
+				},
 			})
 			if err != nil {
 				return err
+			}
+			outcomesMu.Lock()
+			batchOutcomes := outcomes
+			outcomesMu.Unlock()
+			settledHere, requeuedHere, settleErr := m.applyItemFailures(messageItems, job.ID, planItemFailures(batchOutcomes, byMessage))
+			if settleErr != nil {
+				return settleErr
+			}
+			if settledHere > 0 || requeuedHere {
+				requeuedMu.Lock()
+				settled += settledHere
+				requeued = requeued || requeuedHere
+				requeuedMu.Unlock()
 			}
 			applog.Info("download", "batch_transferred", "job_id", job.ID, "requested", len(messageIDs),
 				"files", stats.Files, "deleted", stats.Deleted, "without_media", stats.Empty,
@@ -1962,15 +1992,70 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 		return
 	}
-	if !m.allItemsCompleted(job.ID) {
-		if m.hasWaitingMessageItems(job.ID) {
-			_ = m.setJob(job.ID, "queued", "等待其他任务完成同一文件")
-			return
-		}
-		m.fail(job.ID, errors.New("部分文件未收到收尾完成回调或移动失败"))
-	} else {
-		_ = m.setJob(job.ID, "completed", "")
+	requeuedMu.Lock()
+	hasRetries, settledHere := requeued, settled
+	requeuedMu.Unlock()
+	m.settleMessageTask(job.ID, hasRetries, settledHere)
+}
+
+// settleMessageTask decides what a task becomes once its batch has stopped.
+//
+// retries is whether any file went back on the queue, and settled is how many
+// the batch gave a reason of their own. Both are what the engine's per-file
+// report turned into, and neither can be recovered from the rows afterwards -
+// "queued" is also the state a file starts in, and a reason is not marked as to
+// where it came from.
+func (m *Manager) settleMessageTask(jobID string, retries bool, settled int) {
+	if m.allItemsCompleted(jobID) {
+		_ = m.setJob(jobID, "completed", "")
+		return
 	}
+	if m.hasWaitingMessageItems(jobID) {
+		_ = m.setJob(jobID, "queued", "等待其他任务完成同一文件")
+		return
+	}
+	// A file went back on the queue, so this task is not finished - it is
+	// waiting for another attempt at it. Settling it as failed here is what
+	// turned every dropped connection into a task a person had to restart by
+	// hand.
+	if retries {
+		_ = m.setJob(jobID, "queued", "部分文件下载中断，正在自动重试")
+		m.signal()
+		return
+	}
+	// Every unfinished file was given its own reason by the batch that tried to
+	// fetch it. fail() would write one sentence onto all of them, which is right
+	// when the task failed for a single reason - an unreadable source, a
+	// database outage - and wrong here: the difference between a dropped
+	// connection and a deleted message is what a person reads to decide whether
+	// to try again, and the overwrite is what throws it away.
+	if settled > 0 {
+		m.settleJobFromItems(jobID)
+		return
+	}
+	m.fail(jobID, errors.New("部分文件未收到收尾完成回调或移动失败"))
+}
+
+// settleJobFromItems decides a task's status from the files it is left with,
+// without rewriting any of them.
+//
+// It is fail()'s counterpart for the case where each file already carries the
+// reason it failed for. The task's own status is computed the same way - any
+// file that arrived makes it partial rather than failed - and the wording is
+// the one the other settling paths already use, so an operator reads the same
+// sentence and looks in the same place.
+func (m *Manager) settleJobFromItems(jobID string) {
+	var completed int
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status = 'completed'`, jobID).Scan(&completed); err != nil {
+		applog.Error("download", "task_settle_count_failed", "job_id", jobID, "error", err.Error())
+		return
+	}
+	if completed > 0 {
+		_ = m.setJobWhileRunning(jobID, "partial", "部分文件未完成，可重试失败文件")
+	} else {
+		_ = m.setJobWhileRunning(jobID, "failed", "没有可继续下载的文件，请查看各文件的失败原因")
+	}
+	m.releaseFailedMessageClaims(jobID)
 }
 
 // requeueRateLimitedMessage returns a flood-limited task to the queue. It

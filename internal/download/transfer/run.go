@@ -116,6 +116,14 @@ func (e *engine) transfer(ctx context.Context, item *element) {
 		err = e.fetch(ctx, item)
 	}
 	if err != nil {
+		// A transfer the caller stopped is not a transfer that failed. Pause,
+		// cancel, a database outage and shutdown all arrive here as a context
+		// error, and reporting them would mark every in-flight file of a paused
+		// task as failed - overwriting the pause the caller is in the middle of
+		// writing. Whatever stopped the batch owns those rows.
+		if ctx.Err() != nil {
+			return
+		}
 		e.failed.Add(1)
 		// The partial file is removed rather than left in place. The engine this
 		// replaced renamed it out of its temporary name and reported success,
@@ -126,14 +134,21 @@ func (e *engine) transfer(ctx context.Context, item *element) {
 		applog.Error("download", "transfer_failed", "account_id", e.deps.AccountID,
 			"dialog_id", item.dialogID, "message_id", item.message.ID,
 			"name", item.media.Name, "size", item.media.Size, "error", err.Error())
+		e.outcome(item, err)
 		return
 	}
 
 	path, err := finalize(item)
 	if err != nil {
 		e.failed.Add(1)
+		// finalize renames the working file before it stamps it, so a failure
+		// here can leave the bytes under either name. Neither is publishable -
+		// the caller never heard about it - and leaving them is what fills a
+		// working directory with files a person would mistake for downloads.
+		e.discard(item)
 		applog.Error("download", "transfer_finalize_failed", "account_id", e.deps.AccountID,
 			"dialog_id", item.dialogID, "message_id", item.message.ID, "error", err.Error())
+		e.outcome(item, err)
 		return
 	}
 
@@ -143,6 +158,24 @@ func (e *engine) transfer(ctx context.Context, item *element) {
 			MessageID: item.message.ID,
 			Path:      path,
 		})
+	}
+}
+
+// outcome reports that one message of the batch produced no file.
+func (e *engine) outcome(item *element, err error) {
+	if e.opts.OnFileOutcome == nil {
+		return
+	}
+	e.opts.OnFileOutcome(FileOutcomeUpdate{MessageID: item.message.ID, Err: err})
+}
+
+// discard removes whatever a failed finalize left on disk, under either of the
+// two names it can hold.
+func (e *engine) discard(item *element) {
+	for _, path := range []string{item.to.Name(), strings.TrimSuffix(item.to.Name(), tempExt)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			applog.Warn("download", "working_file_not_removed", "path", path, "error", err.Error())
+		}
 	}
 }
 

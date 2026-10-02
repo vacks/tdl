@@ -57,8 +57,11 @@
   跟着长轮询的节奏走，人为加令牌可能拖慢 update 投递并造成积压。
 - `auth.*`（sendCode / signIn / password）：只发生在登录时。
 - 连接内部请求（`help.getConfig`、MTProto ping、DC 迁移）。
-- `messages.getChats`：**已确认应该补进白名单**——gotd 的 peers 解析基本群时会发它，
-  现在没过闸门。见 `internal/telegram/accounts.go`。
+- ~~`messages.getChats`~~：**已补进白名单**（v1.11.13）。gotd 的 peers 解析基本群时会发它。
+
+**闸门与用户名缓存的顺序（v1.11.13 订正）**：链序现在是 `usernameCache → gate → tally`。
+原来 gate 在缓存外侧，一次命中缓存的解析照样要花一个令牌——账户处在 FLOOD_WAIT 冷却里时
+（可达数小时），一个纯内存查表会被一直压到冷却结束。
 
 ### 4. `upstreamVersion` 这个字段
 

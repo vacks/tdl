@@ -78,7 +78,10 @@ type botUser struct {
 // honours, and this service sends very little. The account's own request volume
 // is where the risk is. See docs/todo.md for the per-method migration notes.
 type Service struct {
-	settings   *settings.Store
+	settings *settings.Store
+	// apiBase overrides the Bot API address. Empty means the real one; see
+	// apiBaseURL.
+	apiBase    string
 	downloads  *download.Manager
 	telegram   *telegram.Manager
 	monitor    *monitor.Monitor
@@ -3450,7 +3453,7 @@ func (s *Service) callWithTimeout(token, method string, body any, out any, timeo
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/"+method, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.apiBaseURL()+"/bot"+token+"/"+method, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -3460,29 +3463,38 @@ func (s *Service) callWithTimeout(token, method string, body any, out any, timeo
 		return err
 	}
 	defer resp.Body.Close()
+	// The body is read whoever answered, because a refusal is where Telegram
+	// says why. Reading it only on success left every 4xx as a bare status code,
+	// and the wording that says a card no longer exists - "message to edit not
+	// found", "chat not found" - never reached the one caller that has to act on
+	// it. A body that cannot be parsed is not a reason to lose the status code:
+	// an intermediary may answer HTML, and the caller still has to decide what
+	// to do with a 429.
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	_ = json.Unmarshal(payload, &probe)
+	// The server's own window takes precedence when it sends one; the header is
+	// the fallback, because a 429 that carries only one of the two still has to
+	// be waited out rather than retried on our own schedule.
+	if probe.Parameters.RetryAfter > 0 {
+		s.noteOutboundWait(time.Duration(probe.Parameters.RetryAfter) * time.Second)
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
 			s.noteOutboundWait(time.Duration(seconds) * time.Second)
 		}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return &botAPIError{method: method, status: resp.StatusCode}
-	}
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	var probe struct {
-		OK         bool `json:"ok"`
-		Parameters struct {
-			RetryAfter int `json:"retry_after"`
-		} `json:"parameters"`
-	}
-	if err := json.Unmarshal(payload, &probe); err != nil {
-		return err
-	}
-	if !probe.OK && probe.Parameters.RetryAfter > 0 {
-		s.noteOutboundWait(time.Duration(probe.Parameters.RetryAfter) * time.Second)
+		return &botAPIError{method: method, status: resp.StatusCode, description: probe.Description}
 	}
 	return json.Unmarshal(payload, out)
 }
@@ -3533,6 +3545,23 @@ func waitContext(ctx context.Context, delay time.Duration) bool {
 	case <-time.After(delay):
 		return true
 	}
+}
+
+// botAPIBase is where the Bot API lives.
+const botAPIBase = "https://api.telegram.org"
+
+// apiBaseURL is the address every call is sent to.
+//
+// The field exists so a caller can point the service at a stand-in. What a
+// refusal means is decided from Telegram's own wording in the response body,
+// and that decision is the difference between dropping a card that is gone and
+// retrying it forever - so the path that carries the wording has to be provable
+// without a Bot token and a real deleted message.
+func (s *Service) apiBaseURL() string {
+	if s.apiBase != "" {
+		return s.apiBase
+	}
+	return botAPIBase
 }
 
 func (s *Service) httpClient() *http.Client {
@@ -3743,22 +3772,70 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 	payload := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true, "reply_markup": map[string]any{"inline_keyboard": markup}}
 	if err := s.call(token, "editMessageText", payload, &result); err != nil {
 		applog.Error("bot", "message_edit_failed", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, err.Error()))
-		// A chat that can never be written to again is reported as missing so its
-		// card reference is dropped instead of being retried on every later status
+		// A card that can never be written to again is reported as missing so its
+		// reference is dropped instead of being retried on every later status
 		// change.
-		return unreachableTarget(err), false
+		//
+		// Telegram spells these refusals two ways. A chat or a user that is gone
+		// is a 403; a message that was deleted out of a chat that still exists is
+		// an ordinary 400 whose body carries the reason. Only the 403 was ever
+		// recognized, because the body of a failed request was not read - so a
+		// card a person had deleted was edited again every three seconds for as
+		// long as its task stayed active, failing each time, against the same
+		// eight-per-second outbound budget that every command reply shares.
+		missing, unchanged := editRefusal(err)
+		return missing, unchanged
 	}
 	if !result.OK {
+		// A 2xx carrying ok:false. Telegram answers refusals with a status code,
+		// so this is the shape of a proxy or a future API change; treating the
+		// description as authoritative here as well costs nothing.
 		if isMissingMessage(result.Description) {
 			return true, false
 		}
-		if strings.Contains(strings.ToLower(result.Description), "message is not modified") {
+		if isNotModified(result.Description) {
 			return false, true
 		}
 		applog.Error("bot", "message_edit_rejected", "chat_id", chatID, "message_id", messageID, "error", redactBotError(token, result.Description))
 		return false, false
 	}
 	return false, true
+}
+
+// editRefusal reads a refused edit and says what it means for the card:
+// whether the card can never be written to again, and whether it already says
+// what the caller wanted it to say.
+//
+// Both answers arrive in the response body, because Telegram reports a message
+// that was deleted out of a chat that still exists as an ordinary 400. Only the
+// 403 was recognized before the body was read, so a deleted card was retried
+// every three seconds for as long as its task stayed active - failing each
+// time, against the same eight-per-second outbound budget every command reply
+// shares.
+func editRefusal(err error) (missing bool, unchanged bool) {
+	description := botAPIDescription(err)
+	if unreachableTarget(err) || isMissingMessage(description) {
+		return true, false
+	}
+	return false, isNotModified(description)
+}
+
+// botAPIDescription is what Telegram said about a refusal, or empty when it
+// said nothing this call can read.
+func botAPIDescription(err error) string {
+	var apiErr *botAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.description
+	}
+	return ""
+}
+
+// isNotModified reports the refusal Telegram sends when an edit would leave the
+// message exactly as it is. It is not a failure: the card already says what the
+// caller wanted it to say, and the periodic refresh will hit it whenever a
+// status stops changing.
+func isNotModified(description string) bool {
+	return strings.Contains(strings.ToLower(description), "message is not modified")
 }
 
 // botAPIError is an HTTP-level Bot API failure. It carries the status code
@@ -3768,6 +3845,11 @@ func (s *Service) edit(token string, chatID, messageID int64, text string, keybo
 type botAPIError struct {
 	method string
 	status int
+	// description is Telegram's own wording from the response body. Some
+	// refusals have no status code of their own - a deleted message is a 400,
+	// like every other malformed request - so the wording is the only thing that
+	// tells them apart.
+	description string
 }
 
 func (e *botAPIError) Error() string {

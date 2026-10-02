@@ -38,6 +38,8 @@ type iterator struct {
 	delay   time.Duration
 	dir     string
 	elem    chan *element
+	// outcome reports a message that produced no file. See FileOutcomeUpdate.
+	outcome func(FileOutcomeUpdate)
 
 	index int
 	seen  map[int]struct{}
@@ -100,8 +102,14 @@ func (i *iterator) process(ctx context.Context) (ready bool, skip bool) {
 	if err != nil {
 		if errors.Is(err, tmsg.ErrMessageDeleted) {
 			i.deleted++
+			i.report(id, tmsg.ErrMessageDeleted)
 			return false, true
 		}
+		// A read failure stops the batch, so every message after this one has no
+		// outcome to report. It is still reported for this one: without it the
+		// caller's row stays wherever the last callback left it, and the batch
+		// error says nothing about which file it was.
+		i.report(id, err)
 		i.err = fmt.Errorf("读取消息 %d: %w", id, err)
 		return false, false
 	}
@@ -110,6 +118,7 @@ func (i *iterator) process(ctx context.Context) (ready bool, skip bool) {
 	if !ok {
 		// No media is not a failure - most messages in a channel are text.
 		i.empty++
+		i.report(id, nil)
 		return false, true
 	}
 
@@ -167,6 +176,14 @@ func createTempFile(dir string, messageID int, name string) (*os.File, error) {
 		return nil, fmt.Errorf("创建下载临时文件: %w", err)
 	}
 	return file, nil
+}
+
+// report tells the caller that one message of the batch produced no file.
+func (i *iterator) report(messageID int, err error) {
+	if i.outcome == nil {
+		return
+	}
+	i.outcome(FileOutcomeUpdate{MessageID: messageID, Err: err})
 }
 
 // reportOutcome logs what a batch turned out to contain.

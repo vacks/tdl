@@ -30,6 +30,21 @@ func GetSingleMessage(ctx context.Context, client *tg.Client, peer tg.InputPeerC
 		BatchSize(1).Iter()
 
 	if !iterator.Next(ctx) {
+		// Two things end the walk, and they could not be further apart: an empty
+		// page, which says the message is gone, and a request that failed, which
+		// says nothing about the message at all.
+		//
+		// Answering "deleted" for both is how a proxy that drops a connection
+		// turned into a permanent verdict on a file. The account reaches Telegram
+		// through a proxy here; a blip on that link made this return
+		// ErrMessageDeleted, the download path classifies that as an answer no
+		// later attempt can change, and the file was settled as failed with a
+		// reason that was not true. Observed on the development instance: a
+		// batch read refused with "retry limit reached", the per-message
+		// fallback asked again, and the file was recorded as 消息已删除.
+		if err := iterator.Err(); err != nil {
+			return nil, err
+		}
 		// The page is empty, so the message is gone. This is returned explicitly:
 		// wrapping a nil error still produces an error here, but one that carries
 		// no cause, which reads downstream as an unexplained failure rather than
@@ -94,6 +109,17 @@ func GetGroupedMessages(ctx context.Context, client *tg.Client, peer tg.InputPee
 		}
 	}
 
+	// A walk that stopped because the request failed found a prefix of the
+	// album, and returning it would download part of an album while reporting
+	// success - the file count is the only thing that would show it, and only to
+	// someone who knew how many members to expect. The caller has to be able to
+	// tell a short album from a refused request.
+	if err := iterator.Err(); err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("the album of message %d holds nothing readable", message.ID)
+	}
 	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
 	return messages, nil
 }

@@ -119,6 +119,24 @@ var postgresIndexStatements = []string{
 	// Serves every per task lookup: item lists, completion counts, the
 	// per-task claim scan and the "all items completed" settle check.
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
+	// The per-task file page, which is a keyset read in id order:
+	// WHERE job_id = ? AND id > ? ORDER BY id LIMIT ?.
+	//
+	// job_id alone cannot serve it. Measured on 2.65 million rows with 201 tasks,
+	// a task whose rows are not at the start of the id space - which is every
+	// task created after the first few, since items take their ids at insert
+	// time - had the planner walk the primary key from the beginning, testing
+	// job_id on every row: 366 ms, 67k buffers, 2,650,101 rows removed by the
+	// filter, to answer a page of 101. The planner prefers that plan because it
+	// estimates rows per job from n_distinct, which assumes job_id is spread
+	// evenly over the id space; a task's rows are in fact contiguous, so they are
+	// either all near the start or all near the end. With this index the same
+	// page is an index-only seek: 0.14 ms, 63 buffers.
+	//
+	// This is the read behind GET /api/downloads/{id}, its items page, and the
+	// Bot's once-a-second refresh of every card it is tracking - so on a thirty
+	// thousand file task the cost is paid continuously, not once.
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_job_id_id ON download_items(job_id, id)`,
 	// The scheduler's ready-work probe, narrowed to the one status it asks
 	// about. A queued row that later completes leaves this index entirely.
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS download_items_queued_job_id ON download_items(job_id) WHERE status = 'queued'`,

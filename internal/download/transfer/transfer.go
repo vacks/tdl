@@ -99,6 +99,26 @@ type FileCompletedUpdate struct {
 	Path      string
 }
 
+// FileOutcomeUpdate identifies one message of the batch that produced no
+// publishable file, and why.
+//
+// It exists because a count is not enough to settle a task. Every message of
+// the batch has a durable row in the caller's own tables, and a message the
+// engine did not deliver leaves that row wherever the last progress callback
+// put it - which is "running", a state no other pass revisits. A batch of
+// sixty-four files that loses one to a dropped connection therefore left one
+// row running forever and the task pinned in 下载中, with the failure visible
+// only in a log line. The engine knows which message it was; only the caller
+// knows what its row should become.
+type FileOutcomeUpdate struct {
+	// MessageID is the message the batch was asked for.
+	MessageID int
+	// Err is why it produced no file. ErrMessageDeleted means it was gone
+	// before it could be read; nil means it was read and held nothing
+	// downloadable.
+	Err error
+}
+
 // Options describes one batch.
 type Options struct {
 	// Dir is the working directory. Temporary files are created here and the
@@ -125,6 +145,15 @@ type Options struct {
 	// OnFileCompleted receives each file as it becomes publishable. It runs on
 	// a transfer worker, so it must return promptly.
 	OnFileCompleted func(FileCompletedUpdate)
+	// OnFileOutcome receives every message of this batch that ended with no
+	// file to publish, and why. It runs on the iterator or a transfer worker,
+	// so it must return promptly. See FileOutcomeUpdate for why the caller
+	// cannot do without it.
+	//
+	// Nothing is reported for a transfer the caller itself stopped: a pause or
+	// a cancel arrives as a context error, and the rows of a stopped task
+	// belong to whatever stopped it.
+	OnFileOutcome func(FileOutcomeUpdate)
 }
 
 // Stats is what one batch cost.
@@ -187,6 +216,7 @@ func Run(ctx context.Context, deps Deps, opts Options) (Stats, error) {
 			delay:   opts.Delay,
 			dir:     opts.Dir,
 			elem:    make(chan *element, 1),
+			outcome: opts.OnFileOutcome,
 			seen:    make(map[int]struct{}, len(opts.Messages)),
 		},
 	}

@@ -7,6 +7,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
+	"github.com/gotd/td/tg"
 	"golang.org/x/net/proxy"
 
 	"github.com/vacks/tdl/internal/kv"
@@ -42,6 +43,15 @@ type Options struct {
 	ReconnectTimeout time.Duration
 	// UpdateHandler receives the account's updates.
 	UpdateHandler telegram.UpdateHandler
+	// OnSelfSuccess is called every time the connection is established, which
+	// includes every reconnect.
+	//
+	// It is the only signal that a dropped connection came back. The callback
+	// passed to Client.Run is not called again - it is invoked once, when the
+	// session first becomes ready, and a reconnect inside that same Run neither
+	// calls it again nor cancels its context. Anything that has to happen after
+	// an outage therefore has to hang off this.
+	OnSelfSuccess func(self *tg.User)
 	// Middlewares are appended to DefaultMiddlewares, which places them
 	// innermost - see DefaultMiddlewares for why that matters.
 	Middlewares []telegram.Middleware
@@ -72,6 +82,7 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		// attempt state and a shared one would keep growing across reconnects.
 		ReconnectionBackoff: func() backoff.BackOff { return reconnectBackoff(o.ReconnectTimeout) },
 		UpdateHandler:       o.UpdateHandler,
+		OnSelfSuccess:       o.OnSelfSuccess,
 		Device:              device,
 		SessionStorage:      kv.NewSession(o.KV, o.Login),
 		RetryInterval:       5 * time.Second,

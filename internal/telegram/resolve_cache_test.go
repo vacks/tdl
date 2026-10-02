@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 )
 
@@ -235,4 +236,64 @@ func TestASlowRequestIsReportedWithItsMethod(t *testing.T) {
 	if reports[0].elapsed < slowRPCThreshold {
 		t.Fatalf("the report claims %v", reports[0].elapsed)
 	}
+}
+
+// countingGate records how many requests the account was paced through.
+type countingGate struct{ acquires int }
+
+func (g *countingGate) Acquire(context.Context, string) error { g.acquires++; return nil }
+func (g *countingGate) Report(string, error)                  {}
+
+// An answer that costs no request must cost no token either.
+//
+// The gate exists to ration what reaches Telegram, and the username cache exists
+// to make repeated resolutions of the same name reach it once. With the gate
+// outside the cache the second resolution - the one that is pure memory - was
+// still paced through it. That is one token spent on nothing on an ordinary
+// warm path, and while the account sits inside a FLOOD_WAIT window, whose
+// length is minutes to hours, it is far worse: the answer was already in this
+// process, and the gate held it back until the window expired. The cache is
+// also what the tally is measured against - it counts only what reached the
+// wire - so the two layers disagreeing about what a request is meant one of
+// them was wrong.
+func TestAResolutionAnsweredFromCacheSpendsNoToken(t *testing.T) {
+	gate := &countingGate{}
+	m := &Manager{rpcGate: gate}
+	next := &countingInvoker{}
+
+	// The whole chain, in the order the account client builds it.
+	invoke := chainMiddlewaresForTest(t, m, "account-1", next)
+
+	for i := 0; i < 2; i++ {
+		var out tg.ContactsResolvedPeer
+		if err := invoke(context.Background(), &tg.ContactsResolveUsernameRequest{Username: "tdlbot"}, &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if next.calls() != 1 {
+		t.Fatalf("the second resolution reached the invoker: %d requests", next.calls())
+	}
+	if gate.acquires != 1 {
+		t.Fatalf("two resolutions of one name were paced %d times, want 1: the second was "+
+			"answered from memory and must not spend the account's budget", gate.acquires)
+	}
+}
+
+// chainMiddlewaresForTest applies the account's middlewares the way gotd does:
+// first listed is outermost.
+func chainMiddlewaresForTest(t *testing.T, m *Manager, accountID string, next tg.Invoker) gotd.InvokeFunc {
+	t.Helper()
+	invoker := next
+	middlewares := m.accountMiddlewares(accountID)
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		invoker = middlewareInvoker{middlewares[i].Handle(invoker)}
+	}
+	return invoker.Invoke
+}
+
+type middlewareInvoker struct{ invoke gotd.InvokeFunc }
+
+func (m middlewareInvoker) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+	return m.invoke(ctx, input, output)
 }

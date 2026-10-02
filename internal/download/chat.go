@@ -15,6 +15,8 @@ import (
 
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"golang.org/x/sys/unix"
+
 	transfer "github.com/vacks/tdl/internal/download/transfer"
 	"github.com/vacks/tdl/internal/tmedia"
 	"github.com/vacks/tdl/internal/tmsg"
@@ -1009,7 +1011,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	// three set-based statements below are what makes the bound mean something.
 	lock := m.chatLock(id)
 	lock.Lock()
-	if !chatRunnable(m.chatStatus(id)) {
+	if !m.chatRunningOrUnknown(id) {
 		lock.Unlock()
 		return false, nil
 	}
@@ -1070,6 +1072,8 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	byMessage := make(map[int]source, len(batch))
 	ids := make([]int, 0, len(batch))
 	seenMessages := map[int]struct{}{}
+	var outcomesMu sync.Mutex
+	var outcomes []transfer.FileOutcomeUpdate
 	for _, item := range batch {
 		byMessage[item.MessageID] = item
 		// Every member of an album is listed, not only its first: the items were
@@ -1167,6 +1171,15 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 					}
 				}()
 			},
+			// Collected rather than written here, for the reason the message
+			// path collects them: this runs on a transfer worker or on the
+			// iterator, and a round trip there would hold up the files queued
+			// behind it.
+			OnFileOutcome: func(update transfer.FileOutcomeUpdate) {
+				outcomesMu.Lock()
+				outcomes = append(outcomes, update)
+				outcomesMu.Unlock()
+			},
 		})
 		applog.Info("chat_download", "batch_transferred", "chat_job_id", id, "requested", len(ids),
 			"files", stats.Files, "deleted", stats.Deleted, "without_media", stats.Empty,
@@ -1176,6 +1189,19 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	publishWG.Wait()
 	if reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch)); reconcileErr != nil {
 		return false, fmt.Errorf("核对已移动文件: %w", reconcileErr)
+	}
+	// Settled before the batch decides it is over: a file that went back on the
+	// queue is work the task still has, and the remaining checks below all
+	// assume the rows they read are final.
+	outcomesMu.Lock()
+	batchOutcomes := outcomes
+	outcomesMu.Unlock()
+	_, requeued, settleErr := m.applyItemFailures(chatItems, id, planItemFailures(batchOutcomes, byMessage))
+	if settleErr != nil {
+		return false, fmt.Errorf("记录文件下载结果: %w", settleErr)
+	}
+	if requeued {
+		m.signalChat()
 	}
 	publishMu.Lock()
 	persistErr := publishErr
@@ -1188,10 +1214,10 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 			return false, fmt.Errorf("恢复文件发布状态: %w", recoverErr)
 		}
 	}
-	if watchdog.Stalled() && (m.chatStatus(id) == ChatStatusScanning || m.chatStatus(id) == ChatStatusDownloading || m.chatStatus(id) == ChatStatusListening) {
+	if watchdog.Stalled() && m.chatRunningOrUnknown(id) {
 		return false, m.requeueStalledChatBatch(id, batch)
 	}
-	if err != nil && m.chatStatus(id) != ChatStatusPaused && m.chatStatus(id) != ChatStatusCancelled {
+	if err != nil && m.chatControlHasNotLanded(id) {
 		if m.recordTelegramRPCError(target.AccountID, err) {
 			// Mirrors the stalled-item rule: a flood that keeps recurring must not
 			// retry forever, because every retry extends the cooldown it is
@@ -1317,9 +1343,56 @@ func (m *Manager) requeueFloodedChatItems(chatID string) error {
 }
 
 func (m *Manager) chatStatus(id string) string {
-	var status string
-	_ = m.db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = ?`, id).Scan(&status)
+	status, _ := m.chatJobStatus(id)
 	return status
+}
+
+// chatJobStatus reads a session task's state and says whether the read worked.
+//
+// The two answers are not interchangeable, and the callers that decide whether
+// to keep working need the second one. A status that could not be read is an
+// empty string, which is a value no task holds - and comparing it against the
+// states a task can be in reads as "this task is not running any more", which
+// is the opposite of what an unreadable status means.
+func (m *Manager) chatJobStatus(id string) (string, bool) {
+	var status string
+	if err := m.db.QueryRow(`SELECT status FROM chat_download_jobs WHERE id = ?`, id).Scan(&status); err != nil {
+		return "", false
+	}
+	return status, true
+}
+
+// chatRunningOrUnknown reports whether a worker should keep working on its task.
+//
+// It is runningOrUnknown's counterpart for session tasks, and it exists because
+// the message path was fixed and this one was not. There, a failed status read
+// stopped a worker mid-task: the worker read an empty status, concluded the task
+// had been taken away from it, and returned - leaving the task in 下载中 with
+// its files queued and nothing that would ever look at it again. Here the same
+// mistake swallowed a finished download: publishChatItem read the empty status,
+// decided it was not allowed to publish, and returned without a word, so the
+// file was removed with the working directory and the task waited forever for a
+// completion that had already happened.
+func (m *Manager) chatRunningOrUnknown(id string) bool {
+	status, ok := m.chatJobStatus(id)
+	return !ok || chatRunnable(status)
+}
+
+// chatControlHasNotLanded reports whether a failed batch should still settle
+// its files.
+//
+// A pause or a cancel that landed first owns those rows, and the batch must not
+// write over the decision. A status that could not be read does not answer
+// "yes", and that is the answer that keeps the batch working - the same
+// direction runningOrUnknown takes, and the one that cannot lose a failure a
+// person needs to see. This reads the status once; the condition it replaces
+// read it twice, which is two round trips on the path every failed batch takes.
+func (m *Manager) chatControlHasNotLanded(id string) bool {
+	status, ok := m.chatJobStatus(id)
+	if !ok {
+		return true
+	}
+	return status != ChatStatusPaused && status != ChatStatusCancelled
 }
 
 func chatRunnable(status string) bool {
@@ -1337,27 +1410,48 @@ func (m *Manager) setChatItem(chatID string, item source, status, path, message 
 	if status == "completed" || status == "failed" || status == "cancelled" {
 		finished = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, err := m.db.Exec(`UPDATE chat_download_items SET status=?, final_path=?, error=?, finished_at=CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id=? AND dialog_key=? AND message_id=?`, status, path, message, finished, finished, chatID, item.DialogKey, item.MessageID)
-	if err != nil {
+	// Completion writes two rows that must agree: the item's terminal state and
+	// the global ownership record every other task consults before deciding
+	// whether this media still has to be downloaded. They travel in one
+	// statement, so a failure leaves neither written rather than an item that
+	// claims to be finished while nothing owns the file.
+	//
+	// The message path has written it this way since the divergence was found
+	// there, and the reason it is written out a second time instead of shared is
+	// the table descriptor the two callers still keep apart - see itemTable,
+	// which is where merging them starts. Writing it separately was wrong in
+	// both directions: an ownership write that failed on its own left a task
+	// reporting success over a file nothing owned, and every other task then
+	// downloaded that file again because the index said nobody had it.
+	if status == "completed" && path != "" {
+		if _, err := m.db.Exec(`WITH updated AS (
+ UPDATE chat_download_items SET status = ?, final_path = ?, error = ?, finished_at = CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? RETURNING chat_job_id
+)
+INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at)
+ SELECT ?, ?, ?, 'completed', 'chat', chat_job_id, ? FROM updated
+ ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`,
+			status, path, message, finished, finished, chatID, item.DialogKey, item.MessageID,
+			item.DialogKey, item.MessageID, path, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		m.touch()
+		// This ownership row is exactly what a waiting message task adopts, so it
+		// must be told to look now instead of on its next idle pass.
+		m.signalReconcile()
+		return nil
+	}
+	if _, err := m.db.Exec(`UPDATE chat_download_items SET status=?, final_path=?, error=?, finished_at=CASE WHEN ? != '' AND finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id=? AND dialog_key=? AND message_id=?`, status, path, message, finished, finished, chatID, item.DialogKey, item.MessageID); err != nil {
 		return err
 	}
+	m.touch()
 	if status == "failed" || status == "cancelled" {
-		if _, err = m.db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, item.DialogKey, item.MessageID, chatID); err != nil {
+		if _, err := m.db.Exec(`DELETE FROM downloaded_media WHERE dialog_key = ? AND message_id = ? AND status = 'claimed' AND owner_kind = 'chat' AND owner_id = ?`, item.DialogKey, item.MessageID, chatID); err != nil {
 			return err
 		}
 		// Releasing the claim hands this media to whichever task is waiting on it.
 		m.signalReconcile()
 		return nil
 	}
-	if status != "completed" {
-		return nil
-	}
-	if _, err = m.db.Exec(`INSERT INTO downloaded_media(dialog_key, message_id, final_path, status, owner_kind, owner_id, updated_at) VALUES (?, ?, ?, 'completed', 'chat', ?, ?) ON CONFLICT(dialog_key, message_id) DO UPDATE SET final_path = EXCLUDED.final_path, status = EXCLUDED.status, owner_kind = EXCLUDED.owner_kind, owner_id = EXCLUDED.owner_id, updated_at = EXCLUDED.updated_at`, item.DialogKey, item.MessageID, path, chatID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-		return err
-	}
-	// This ownership row is exactly what a waiting message task adopts, so it
-	// must be told to look now instead of on its next idle pass.
-	m.signalReconcile()
 	return nil
 }
 
@@ -1472,7 +1566,7 @@ func (m *Manager) publishChatItem(chatID, path string, item source, config setti
 	lock := m.chatLock(chatID)
 	lock.Lock()
 	defer lock.Unlock()
-	if status := m.chatStatus(chatID); status != ChatStatusScanning && status != ChatStatusDownloading && status != ChatStatusListening {
+	if !m.chatRunningOrUnknown(chatID) {
 		return nil
 	}
 	if problem := incompleteFileError(item, path); problem != nil {
@@ -1503,6 +1597,19 @@ func (m *Manager) publishChatItem(chatID, path string, item source, config setti
 		return err
 	}
 	if err := publishNoReplace(path, finalPath); err != nil {
+		// A name that was taken between the check above and the move is the same
+		// answer as one taken before it, and it is told the same way - the move
+		// is only atomic against other movers, not against a person dropping a
+		// file into the directory. Reporting the raw error instead loses the one
+		// distinction that tells an operator whether the destination holds an
+		// ordinary file or something the move must never replace.
+		if errors.Is(err, unix.EEXIST) {
+			message := "目标文件已存在，未覆盖"
+			if occupied, regularFile := destinationOccupied(finalPath); occupied && !regularFile {
+				message = blockedDestinationMessage(finalPath)
+			}
+			return m.setChatItem(chatID, item, "failed", "", message)
+		}
 		return m.setChatItem(chatID, item, "failed", "", err.Error())
 	}
 	return m.setChatItem(chatID, item, "completed", finalPath, "")
@@ -3394,7 +3501,12 @@ func (m *Manager) PauseChat(id string) error {
 	// The parent and media index transition together. The scanner and listener
 	// observe the durable parent state, while a failed media update rolls the
 	// whole operation back instead of leaving a half-paused task.
-	if err := m.transitionChatItems(id, target.Status, ChatStatusPaused, "", `UPDATE chat_download_items SET status = 'paused', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END, started_at = '' WHERE chat_job_id = ? AND status IN ('queued','running','downloaded')`, releaseChatClaims(id), now, id); err != nil {
+	// waiting is in the list for the reason it is in the message path's: a file
+	// waiting on another task's claim is still this task's work, and pausing
+	// only what happens to be queued leaves it out of every later statement
+	// that selects by state - resuming asks for paused rows, and this one was
+	// never made one.
+	if err := m.transitionChatItems(id, target.Status, ChatStatusPaused, "", `UPDATE chat_download_items SET status = 'paused', elapsed_ms = elapsed_ms + CASE WHEN started_at != '' THEN FLOOR(EXTRACT(EPOCH FROM (?::timestamptz - started_at::timestamptz)) * 1000)::BIGINT ELSE 0 END, started_at = '', finished_at = '' WHERE chat_job_id = ? AND status IN ('queued','waiting','running','downloaded')`, releaseChatClaims(id), now, id); err != nil {
 		return err
 	}
 	m.cancelChatExecutions(id)
@@ -3419,7 +3531,12 @@ func (m *Manager) ResumeChat(id string) error {
 	if target.ScanState == chatScanCompleted {
 		next = ChatStatusDownloading
 	}
-	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '' WHERE chat_job_id = ? AND status = 'paused'`, nil, id); err != nil {
+	// The attempt budget is reset for the reason Resume resets it on the other
+	// table: a file that ran the budget down before the pause would be one stall
+	// away from being given up on, so pressing 恢复 would hand back a file with
+	// no attempts left. Starting a task again is the person saying the earlier
+	// failures were circumstances, not the file.
+	if err := m.transitionChatItems(id, ChatStatusPaused, next, "", `UPDATE chat_download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0, attempts = 0 WHERE chat_job_id = ? AND status = 'paused'`, nil, id); err != nil {
 		return err
 	}
 	m.signalChat()

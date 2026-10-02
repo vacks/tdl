@@ -239,6 +239,40 @@ func (s *accountSession) markReady(client *gotd.Client) []func() {
 	return callbacks
 }
 
+// noteReconnect tells every subscriber that the connection was re-established.
+//
+// Telegram only delivers an update once. A connection that drops and comes back
+// is invisible from inside this process - gotd reconnects under the same client
+// and the same authorization, without calling the Run callback again - so the
+// messages published while it was down are simply never delivered. There is no
+// framework-level repair either: this application drives a bare update
+// dispatcher, not the updates manager that would replay the difference between
+// the last known pts and the server's.
+//
+// What makes the loss recoverable is that the listeners already know how: the
+// same reconciliation they run when they first attach recovers the interval
+// between each task's persisted watermark and the connection being ready. It
+// just has to be run again, which is what this does.
+//
+// The first connection is skipped deliberately. markReady is about to invoke
+// the same callbacks, and running them twice would make every listener start
+// with two overlapping reconciliations of the same interval.
+func (s *accountSession) noteReconnect() {
+	s.mu.Lock()
+	if !s.ready {
+		s.mu.Unlock()
+		return
+	}
+	callbacks := make([]func(), 0, len(s.readies))
+	for _, callback := range s.readies {
+		callbacks = append(callbacks, callback)
+	}
+	s.mu.Unlock()
+	for _, callback := range callbacks {
+		callback()
+	}
+}
+
 // markDisconnected records that the current connection is gone and arms a fresh
 // readiness signal, so a caller waiting on it waits for the next connection
 // rather than proceeding with the dead one.
@@ -506,6 +540,10 @@ func pacedRequest(input bin.Encoder) bool {
 		*tg.ChannelsGetChannelsRequest,
 		*tg.ChannelsGetMessagesRequest,
 		*tg.ContactsResolveUsernameRequest,
+		// getChats is what gotd's peer resolver issues for a basic group, which
+		// it reaches from a numeric link and from a stored InputPeerChat. It was
+		// the one metadata request of ours that reached the wire unpaced.
+		*tg.MessagesGetChatsRequest,
 		*tg.UsersGetFullUserRequest,
 		*tg.UsersGetUsersRequest:
 		return true
@@ -585,20 +623,25 @@ func (m *Manager) rpcGateMiddleware(accountID string) gotd.Middleware {
 // being repeated as an argument list at each client construction. Reading it
 // outermost to innermost:
 //
-//   - the gate paces the request, and the tally below it then counts what the
-//     gate let through;
-//   - the gate must be outside the waiter that consumes a FLOOD_WAIT, which is
-//     why the caller's middlewares go last in the client's own chain (see
-//     upstream tclient.New) - the gate has to see the refusal before the
-//     waiter sleeps it off;
+//   - the username cache is outside everything, because it is the only layer
+//     that can answer without a request. Everything inside it exists to govern
+//     requests that are about to happen, and a request that will not happen
+//     must not be paced or counted. With the gate outside it, a link resolved
+//     from memory an hour ago still spent a token - and while the account was
+//     inside a FLOOD_WAIT window, which lasts minutes to hours, that same
+//     in-memory answer was held back until the window expired;
+//   - the gate is inside the cache and outside the waiter that consumes a
+//     FLOOD_WAIT, which is why the caller's middlewares go last in the client's
+//     own chain (see DefaultMiddlewares) - the gate has to see the refusal
+//     before the waiter sleeps it off;
 //   - the tally is innermost because it counts requests that reached the wire:
 //     a resolution answered from the username cache never happened as far as
 //     Telegram is concerned, and counting it would overstate the budget this
 //     tally exists to measure.
 func (m *Manager) accountMiddlewares(accountID string) []gotd.Middleware {
 	return []gotd.Middleware{
-		m.rpcGateMiddleware(accountID),
 		m.usernameCacheMiddleware(accountID),
+		m.rpcGateMiddleware(accountID),
 		m.rpcTallyMiddleware(accountID),
 	}
 }
@@ -1242,7 +1285,16 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 	// contacts.resolveUsername requests the download path does, against the same
 	// account and the same server-side window, so leaving them unpaced meant the
 	// listener and the transfers were not sharing one budget at all.
-	client, err := tgclient.New(ctx, tgclient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher, Middlewares: m.accountMiddlewares(accountID)})
+	client, err := tgclient.New(ctx, tgclient.Options{
+		KV: store, Proxy: session.proxy, UpdateHandler: dispatcher,
+		Middlewares: m.accountMiddlewares(accountID),
+		// The connection came back. Anything that depends on having missed
+		// nothing has to be told, and this is the only place that knows: a
+		// reconnect inside one client.Run neither calls the Run callback again
+		// nor cancels its context, so the listeners below are still waiting on
+		// the update stream they started with.
+		OnSelfSuccess: func(*tg.User) { session.noteReconnect() },
+	})
 	if err != nil {
 		return &sessionBuildError{err: fmt.Errorf("创建 Telegram 连接: %w", err)}
 	}
