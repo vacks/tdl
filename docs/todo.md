@@ -118,3 +118,53 @@
   现在每账号一个 manager **且**带 `&peers.InmemoryCache{}`。实测（开发实例，
   温暖会话，单文件链接）：重复的 `channels.getChannels` 消失，再下同一个频道
   连那 1 次也没有。
+
+---
+
+## 四、P4 剩余工作（v1.11.13 之后的实际范围）
+
+**前提：** v1.11.13 已修掉两套状态机之间 7 处分叉中的 7 处（完成写入原子性、父状态读取语义、
+暂停范围、恢复预算、EEXIST 区分、变更通知、认领规则的第三份实现之外的部分）。
+**所以 P4 现在剩下的是防分叉，不是止血** —— 唯一还在造成实际损害的是 `registerChatMedia`。
+
+按收益/风险排序，逐块做，每块单独提交 + 发布：
+
+1. **认领规则合一（先做，有量化判据）**
+   - `internal/download/manager.go` 的 `claimMedia` / `claimMediaBatch` / `claimMediaChunk` 改成接受
+     一个 `querier` 接口（`*database` 与 `*databaseTx` 的方法集相同：Exec/Query/QueryRow，定义放
+     `internal/download/database.go`）。
+   - `internal/download/chat.go:484` 的 `registerChatMedia` 改为调用集合式路径，删掉内联的分类规则。
+   - 判据：扫描一页 100 条消息时，认领的往返次数从**每候选 3–5 次**降到**每块 1–2 次**（用假 querier 计数）。
+   - ⚠️ `claimMedia` 逐项版内部自己 `m.db.Begin()`，不能直接接受外部事务；它的 fallback 分支
+     （completed-但文件不在）要在事务内用守卫语句重写，否则会变成"事务里再开事务"。
+
+2. **状态写入合一**：`setItem`（manager.go:3749）/ `setChatItem`（chat.go:1408）→ 一个带 `itemTable` 描述符的实现。
+
+3. **发布合一**：`publishItem`（manager.go:3006）/ `publishChatItem`（chat.go:1562）。
+   差异只有三个钩子：锁、根任务可运行判定、释放后钩子。
+
+4. **控制语义合一**：`Pause/Resume/Retry/Cancel` ↔ `PauseChat/...`（chat.go:3489 起）。
+
+5. **准入合一**：五条路径 + 三套 inbox。
+
+6. **来源解析合一**：四份媒体抽取循环（manager.go:2997/3097 附近、chat.go、discussion.go）。
+
+**不变量（全程不能碰）**：表结构；状态字符串（它们是 `download_items_active_status` 等部分索引的
+成员条件）；`reconcile` 的 WHERE 不新增 `owner_kind`；列表/分页游标；认领保持 256/块 +
+行值谓词 `(?,?::integer)`；不加迁移版本。
+
+## 五、P6 剩余工作
+
+在 `tdl_test` 用合成数据把三张表灌到 5M 与 50M 两档，对下面这些改过的语句做
+`EXPLAIN (ANALYZE, BUFFERS)`，与小库基线对比，确认**无 Seq Scan、无计划翻转**：
+
+- `claimMediaBatch` 的 `INSERT…SELECT…RETURNING`（走 `(dialog_key,message_id)` 主键 seek）
+- `setItem` / `setChatItem` 的完成 CTE（一条语句搞定，不该退化成两条）
+- `reconcileMessageClaims` / `reconcileChatClaims` 的游标轮转
+- `ItemsPage`（v1.11.13 新增 `download_items(job_id, id)`，实测 265 万行下 366ms → 0.14ms）
+- `nextQueued`（`download_jobs_queued_created_id`）
+- `nextChatBatch` / 聊天调度查询
+
+⚠️ 小库上的计划会误导（schema 注释已警告），必须以实际 EXPLAIN 为准。
+⚠️ 造数时注意：`download_items.id` 是序列，晚插入的行自然落在末尾 —— 想造"分散"的 id 必须显式指定 id。
+⚠️ 灌数据前要 `ALTER TABLE ... DISABLE TRIGGER USER` 并临时去掉 `download_item_stats` 的外键。
