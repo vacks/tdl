@@ -1273,6 +1273,33 @@ func taskLogFiles(sources []source) []string {
 	return names
 }
 
+// insertTaskItems gives a task the files a request named, and reports how many
+// rows it actually created.
+//
+// It is the one place a file row is written, shared by the request that creates
+// a task and the request that extends one, so both agree on every column and on
+// what a conflict means.
+//
+// A conflict is not an error. `(dialog_key, message_id)` is unique across the
+// whole table, so a row that is already there means another task took that
+// media identity between this request's lookup and its write. The callers
+// differ in what they do about it: the create path rolls back rather than leave
+// a task holding part of its request and asks the duplicate path to look again,
+// and the extend path simply does not claim credit for a file it did not place.
+func insertTaskItems(tx *databaseTx, jobID string, items []source) (int, error) {
+	inserted := 0
+	for _, item := range items {
+		result, err := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT(dialog_key, message_id) DO NOTHING`, jobID, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size)
+		if err != nil {
+			return inserted, err
+		}
+		if changed, _ := result.RowsAffected(); changed == 1 {
+			inserted++
+		}
+	}
+	return inserted, nil
+}
+
 // taskMessageText picks the text shown for a whole task. Every file of one
 // message or album carries the same caption, and a first file without one must
 // not hide a caption that a later file of the same group has.
@@ -1336,11 +1363,19 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	}
 	defer tx.Rollback()
 	var existingID string
+	// The files this request names that no task holds yet. They are what a
+	// request can ask for beyond a task it already has; see the extend branch
+	// below for the shape that produces them.
+	unowned := make([]source, 0, len(sources))
 	for _, item := range sources {
 		var jobID string
 		err = tx.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ? LIMIT 1`, item.DialogKey, item.MessageID).Scan(&jobID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return Submission{}, false, err
+		}
+		if jobID == "" {
+			unowned = append(unowned, item)
+			continue
 		}
 		if jobID != "" {
 			if existingID != "" && existingID != jobID {
@@ -1362,9 +1397,30 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 		if err := tx.QueryRow(`SELECT status, parent_chat_id FROM download_jobs WHERE id = ? FOR UPDATE`, existingID).Scan(&existingStatus, &existingParent); err != nil {
 			return Submission{}, false, err
 		}
-		reactivated := existingStatus == "cancelled" || existingStatus == "deleted"
+		// A request can name files the task it matched does not hold. The usual
+		// shape is an album whose first member was fetched on its own with
+		// ?single and then submitted as a whole: the match is that one-file task,
+		// and answering with it dropped the rest of the request on the floor.
+		// Nothing else could pick them up either - a settled task is never
+		// claimed again, and the rows for those files were never written - so the
+		// whole album became unreachable behind the one file that had been
+		// downloaded. The request is for the files, not for the task, so the
+		// files it names join the task that already holds the rest of the group.
+		//
+		// A task with a transfer in flight is left alone. Its worker read its
+		// file list when the task was claimed, so a row added now would sit
+		// queued behind a task that is about to settle - which is the very stall
+		// this is avoiding.
+		added := 0
+		if len(unowned) > 0 && existingStatus != "running" {
+			if added, err = insertTaskItems(tx, existingID, unowned); err != nil {
+				return Submission{}, false, err
+			}
+		}
+		reopening := existingStatus == "cancelled" || existingStatus == "deleted"
+		reactivated := reopening || added > 0
 		reactivationStatus := "queued"
-		if reactivated {
+		if reopening {
 			// Completed files are already safely published and must never be
 			// downloaded again. Every other file restarts or resumes normally.
 			if _, err := tx.Exec(`UPDATE download_items SET status = 'queued', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND status != 'completed'`, existingID); err != nil {
@@ -1424,6 +1480,24 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 			// A concurrent request already reactivated this job while we were
 			// waiting for its row lock. It is now a normal duplicate request.
 			reactivated = changed == 1
+		} else if added > 0 && existingStatus != "queued" {
+			// A task that had settled and has just taken on files has to be
+			// claimable again, because the scheduler only ever claims a queued
+			// task. Its published files keep their rows: only the files this
+			// request added are queued, and those are exactly the ones the task
+			// has left to fetch.
+			result, err := tx.Exec(`UPDATE download_jobs SET status = 'queued', error = '', updated_at = ? WHERE id = ? AND status = ?`, now, existingID, existingStatus)
+			if err != nil {
+				return Submission{}, false, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return Submission{}, false, err
+			}
+			// The row lock taken above makes a lost race impossible here; if one
+			// happens anyway, the other request has already accounted for these
+			// files and this one is a plain duplicate.
+			reactivated = changed == 1
 		}
 		if _, err = tx.Exec(`INSERT INTO download_requests(id, job_id, source_kind, account_id, source_url, dialog_key, message_id, trigger_json, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'duplicate', ?)`, requestID, existingID, intent.Source, intent.AccountID, intent.URL, sources[0].DialogKey, sources[0].MessageID, trigger, now); err != nil {
 			return Submission{}, false, err
@@ -1456,18 +1530,16 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, parent_chat_id, config_json, message_text, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, parentChatID, configJSON, messageText, now, now); err != nil {
 		return Submission{}, false, err
 	}
-	for _, item := range sources {
-		result, insertErr := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT(dialog_key, message_id) DO NOTHING`, id, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size)
-		if insertErr != nil {
-			return Submission{}, false, insertErr
-		}
-		if changed, _ := result.RowsAffected(); changed != 1 {
-			// A competing Web/Bot/reaction request committed after the
-			// preflight lookup. Discard this incomplete job and resolve through
-			// the normal duplicate path against the durable owner.
-			_ = tx.Rollback()
-			return Submission{}, true, nil
-		}
+	inserted, insertErr := insertTaskItems(tx, id, sources)
+	if insertErr != nil {
+		return Submission{}, false, insertErr
+	}
+	if inserted != len(sources) {
+		// A competing Web/Bot/reaction request committed after the
+		// preflight lookup. Discard this incomplete job and resolve through
+		// the normal duplicate path against the durable owner.
+		_ = tx.Rollback()
+		return Submission{}, true, nil
 	}
 	if _, err = tx.Exec(`INSERT INTO download_requests(id, job_id, source_kind, account_id, source_url, dialog_key, message_id, trigger_json, outcome, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'created', ?)`, requestID, id, intent.Source, intent.AccountID, intent.URL, sources[0].DialogKey, sources[0].MessageID, trigger, now); err != nil {
 		return Submission{}, false, err

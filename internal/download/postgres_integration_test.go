@@ -17,6 +17,21 @@ import (
 	"github.com/vacks/tdl/internal/telegram"
 )
 
+// newSubmissionTestManager builds the manager a submission needs: a settings
+// store for the configuration snapshot every task carries, and the wake
+// channels the caller signals.
+func newSubmissionTestManager(t *testing.T, db *database) *Manager {
+	t.Helper()
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Manager{db: db, settings: store, events: newEventBus(), progress: newProgressStore(),
+		wake: make(chan struct{}, workerCount), chatWake: make(chan struct{}, 1),
+		slotWake: make(chan struct{}, 1), stopCh: make(chan struct{}),
+		rpcState: make(map[string]*telegramRPCState), chatActive: make(map[string]struct{})}
+}
+
 func clearPostgresDownloadTestData(db *database) error {
 	for _, statement := range []string{
 		`DELETE FROM chat_download_streams`, `DELETE FROM chat_download_items`, `DELETE FROM chat_download_jobs`,
@@ -2527,6 +2542,92 @@ func TestPostgresChatReconcileRetiresAStaleCompletedClaim(t *testing.T) {
 	}
 	if ownerKind != "chat" || ownerID != "chat-stale" || ownerStatus != "claimed" {
 		t.Fatalf("the stale row is now %s/%s/%s; the task that can transfer it must hold the claim", ownerKind, ownerID, ownerStatus)
+	}
+}
+
+// A request names files; a task is just where they live. When a submission
+// names files the task it matched does not hold, those files have to join it.
+//
+// The shape that produced this is an album: one member fetched on its own with
+// ?single, and then the whole album submitted. The match is that one-file task,
+// and answering with it dropped the rest of the request on the floor — the rows
+// were never written, and a settled task is never claimed again, so the album
+// became unreachable behind the one file that had been downloaded. The user saw
+// a 202 and a duplicate, and waited for files that were never queued.
+func TestPostgresSubmissionExtendsTheTaskThatHoldsPartOfTheRequest(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := newSubmissionTestManager(t, db)
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('album-one','https://t.me/c/700/100?single','channel','channel:album','相册','account','completed',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, original_name, status, final_path) VALUES ('album-one','channel','channel:album',700,100,'one.bin','completed','/downloads/one.bin')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same album, now submitted whole: one file the task holds and two it
+	// does not.
+	sources := []source{
+		{Item: Item{DialogType: "channel", DialogKey: "channel:album", DialogID: 700, MessageID: 100, OriginalName: "one.bin"}, DialogName: "相册"},
+		{Item: Item{DialogType: "channel", DialogKey: "channel:album", DialogID: 700, MessageID: 101, OriginalName: "two.bin"}, DialogName: "相册"},
+		{Item: Item{DialogType: "channel", DialogKey: "channel:album", DialogID: 700, MessageID: 102, OriginalName: "three.bin"}, DialogName: "相册"},
+	}
+	submission, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account", URL: "https://t.me/c/700/100"}, sources, directPeer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !submission.Duplicate || !submission.Reactivated {
+		t.Fatalf("the submission reports duplicate=%t reactivated=%t; the task it matched has to take the new files and go back on the queue", submission.Duplicate, submission.Reactivated)
+	}
+	if submission.Job.ID != "album-one" {
+		t.Fatalf("the submission matched task %q; want the one that already holds part of the album", submission.Job.ID)
+	}
+
+	var total, queued int
+	if err := db.QueryRow(`SELECT COUNT(1), COUNT(1) FILTER (WHERE status = 'queued') FROM download_items WHERE job_id = 'album-one'`).Scan(&total, &queued); err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || queued != 2 {
+		t.Fatalf("the task holds %d file(s), %d queued; want 3 with the 2 new ones queued", total, queued)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM download_jobs WHERE id = 'album-one'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("the task is %q; a task that just took on files has to be claimable again", status)
+	}
+
+	// A request that brings nothing new is still the plain duplicate it always
+	// was: no status change, no spurious reactivation.
+	before := submission.Job.UpdatedAt
+	again, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account", URL: "https://t.me/c/700/100"}, sources, directPeer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Duplicate || again.Reactivated {
+		t.Fatalf("re-submitting the same files reports duplicate=%t reactivated=%t; want a plain duplicate", again.Duplicate, again.Reactivated)
+	}
+	var after string
+	if err := db.QueryRow(`SELECT updated_at FROM download_jobs WHERE id = 'album-one'`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("the task's updated_at moved from %q to %q for a request that added nothing", before, after)
 	}
 }
 
