@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vacks/tdl/internal/adapter/upstream"
 	"github.com/vacks/tdl/internal/buildinfo"
 	"github.com/vacks/tdl/internal/download"
 )
@@ -18,7 +17,7 @@ import (
 func TestHelpTextIsTheDocumentedCommandList(t *testing.T) {
 	want := []string{
 		"<b>TDL帮助</b>",
-		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + upstream.Version,
+		"版本：TDL 管理 " + buildinfo.Version + " · 上游 TDL " + buildinfo.UpstreamVersion,
 		"",
 		"发送 Telegram 消息链接或转发消息即可创建消息下载任务。",
 		"",

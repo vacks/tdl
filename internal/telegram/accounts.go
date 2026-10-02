@@ -326,6 +326,10 @@ type Manager struct {
 	// settable so a test can watch the reporting happen without capturing the
 	// process's log output; see noteSlowRPC.
 	slowRPC func(accountID, method string, elapsed time.Duration, err error)
+	// tally counts the requests that actually reached the wire, per account and
+	// method. See rpc_tally.go: it is the only place the account's request
+	// volume is observable, because a flood window surfaced nowhere else.
+	tally rpcTally
 }
 
 // RPCGate is the account-wide metadata gate.
@@ -430,7 +434,7 @@ func (m *Manager) noteSlowRPC(accountID string, input bin.Encoder, elapsed time.
 	if elapsed < slowRPCThreshold {
 		return
 	}
-	method := strings.TrimPrefix(fmt.Sprintf("%T", input), "*tg.")
+	method := rpcMethodName(input)
 	if m.slowRPC != nil {
 		m.slowRPC(accountID, method, elapsed, err)
 	}
@@ -460,6 +464,31 @@ func (m *Manager) rpcGateMiddleware(accountID string) gotd.Middleware {
 			return err
 		}
 	})
+}
+
+// accountMiddlewares is the invoker chain every account client is built with,
+// in the order it has to be applied: first listed is outermost.
+//
+// The order is the whole point of the list, so it lives in one place instead of
+// being repeated as an argument list at each client construction. Reading it
+// outermost to innermost:
+//
+//   - the gate paces the request, and the tally below it then counts what the
+//     gate let through;
+//   - the gate must be outside the waiter that consumes a FLOOD_WAIT, which is
+//     why the caller's middlewares go last in the client's own chain (see
+//     upstream tclient.New) - the gate has to see the refusal before the
+//     waiter sleeps it off;
+//   - the tally is innermost because it counts requests that reached the wire:
+//     a resolution answered from the username cache never happened as far as
+//     Telegram is concerned, and counting it would overstate the budget this
+//     tally exists to measure.
+func (m *Manager) accountMiddlewares(accountID string) []gotd.Middleware {
+	return []gotd.Middleware{
+		m.rpcGateMiddleware(accountID),
+		m.usernameCacheMiddleware(accountID),
+		m.rpcTallyMiddleware(accountID),
+	}
 }
 
 func Open(dataDir string, proxyURL func() string) (*Manager, error) {
@@ -1094,7 +1123,7 @@ func (m *Manager) runSessionConnection(ctx context.Context, session *accountSess
 	// contacts.resolveUsername requests the download path does, against the same
 	// account and the same server-side window, so leaving them unpaced meant the
 	// listener and the transfers were not sharing one budget at all.
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher}, false, m.rpcGateMiddleware(accountID), m.usernameCacheMiddleware(accountID))
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: session.proxy, UpdateHandler: dispatcher}, false, m.accountMiddlewares(accountID)...)
 	if err != nil {
 		return &sessionBuildError{err: fmt.Errorf("创建 Telegram 连接: %w", err)}
 	}
@@ -1608,7 +1637,7 @@ func (m *Manager) markExpired(id string) {
 func (m *Manager) runQR(ctx context.Context, id string) {
 	store := m.accountStore(id)
 	dispatcher := tg.NewUpdateDispatcher()
-	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true, m.rpcGateMiddleware(id), m.usernameCacheMiddleware(id))
+	client, err := upstreamClient.New(ctx, upstreamClient.Options{KV: store, Proxy: m.proxyURL(), UpdateHandler: dispatcher}, true, m.accountMiddlewares(id)...)
 	if err != nil {
 		m.setError(id, fmt.Errorf("创建 Telegram 客户端失败: %w", err))
 		return

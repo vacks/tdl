@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vacks/tdl/internal/adapter/upstream"
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/buildinfo"
 	"github.com/vacks/tdl/internal/download"
@@ -64,6 +63,20 @@ type botUser struct {
 
 // Service is intentionally a small Telegram Bot API client. It is separate
 // from the user-account MTProto client used by tdl downloads.
+//
+// TODO(bot-mtproto): the two clients do not have to stay separate. Everything
+// this service sends goes over the Bot API's HTTP, while the rest of the
+// application speaks MTProto as a simulated client - a second connection
+// stack, a second proxy path, a second rate limiter and a second notion of
+// what Telegram refused. gotd can authorize as a bot (Auth().Bot(token) ->
+// auth.importBotAuthorization), at which point the bot could share this
+// application's transport and could read a forwarded post's origin directly
+// instead of rebuilding a t.me link and hoping the account can open it.
+//
+// It is deliberately not done yet: the Bot API is the sanctioned interface for
+// bots, its limits are documented, 429 carries a retry_after this service
+// honours, and this service sends very little. The account's own request volume
+// is where the risk is. See docs/todo.md for the per-method migration notes.
 type Service struct {
 	settings   *settings.Store
 	downloads  *download.Manager
@@ -3110,7 +3123,7 @@ func messageFullText(value string) string {
 }
 
 func helpText() string {
-	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version, upstream.Version)
+	return fmt.Sprintf("<b>TDL帮助</b>\n版本：TDL 管理 %s · 上游 TDL %s\n\n发送 Telegram 消息链接或转发消息即可创建消息下载任务。\n\n<code>/help</code> 获取帮助信息\n<code>/status</code> 获取TDL当前状态\n<code>/config</code> 获取TDL当前配置\n<code>/restart</code> 重启TDL所有服务\n<code>/tasks</code> 获取所有消息下载任务\n<code>/task_filter</code> 筛选获取消息下载任务\n<code>/chats [链接]</code> 获取/创建会话类型下载\n<code>/saved_task</code> 获取收藏夹任务\n<code>/saved_all</code> 下载收藏夹历史消息\n<code>/saved_listen</code> 开始/停止监听收藏夹新消息\n<code>/events</code> 获取监听的正在处理事件\n<code>/event_clear</code> 清空已停止重试的事件", buildinfo.Version, buildinfo.UpstreamVersion)
 }
 
 // statusAccountBudget bounds the account block in the status card, in runes.
@@ -3301,7 +3314,7 @@ func databaseStatusLabel(health download.DatabaseHealth) string {
 func statusCard(accounts, database, network string, counts []string, cpu, memory, receive, transmit float64) string {
 	lines := []string{
 		"<b>当前状态</b>",
-		fmt.Sprintf("版本：TDL 管理 %s · 上游 TDL %s", buildinfo.Version, upstream.Version),
+		fmt.Sprintf("版本：TDL 管理 %s · 上游 TDL %s", buildinfo.Version, buildinfo.UpstreamVersion),
 		"数据库状态：" + database,
 		"Telegram网络：" + network,
 		accounts,

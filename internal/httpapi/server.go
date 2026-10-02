@@ -16,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vacks/tdl/internal/adapter/upstream"
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/auth"
 	"github.com/vacks/tdl/internal/bot"
+	"github.com/vacks/tdl/internal/buildinfo"
 	"github.com/vacks/tdl/internal/config"
 	"github.com/vacks/tdl/internal/download"
 	"github.com/vacks/tdl/internal/monitor"
@@ -158,6 +158,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/config", s.requireAuth(s.configAPI))
 	s.mux.HandleFunc("/api/telegram/accounts", s.requireAuth(s.telegramAccounts))
 	s.mux.HandleFunc("/api/telegram/accounts/", s.requireAuth(s.telegramAccount))
+	s.mux.HandleFunc("/api/telegram/rpc-tally", s.requireAuth(s.rpcTallyAPI))
 	s.mux.HandleFunc("/api/downloads", s.requireAuth(s.downloadsAPI))
 	s.mux.HandleFunc("/api/downloads/progress", s.requireAuth(s.downloadProgressSSE))
 	s.mux.HandleFunc("/api/downloads/", s.requireAuth(s.downloadControlAPI))
@@ -259,13 +260,38 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 // the Bot's /status command, where a person asks for them once.
 func (s *Server) dashboard(w http.ResponseWriter, _ *http.Request) {
 	current, trend := s.monitor.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "database": s.downloads.DatabaseHealth(), "reactions": s.reactions.Health(), "upstreamVersion": upstream.Version, "system": map[string]any{"current": current, "trend": trend}})
+	writeJSON(w, http.StatusOK, map[string]any{"telegram": map[string]string{"status": s.telegram.Status()}, "database": s.downloads.DatabaseHealth(), "reactions": s.reactions.Health(), "upstreamVersion": buildinfo.UpstreamVersion, "system": map[string]any{"current": current, "trend": trend}})
+}
+
+// rpcTallyAPI reports — and can reset — the Telegram requests each account has
+// actually put on the wire since the process started.
+//
+// It is deliberately its own endpoint rather than a field on /api/status: that
+// snapshot is compared between reads to decide whether to push an SSE frame, so
+// anything that changes on every request would turn the push into a poll. A
+// counter that moves with every Telegram request is the worst possible tenant
+// for that struct.
+//
+// Reset is a POST on the same path. A measurement is "reset, do one thing, read
+// what it cost", and doing it in two round trips invites reading someone else's
+// requests in between.
+func (s *Server) rpcTallyAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": s.telegram.RPCTally()})
+	case http.MethodPost:
+		s.telegram.ResetRPCTally()
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": map[string]any{}})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "不支持的请求方法"})
+	}
 }
 
 func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"settings": s.settings.Get(), "downloadDir": s.cfg.DownloadDir, "upstreamVersion": upstream.Version, "aria2Enabled": false})
+		writeJSON(w, http.StatusOK, map[string]any{"settings": s.settings.Get(), "downloadDir": s.cfg.DownloadDir, "upstreamVersion": buildinfo.UpstreamVersion, "aria2Enabled": false})
 	case http.MethodPut:
 		var values settings.Values
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&values); err != nil {
@@ -276,7 +302,7 @@ func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"settings": s.settings.Get(), "downloadDir": s.cfg.DownloadDir, "upstreamVersion": upstream.Version, "aria2Enabled": false})
+		writeJSON(w, http.StatusOK, map[string]any{"settings": s.settings.Get(), "downloadDir": s.cfg.DownloadDir, "upstreamVersion": buildinfo.UpstreamVersion, "aria2Enabled": false})
 	default:
 		methodNotAllowed(w, "GET, PUT")
 	}
