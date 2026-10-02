@@ -7,15 +7,10 @@ RUN npm run build
 
 FROM golang:1.25-bookworm AS backend
 WORKDIR /src
-RUN apt-get update && apt-get install -y --no-install-recommends patch && rm -rf /var/lib/apt/lists/*
-# Keep the dependency and upstream-patch layer independent from application
-# source. A UI or handler edit must not force a full Go module download again.
-COPY go.mod go.sum go.work ./
-COPY scripts/prepare-upstream-progress.sh ./scripts/prepare-upstream-progress.sh
-COPY patches/tdl-progress-0.20.4.patch ./patches/tdl-progress-0.20.4.patch
-COPY patches/tdl-runtime-options-0.20.4.patch ./patches/tdl-runtime-options-0.20.4.patch
-COPY patches/tdl-cancel-0.20.4.patch ./patches/tdl-cancel-0.20.4.patch
-RUN sh ./scripts/prepare-upstream-progress.sh && go mod download
+# Keep the dependency layer independent from application source. A UI or handler
+# edit must not force a full Go module download again.
+COPY go.mod go.sum ./
+RUN go mod download
 # Keep the Go test layer independent from Web source changes. The static Web
 # bundle is embedded only for the final binary build below.
 COPY cmd ./cmd

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	upstreamDL "github.com/iyear/tdl/app/dl"
+	transfer "github.com/vacks/tdl/internal/download/transfer"
 )
 
 // FileProgress is live, non-persistent download state. It intentionally stays
@@ -52,7 +52,7 @@ func progressKey(dialogKey string, messageID int) string {
 	return fmt.Sprintf("%s:%d", dialogKey, messageID)
 }
 
-func (p *progressStore) Update(jobID string, item Item, update upstreamDL.ProgressUpdate) (started, completed bool) {
+func (p *progressStore) Update(jobID string, item Item, update transfer.ProgressUpdate) (started, completed bool) {
 	now := time.Now()
 	key := progressKey(item.DialogKey, update.MessageID)
 	p.mu.Lock()

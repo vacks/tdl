@@ -16,8 +16,7 @@ package kv
 
 import (
 	"context"
-
-	upstreamStorage "github.com/iyear/tdl/core/storage"
+	"errors"
 )
 
 // Storage is a byte-oriented key-value store.
@@ -31,19 +30,11 @@ type Storage interface {
 // deleted. Callers distinguish it from a read failure, because "no session yet"
 // is the ordinary first-run case and "cannot read the session" is not.
 //
-// It is, for now, the same value the upstream storage package uses, and that
-// identity is load-bearing rather than tidy-minded. This store is handed to
-// code that predates it: the upstream downloader reads its resume state through
-// it and decides whether the read failed or merely found nothing with
-// errors.Is(err, storage.ErrNotFound). A store answering with a sentinel of its
-// own made every first download look like a failed read - the resume key is
-// absent in the ordinary case - and the transfer was abandoned with "key not
-// found" before it started.
-//
-// It is one value, not two aliases, because both sides have to agree: our own
-// session and peer storage compare against this too, and they are handed errors
-// by the same store.
-//
-// When the upstream downloader is gone this becomes its own sentinel, which is
-// a one-line change with no caller to update.
-var ErrNotFound = upstreamStorage.ErrNotFound
+// It used to be the upstream storage package's sentinel, and the identity was
+// load-bearing: the upstream downloader read its resume state through this
+// store and decided whether the read had failed by comparing against its own
+// package's value. Two sentinels for one answer made every first download look
+// like a failed read, and every download was abandoned before it started. That
+// consumer is gone, so this is a value of its own - and every reader of this
+// store is in this repository, comparing against this name.
+var ErrNotFound = errors.New("key not found")

@@ -14,9 +14,9 @@ import (
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
-	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/kv"
+	"github.com/vacks/tdl/internal/tmsg"
 )
 
 func triggerJSON(trigger map[string]string) string {
@@ -506,7 +506,7 @@ func (m *Manager) SubmitChat(ctx context.Context, intent ChatIntent) (ChatJob, e
 }
 
 func resolveChatTarget(ctx context.Context, manager *peers.Manager, rawURL string) (peers.Peer, int, error) {
-	peer, messageID, err := tutil.ParseMessageLink(ctx, manager, rawURL)
+	peer, messageID, err := tmsg.ParseMessageLink(ctx, manager, rawURL)
 	if err == nil {
 		return peer, messageID, nil
 	}
@@ -521,7 +521,7 @@ func resolveChatTarget(ctx context.Context, manager *peers.Manager, rawURL strin
 	if _, convertErr := strconv.Atoi(parts[0]); convertErr == nil {
 		return nil, 0, errors.New("会话链接缺少用户名")
 	}
-	resolved, resolveErr := tutil.GetInputPeer(ctx, manager, parts[0])
+	resolved, resolveErr := tmsg.GetInputPeer(ctx, manager, parts[0])
 	if resolveErr != nil {
 		return nil, 0, fmt.Errorf("解析会话链接: %w", resolveErr)
 	}

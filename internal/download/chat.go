@@ -16,10 +16,10 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
-	upstreamDL "github.com/iyear/tdl/app/dl"
-	"github.com/iyear/tdl/core/tmedia"
-	"github.com/iyear/tdl/core/util/tutil"
-	"github.com/iyear/tdl/pkg/tmessage"
+	transfer "github.com/vacks/tdl/internal/download/transfer"
+	"github.com/vacks/tdl/internal/tmedia"
+	"github.com/vacks/tdl/internal/tmsg"
+
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/kv"
 	"github.com/vacks/tdl/internal/settings"
@@ -881,9 +881,9 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	// earlier task had already fetched.
 	claimedWindow := 0
 	adopted := 0
-	transfer := make([]source, 0)
+	toTransfer := make([]source, 0)
 	defer func() {
-		more = err == nil && claimedWindow == chatBatchSize && adopted+len(transfer) > 0
+		more = err == nil && claimedWindow == chatBatchSize && adopted+len(toTransfer) > 0
 	}()
 	// A message task created from a link, Bot command or reaction is interactive
 	// work. While any such task is ready, the shared scheduler caps chat batches
@@ -1019,7 +1019,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		lock.Unlock()
 		return false, err
 	}
-	transfer = make([]source, 0, len(batch))
+	toTransfer = make([]source, 0, len(batch))
 	waiting := make([]source, 0, len(batch))
 	for _, item := range batch {
 		claim := claims[mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}]
@@ -1033,7 +1033,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		case "waiting":
 			waiting = append(waiting, item)
 		default:
-			transfer = append(transfer, item)
+			toTransfer = append(toTransfer, item)
 		}
 	}
 	if len(waiting) > 0 {
@@ -1042,7 +1042,7 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 			return false, err
 		}
 	}
-	batch = transfer
+	batch = toTransfer
 	if len(batch) == 0 {
 		lock.Unlock()
 		return false, nil
@@ -1070,15 +1070,16 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	}
 	byMessage := make(map[int]source, len(batch))
 	ids := make([]int, 0, len(batch))
-	groups := map[int64]struct{}{}
+	seenMessages := map[int]struct{}{}
 	for _, item := range batch {
 		byMessage[item.MessageID] = item
-		if item.GroupedID != 0 {
-			if _, ok := groups[item.GroupedID]; ok {
-				continue
-			}
-			groups[item.GroupedID] = struct{}{}
+		// Every member of an album is listed, not only its first: the items were
+		// built by expanding the album, and the engine no longer expands it
+		// again. An album that arrived as one item stays one file.
+		if _, exists := seenMessages[item.MessageID]; exists {
+			continue
 		}
+		seenMessages[item.MessageID] = struct{}{}
 		ids = append(ids, item.MessageID)
 	}
 	tmpRoot := filepath.Join(m.downloadDir, ".tdl-tmp", "chat-"+id)
@@ -1115,42 +1116,59 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 		publishMu.Unlock()
 	}
 	err = m.accounts.Run(transferCtx, target.AccountID, func(runCtx context.Context, client *gotd.Client, kvd kv.Storage) error {
+		// The account's pool, not this task's: it is built once per account and
+		// its invoker chain carries the rate limit gate. See
+		// telegram.Manager.TransferPool.
+		pool := m.accounts.TransferPool(target.AccountID, client, config.Download.PoolSize)
 		peer := selected.inputPeer()
 		if peer == nil {
 			return errors.New("会话下载文件缺少 Telegram 来源会话")
 		}
-		opts := upstreamDL.Options{Dir: tmpDir, Template: temporaryFilenameTemplate, Group: true, Continue: true, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: ids}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
-			item, ok := byMessage[update.MessageID]
-			if !ok {
-				return
-			}
-			watchdog.Touch()
-			started, _ := m.progress.Update(id, item.Item, update)
-			if started {
-				_, _ = m.db.Exec(`UPDATE chat_download_items SET status='running', started_at=? WHERE chat_job_id=? AND dialog_key=? AND message_id=? AND status='queued'`, time.Now().UTC().Format(time.RFC3339Nano), id, item.DialogKey, item.MessageID)
-			}
-		}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
-			item, ok := byMessage[update.MessageID]
-			if !ok {
-				return
-			}
-			watchdog.Touch()
-			m.progress.ClearItem(id, item.Item)
-			// Upstream invokes completion callbacks from transfer workers. Keep
-			// final file moves out of those workers, but wait below before the
-			// batch decides its final state. publishChatItem itself records a
-			// per-file failure; a post-move database failure is recovered by the
-			// reconciliation immediately after the wait and on worker cadence.
-			publishWG.Add(1)
-			go func() {
-				defer publishWG.Done()
-				if publishErr := m.publishChatItem(id, update.Path, item, config); publishErr != nil {
-					recordPublishErr(publishErr)
-					applog.Error("chat_download", "file_publish_failed", "chat_job_id", id, "message_id", item.MessageID, "error", publishErr.Error())
+		stats, runErr := transfer.Run(runCtx, transfer.Deps{Pool: pool, KV: kvd, AccountID: target.AccountID}, transfer.Options{
+			Dir:      tmpDir,
+			Peer:     peer,
+			Messages: ids,
+			Threads:  config.Download.Threads,
+			Tasks:    config.Download.TaskLimit,
+			Delay:    time.Duration(config.Download.DelayMS) * time.Millisecond,
+			OnProgress: func(update transfer.ProgressUpdate) {
+				item, ok := byMessage[update.MessageID]
+				if !ok {
+					return
 				}
-			}()
-		}}
-		return upstreamDL.Run(runCtx, client, kvd, opts)
+				watchdog.Touch()
+				started, _ := m.progress.Update(id, item.Item, update)
+				if started {
+					_, _ = m.db.Exec(`UPDATE chat_download_items SET status='running', started_at=? WHERE chat_job_id=? AND dialog_key=? AND message_id=? AND status='queued'`, time.Now().UTC().Format(time.RFC3339Nano), id, item.DialogKey, item.MessageID)
+				}
+			},
+			OnFileCompleted: func(update transfer.FileCompletedUpdate) {
+				item, ok := byMessage[update.MessageID]
+				if !ok {
+					return
+				}
+				watchdog.Touch()
+				m.progress.ClearItem(id, item.Item)
+				// The engine invokes completion callbacks from transfer workers.
+				// Keep final file moves out of those workers, but wait below
+				// before the batch decides its final state. publishChatItem itself
+				// records a per-file failure; a post-move database failure is
+				// recovered by the reconciliation immediately after the wait and
+				// on worker cadence.
+				publishWG.Add(1)
+				go func() {
+					defer publishWG.Done()
+					if publishErr := m.publishChatItem(id, update.Path, item, config); publishErr != nil {
+						recordPublishErr(publishErr)
+						applog.Error("chat_download", "file_publish_failed", "chat_job_id", id, "message_id", item.MessageID, "error", publishErr.Error())
+					}
+				}()
+			},
+		})
+		applog.Info("chat_download", "batch_transferred", "chat_job_id", id, "requested", len(ids),
+			"files", stats.Files, "deleted", stats.Deleted, "without_media", stats.Empty,
+			"failed", stats.Failed, "batch_reads", stats.BatchCalls, "single_reads", stats.SingleCalls)
+		return runErr
 	})
 	publishWG.Wait()
 	if reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch)); reconcileErr != nil {
@@ -2843,7 +2861,7 @@ func (m *Manager) scanChatStream(ctx context.Context, client *gotd.Client, targe
 				if _, done := expandedGroups[group.id]; done {
 					continue
 				}
-				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), group.members[0]); groupErr == nil && len(expanded) > 0 {
+				if expanded, groupErr := tmsg.GetGroupedMessages(ctx, client.API(), target.inputPeer(), group.members[0]); groupErr == nil && len(expanded) > 0 {
 					members = expanded
 					expandedGroups[group.id] = struct{}{}
 				} else if groupErr != nil && m.recordTelegramRPCError(target.AccountID, groupErr) {
@@ -2961,7 +2979,7 @@ func (m *Manager) scanChatReplyCandidates(ctx context.Context, client *gotd.Clie
 			}
 			members := []*tg.Message{message}
 			if grouped {
-				if expanded, groupErr := tutil.GetGroupedMessages(ctx, client.API(), target.inputPeer(), message); groupErr == nil && len(expanded) > 0 {
+				if expanded, groupErr := tmsg.GetGroupedMessages(ctx, client.API(), target.inputPeer(), message); groupErr == nil && len(expanded) > 0 {
 					members = expanded
 				} else if groupErr != nil && m.recordTelegramRPCError(target.AccountID, groupErr) {
 					return fmt.Errorf("展开回复相册: %w", groupErr)

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/gotd/td/telegram/peers"
-	upstreamStorage "github.com/iyear/tdl/core/storage"
 )
 
 // memStorage is an in-memory Storage.
@@ -40,23 +39,6 @@ func (m *memStorage) Set(_ context.Context, key string, value []byte) error {
 func (m *memStorage) Delete(_ context.Context, key string) error {
 	delete(m.values, key)
 	return nil
-}
-
-// This store is handed to the upstream downloader, which decides whether a
-// resume read failed or merely found nothing by comparing against its own
-// package's sentinel. Two different sentinels for one answer made every first
-// download look like a failed read, and it was abandoned with "key not found"
-// before it started - a total failure of the feature, invisible to every test
-// that used a fake store.
-//
-// The assertion is deliberately this blunt. It is not testing behaviour, it is
-// testing that one value is still the value the code on the other side of the
-// boundary compares against, and it should be deleted along with the alias when
-// that code goes.
-func TestNotFoundIsTheSentinelTheUpstreamDownloaderComparesAgainst(t *testing.T) {
-	if ErrNotFound != upstreamStorage.ErrNotFound {
-		t.Fatal("the store answers with a sentinel the upstream downloader does not recognise, so an absent resume key reads as a failed read")
-	}
 }
 
 // Every key this application has ever written is spelled the way these

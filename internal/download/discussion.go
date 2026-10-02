@@ -8,9 +8,9 @@ import (
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
-	"github.com/iyear/tdl/core/tmedia"
-	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/vacks/tdl/internal/applog"
+	"github.com/vacks/tdl/internal/tmedia"
+	"github.com/vacks/tdl/internal/tmsg"
 )
 
 // setOrigin records presentation context without changing the true Telegram
@@ -170,7 +170,7 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 				if _, alreadyExpanded := expandedGroups[groupID]; alreadyExpanded {
 					continue
 				}
-				group, groupErr := tutil.GetGroupedMessages(ctx, api, threadPeer, message)
+				group, groupErr := tmsg.GetGroupedMessages(ctx, api, threadPeer, message)
 				if groupErr != nil {
 					if m.recordTelegramRPCError(accountID, groupErr) {
 						// Keep the reply-page cursor intact during a Telegram cooldown.

@@ -4,13 +4,13 @@ import (
 	"testing"
 	"time"
 
-	upstreamDL "github.com/iyear/tdl/app/dl"
+	transfer "github.com/vacks/tdl/internal/download/transfer"
 )
 
 func TestProgressStoreTracksRateAndClearsOnlyRequestedJob(t *testing.T) {
 	store := newProgressStore()
 	item := Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 7}
-	started, completed := store.Update("job-a", item, upstreamDL.ProgressUpdate{DialogID: 42, MessageID: 7, Downloaded: 100, Total: 1000})
+	started, completed := store.Update("job-a", item, transfer.ProgressUpdate{DialogID: 42, MessageID: 7, Downloaded: 100, Total: 1000})
 	if !started || completed {
 		t.Fatalf("initial Update() = started:%v completed:%v, want true:false", started, completed)
 	}
@@ -23,7 +23,7 @@ func TestProgressStoreTracksRateAndClearsOnlyRequestedJob(t *testing.T) {
 	state.lastMeasuredByte = 100
 	store.files[key] = state
 	store.mu.Unlock()
-	started, completed = store.Update("job-a", item, upstreamDL.ProgressUpdate{DialogID: 42, MessageID: 7, Downloaded: 500, Total: 1000})
+	started, completed = store.Update("job-a", item, transfer.ProgressUpdate{DialogID: 42, MessageID: 7, Downloaded: 500, Total: 1000})
 	if started || completed {
 		t.Fatalf("later Update() = started:%v completed:%v, want false:false", started, completed)
 	}
@@ -33,7 +33,7 @@ func TestProgressStoreTracksRateAndClearsOnlyRequestedJob(t *testing.T) {
 	}
 
 	other := Item{DialogType: "channel", DialogKey: "channel:42", DialogID: 42, MessageID: 8}
-	store.Update("job-b", other, upstreamDL.ProgressUpdate{DialogID: 42, MessageID: 8, Downloaded: 1, Total: 1, Completed: true})
+	store.Update("job-b", other, transfer.ProgressUpdate{DialogID: 42, MessageID: 8, Downloaded: 1, Total: 1, Completed: true})
 	store.ClearJob("job-a")
 	snapshot = store.Snapshot()
 	if len(snapshot) != 1 || snapshot[0].MessageID != 8 {
@@ -44,8 +44,8 @@ func TestProgressStoreTracksRateAndClearsOnlyRequestedJob(t *testing.T) {
 func TestProgressStoreRestartsMeasurementWhenBytesReset(t *testing.T) {
 	store := newProgressStore()
 	item := Item{DialogKey: "channel:42", MessageID: 7}
-	store.Update("job-a", item, upstreamDL.ProgressUpdate{MessageID: 7, Downloaded: 900, Total: 1000})
-	started, _ := store.Update("job-a", item, upstreamDL.ProgressUpdate{MessageID: 7, Downloaded: 10, Total: 1000})
+	store.Update("job-a", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 900, Total: 1000})
+	started, _ := store.Update("job-a", item, transfer.ProgressUpdate{MessageID: 7, Downloaded: 10, Total: 1000})
 	if !started {
 		t.Fatal("progress reset was not treated as a new measurement")
 	}
@@ -59,7 +59,7 @@ func TestProgressStoreUsesTaskWideRateAndDropsFinishedFiles(t *testing.T) {
 	store := newProgressStore()
 	first := Item{DialogKey: "channel:42", MessageID: 7}
 	second := Item{DialogKey: "channel:42", MessageID: 8}
-	store.Update("chat-a", first, upstreamDL.ProgressUpdate{MessageID: 7, Downloaded: 100, Total: 100})
+	store.Update("chat-a", first, transfer.ProgressUpdate{MessageID: 7, Downloaded: 100, Total: 100})
 
 	// Advance the shared sample window without sleeping. The second small file
 	// completes in its first callback, which previously had no per-file rate at
@@ -69,7 +69,7 @@ func TestProgressStoreUsesTaskWideRateAndDropsFinishedFiles(t *testing.T) {
 	job.lastSampleAt = time.Now().Add(-2 * time.Second)
 	store.jobs["chat-a"] = job
 	store.mu.Unlock()
-	store.Update("chat-a", second, upstreamDL.ProgressUpdate{MessageID: 8, Downloaded: 100, Total: 100, Completed: true})
+	store.Update("chat-a", second, transfer.ProgressUpdate{MessageID: 8, Downloaded: 100, Total: 100, Completed: true})
 
 	files, speed := store.Aggregate("chat-a")
 	if files != 2 || speed <= 0 {

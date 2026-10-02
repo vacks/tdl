@@ -329,6 +329,63 @@ type Manager struct {
 	// method. See rpc_tally.go: it is the only place the account's request
 	// volume is observable, because a flood window surfaced nowhere else.
 	tally rpcTally
+
+	// pools holds one connection pool per account, for the byte transfers. A
+	// pool outlives any one transfer - it is the connection handshake that makes
+	// rebuilding it per transfer expensive - and it is bound to the client it
+	// was built from, so a reconnect produces a new one instead of transferring
+	// into a dead connection.
+	poolMu sync.Mutex
+	pools  map[string]*accountPool
+}
+
+type accountPool struct {
+	client *gotd.Client
+	size   int
+	pool   tgclient.Pool
+}
+
+// TransferPool returns the account's pool of transfer connections.
+//
+// The pool is built here rather than by the caller because its invoker chain
+// belongs here: the account's rate-limit gate has to sit inside the waiter that
+// consumes a FLOOD_WAIT, or the pool's metadata reads are unpaced and a refusal
+// is slept off invisibly. That gap is what this function closes.
+//
+// The size is the configured one. A changed size, or a reconnect that replaced
+// the client, builds a new pool and closes the old one, so the configuration
+// takes effect without a restart.
+func (m *Manager) TransferPool(accountID string, client *gotd.Client, size int) tgclient.Pool {
+	m.poolMu.Lock()
+	defer m.poolMu.Unlock()
+	if existing, ok := m.pools[accountID]; ok {
+		if existing.client == client && existing.size == size {
+			return existing.pool
+		}
+		// Closing a pool does not disturb the account's own session: the pool's
+		// connections are its own, and the session keeps running.
+		_ = existing.pool.Close()
+	}
+	pool := tgclient.NewPool(client, int64(size), m.accountMiddlewares(accountID)...)
+	if m.pools == nil {
+		m.pools = make(map[string]*accountPool)
+	}
+	m.pools[accountID] = &accountPool{client: client, size: size, pool: pool}
+	return pool
+}
+
+// closeTransferPool releases an account's pool. It is called wherever the
+// account stops having a session, because the pool's connections are built on
+// that session's authorization and are useless without it.
+func (m *Manager) closeTransferPool(accountID string) {
+	m.poolMu.Lock()
+	defer m.poolMu.Unlock()
+	existing, ok := m.pools[accountID]
+	if !ok {
+		return
+	}
+	delete(m.pools, accountID)
+	_ = existing.pool.Close()
 }
 
 // RPCGate is the account-wide metadata gate.
@@ -855,9 +912,12 @@ func (m *Manager) acquireSession(id string) (*accountSession, error) {
 // it, so the caller decides whether the wait is needed.
 func (m *Manager) detachSession(id string) *accountSession {
 	m.sessionsMu.Lock()
-	defer m.sessionsMu.Unlock()
 	session := m.sessions[id]
 	delete(m.sessions, id)
+	m.sessionsMu.Unlock()
+	if session != nil {
+		m.closeTransferPool(id)
+	}
 	return session
 }
 
@@ -889,10 +949,14 @@ func (m *Manager) stopSession(id string) {
 // may already have taken its place.
 func (m *Manager) forgetSession(session *accountSession) {
 	m.sessionsMu.Lock()
-	if m.sessions[session.accountID] == session {
+	forgotten := m.sessions[session.accountID] == session
+	if forgotten {
 		delete(m.sessions, session.accountID)
 	}
 	m.sessionsMu.Unlock()
+	if forgotten {
+		m.closeTransferPool(session.accountID)
+	}
 }
 
 // cancelSession stops one specific session, detaching it only if it is still the

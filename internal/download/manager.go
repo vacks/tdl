@@ -24,10 +24,10 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
-	upstreamDL "github.com/iyear/tdl/app/dl"
-	"github.com/iyear/tdl/core/tmedia"
-	"github.com/iyear/tdl/core/util/tutil"
-	"github.com/iyear/tdl/pkg/tmessage"
+	transfer "github.com/vacks/tdl/internal/download/transfer"
+	"github.com/vacks/tdl/internal/tmedia"
+	"github.com/vacks/tdl/internal/tmsg"
+
 	"github.com/vacks/tdl/internal/applog"
 	"github.com/vacks/tdl/internal/kv"
 	"github.com/vacks/tdl/internal/settings"
@@ -1791,13 +1791,19 @@ func (m *Manager) run(job Job, sources []source) {
 		}
 		stateMu.Unlock()
 	}
-	// A deleted task may have left an upstream resume key. Consume this one-shot
-	// marker so recreating it starts with a new temporary directory.
-	restart := m.consumeRestart(job.AccountID, job.SourceURL)
+	// Drain the deleted-task marker for this task, if a previous removal left
+	// one. It used to force the download engine to ignore its stored resume
+	// state; the engine keeps none, so it is only a marker to clear now - but it
+	// is cleared, because nothing else would ever remove the row.
+	m.consumeRestart(job.AccountID, job.SourceURL)
 	err = m.accounts.Run(transferCtx, job.AccountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
-		// Upstream callbacks identify only a message ID. Execute one real
-		// Telegram dialog at a time so a discussion-group comment cannot collide
-		// with a channel post that happens to have the same numeric message ID.
+		// The transfer connections belong to the account, not to this task: the
+		// pool is built once per account and its invoker chain carries the rate
+		// limit gate. See telegram.Manager.TransferPool.
+		pool := m.accounts.TransferPool(job.AccountID, client, config.Download.PoolSize)
+		// Callbacks identify only a message ID. Execute one real Telegram dialog
+		// at a time so a discussion-group comment cannot collide with a channel
+		// post that happens to have the same numeric message ID.
 		groups := make([][]source, 0, 2)
 		groupIndex := make(map[string]int)
 		for _, item := range pending {
@@ -1815,7 +1821,7 @@ func (m *Manager) run(job Job, sources []source) {
 			item.Direct = direct
 			groups[index] = append(groups[index], item)
 		}
-		for groupNumber, batch := range groups {
+		for _, batch := range groups {
 			peer := batch[0].Direct.inputPeer()
 			if peer == nil {
 				return errors.New("下载文件缺少 Telegram 会话引用")
@@ -1827,53 +1833,62 @@ func (m *Manager) run(job Job, sources []source) {
 			byMessage := make(map[int]source, len(batch))
 			messageIDs := make([]int, 0, len(batch))
 			seenMessages := make(map[int]struct{}, len(batch))
-			seenGroups := make(map[int64]struct{})
 			for _, item := range batch {
 				byMessage[item.MessageID] = item
-				if item.GroupedID != 0 {
-					if _, exists := seenGroups[item.GroupedID]; exists {
-						continue
-					}
-					seenGroups[item.GroupedID] = struct{}{}
-				}
+				// Every member of an album is listed, not just its first. The
+				// items were built by expanding the album, so the engine does not
+				// have to expand it again - and a link marked ?single, whose items
+				// are deliberately one file, stays one file.
 				if _, exists := seenMessages[item.MessageID]; exists {
 					continue
 				}
 				seenMessages[item.MessageID] = struct{}{}
 				messageIDs = append(messageIDs, item.MessageID)
 			}
-			opts := upstreamDL.Options{Dir: tmpDir, Template: temporaryFilenameTemplate, Group: true, Continue: true, Restart: restart && groupNumber == 0, Quiet: true, Runtime: &upstreamDL.RuntimeOptions{Threads: config.Download.Threads, TaskLimit: config.Download.TaskLimit, PoolSize: config.Download.PoolSize, Delay: time.Duration(config.Download.DelayMS) * time.Millisecond, DisableProgressPS: true}, DirectDialogs: [][]*tmessage.Dialog{{{Peer: peer, Messages: messageIDs}}}, ProgressCallback: func(update upstreamDL.ProgressUpdate) {
-				if !m.runningOrUnknown(job.ID) {
-					return
-				}
-				watchdog.Touch()
-				item, ok := byMessage[update.MessageID]
-				if !ok {
-					return
-				}
-				if started, _ := m.progress.Update(job.ID, item.Item, update); started {
-					recordStateErr(m.markItemStarted(item))
-				}
-			}, FileCompletedCallback: func(update upstreamDL.FileCompletedUpdate) {
-				if !m.runningOrUnknown(job.ID) {
-					return
-				}
-				watchdog.Touch()
-				item, ok := byMessage[update.MessageID]
-				if !ok {
-					return
-				}
-				recordStateErr(m.markItemFinished(item))
-				m.progress.ClearItem(job.ID, item.Item)
-				publishWG.Add(1)
-				go func(item source, path string) {
-					defer publishWG.Done()
-					recordStateErr(m.publishItem(job.ID, path, item, config))
-				}(item, update.Path)
-			}}
-			if err := upstreamDL.Run(ctx, client, kvd, opts); err != nil {
+			stats, err := transfer.Run(ctx, transfer.Deps{Pool: pool, KV: kvd, AccountID: job.AccountID}, transfer.Options{
+				Dir:      tmpDir,
+				Peer:     peer,
+				Messages: messageIDs,
+				Threads:  config.Download.Threads,
+				Tasks:    config.Download.TaskLimit,
+				Delay:    time.Duration(config.Download.DelayMS) * time.Millisecond,
+				OnProgress: func(update transfer.ProgressUpdate) {
+					if !m.runningOrUnknown(job.ID) {
+						return
+					}
+					watchdog.Touch()
+					item, ok := byMessage[update.MessageID]
+					if !ok {
+						return
+					}
+					if started, _ := m.progress.Update(job.ID, item.Item, update); started {
+						recordStateErr(m.markItemStarted(item))
+					}
+				},
+				OnFileCompleted: func(update transfer.FileCompletedUpdate) {
+					if !m.runningOrUnknown(job.ID) {
+						return
+					}
+					watchdog.Touch()
+					item, ok := byMessage[update.MessageID]
+					if !ok {
+						return
+					}
+					recordStateErr(m.markItemFinished(item))
+					m.progress.ClearItem(job.ID, item.Item)
+					publishWG.Add(1)
+					go func(item source, path string) {
+						defer publishWG.Done()
+						recordStateErr(m.publishItem(job.ID, path, item, config))
+					}(item, update.Path)
+				},
+			})
+			if err != nil {
 				return err
 			}
+			applog.Info("download", "batch_transferred", "job_id", job.ID, "requested", len(messageIDs),
+				"files", stats.Files, "deleted", stats.Deleted, "without_media", stats.Empty,
+				"failed", stats.Failed, "batch_reads", stats.BatchCalls, "single_reads", stats.SingleCalls)
 		}
 		return nil
 	})
@@ -2964,11 +2979,11 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
 		manager := peers.Options{Storage: kv.NewPeers(kvd)}.Build(client.API())
-		peer, messageID, err := tutil.ParseMessageLink(ctx, manager, sourceURL)
+		peer, messageID, err := tmsg.ParseMessageLink(ctx, manager, sourceURL)
 		if err != nil {
 			return err
 		}
-		message, err := tutil.GetSingleMessage(ctx, client.API(), peer.InputPeer(), messageID)
+		message, err := tmsg.GetSingleMessage(ctx, client.API(), peer.InputPeer(), messageID)
 		if err != nil {
 			m.recordTelegramRPCError(accountID, err)
 			return err
@@ -2987,7 +3002,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			// on the item, because a naming template may legitimately use it, and
 			// it is the album's identity rather than a property of this one file.
 			if !linkAsksForSingleMessage(sourceURL) {
-				messages, err = tutil.GetGroupedMessages(ctx, client.API(), peer.InputPeer(), message)
+				messages, err = tmsg.GetGroupedMessages(ctx, client.API(), peer.InputPeer(), message)
 				if err != nil {
 					m.recordTelegramRPCError(accountID, err)
 					return err
@@ -3060,7 +3075,7 @@ func (m *Manager) resolvePeer(ctx context.Context, accountID string, inputPeer t
 func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, inputPeer tg.InputPeerClass, dialogID int64, messageID int, dialogName string, includeReplies, learnRoot bool, chatJobID string) ([]source, error) {
 	var result []source
 	err := m.accounts.Run(ctx, accountID, func(ctx context.Context, client *gotd.Client, kvd kv.Storage) error {
-		message, err := tutil.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
+		message, err := tmsg.GetSingleMessage(ctx, client.API(), inputPeer, messageID)
 		if err != nil {
 			m.recordTelegramRPCError(accountID, err)
 			return err
@@ -3069,7 +3084,7 @@ func (m *Manager) resolvePeerWithReplies(ctx context.Context, accountID string, 
 		groupedID := int64(0)
 		if group, ok := message.GetGroupedID(); ok {
 			groupedID = group
-			messages, err = tutil.GetGroupedMessages(ctx, client.API(), inputPeer, message)
+			messages, err = tmsg.GetGroupedMessages(ctx, client.API(), inputPeer, message)
 			if err != nil {
 				m.recordTelegramRPCError(accountID, err)
 				return err
@@ -3505,20 +3520,20 @@ func (m *Manager) Delete(id string) error {
 	return nil
 }
 
-func (m *Manager) consumeRestart(accountID, sourceURL string) bool {
-	tx, err := m.db.Begin()
-	if err != nil {
-		return false
+// consumeRestart clears the marker a removed task leaves behind.
+//
+// It used to answer a question as well: the download engine kept resume state
+// of its own, and a recreated task had to be told to ignore it. The engine
+// keeps none - the database is the only record of what has been fetched - so
+// this drains the marker and nothing reads the answer.
+//
+// It is one statement rather than a transaction around a read and a write. The
+// answer was never worth four round trips inside the path that starts a
+// download, and there is no longer an answer.
+func (m *Manager) consumeRestart(accountID, sourceURL string) {
+	if _, err := m.db.Exec(`DELETE FROM download_resets WHERE account_id = ? AND source_url = ?`, accountID, sourceURL); err != nil {
+		applog.Warn("download", "restart_marker_not_cleared", "account_id", accountID, "error", err.Error())
 	}
-	defer tx.Rollback()
-	var found int
-	if err := tx.QueryRow(`SELECT COUNT(1) FROM download_resets WHERE account_id = ? AND source_url = ?`, accountID, sourceURL).Scan(&found); err != nil || found == 0 {
-		return false
-	}
-	if _, err := tx.Exec(`DELETE FROM download_resets WHERE account_id = ? AND source_url = ?`, accountID, sourceURL); err != nil {
-		return false
-	}
-	return tx.Commit() == nil
 }
 func (m *Manager) jobLock(id string) *sync.Mutex {
 	return lockFor(&m.jobLocks, id)
