@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,8 +171,8 @@ func TestTelegramNetworkLabel(t *testing.T) {
 		latency time.Duration
 		want    string
 	}{
-		{"ok", 12 * time.Millisecond, "连接正常（12ms）"},
-		{"failed", 10 * time.Second, "连接失败"},
+		{telegramNetworkConnected, 12 * time.Millisecond, "连接正常（12ms）"},
+		{telegramNetworkDisconnected, 10 * time.Second, "连接失败"},
 		{"", 0, "检测中"},
 	}
 	seen := make(map[string]string, len(cases))
@@ -205,7 +207,7 @@ func TestTelegramProbeRecordsBothOutcomes(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); service.runTelegramProbe(ctx, server.URL, 10*time.Millisecond) }()
 
-	if !waitForProbe(t, service, "ok") {
+	if !waitForProbe(t, service, telegramNetworkConnected) {
 		cancel()
 		<-done
 		t.Fatalf("a probe against a reachable server did not record success: %s", service.statusText())
@@ -213,7 +215,7 @@ func TestTelegramProbeRecordsBothOutcomes(t *testing.T) {
 
 	// The same probe, with the far end gone. Nothing about the service changes.
 	server.Close()
-	if !waitForProbe(t, service, "failed") {
+	if !waitForProbe(t, service, telegramNetworkDisconnected) {
 		cancel()
 		<-done
 		t.Fatalf("a probe against an unreachable server did not record failure")
@@ -242,6 +244,103 @@ func TestStatusTextReadsTheProbeResult(t *testing.T) {
 
 	if got := service.statusText(); !strings.Contains(got, "Telegram网络：连接正常（34ms）") {
 		t.Fatalf("the card does not carry the probe result:\n%s", got)
+	}
+}
+
+// The Web sidebar renders this state in its own words, so what it reads has to
+// be a state and not a sentence: one probe answers both surfaces, and the
+// vocabulary is the one the sidebar already uses for a connection.
+func TestTelegramNetworkExposesTheStateForTheSidebar(t *testing.T) {
+	service := &Service{}
+	if got := service.TelegramNetwork(); got != "" {
+		t.Fatalf("an unsampled probe reported %q, want an empty state", got)
+	}
+	service.networkProbe.record(true, time.Millisecond)
+	if got := service.TelegramNetwork(); got != telegramNetworkConnected {
+		t.Fatalf("a reachable network reported %q, want %q", got, telegramNetworkConnected)
+	}
+	service.networkProbe.record(false, time.Second)
+	if got := service.TelegramNetwork(); got != telegramNetworkDisconnected {
+		t.Fatalf("an unreachable network reported %q, want %q", got, telegramNetworkDisconnected)
+	}
+}
+
+// A proxy that accepts the connection and never answers the handshake is what a
+// stalled proxy looks like from here.
+//
+// The transport does not bound this dial: it detaches the context from the
+// request and gives it no deadline, deliberately, so a slow dial can still be
+// reused by the next request. Nothing upstream then ever gives up, and the
+// socket and its goroutine live until TCP does - one per attempt, from a proxy
+// that flaps. The bound has to come from the client, and this is the test that
+// says it is still there.
+func TestStalledProxyDialIsAbandoned(t *testing.T) {
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = blocker.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		for {
+			conn, err := blocker.Accept()
+			if err != nil {
+				return
+			}
+			// Accepted, never answered: the handshake the client waits for
+			// never comes.
+			select {
+			case accepted <- conn:
+			default:
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	store, err := settings.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open settings: %v", err)
+	}
+	values := settings.Defaults()
+	values.ProxyURL = "socks5://" + blocker.Addr().String()
+	if err := store.Update(values); err != nil {
+		t.Fatalf("set proxy: %v", err)
+	}
+	client := (&Service{settings: store, dialTimeout: 300 * time.Millisecond}).httpClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.telegram.org/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	response, err := client.Do(request)
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("a request through a proxy that never answers succeeded")
+	}
+
+	select {
+	case conn := <-accepted:
+		defer func() { _ = conn.Close() }()
+		// The connection has to be released, and the dial's own bound outlives
+		// the request's deadline, so waiting past it is the check.
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		// The client opens with its SOCKS5 greeting, so the first read is data
+		// rather than the end. Reading until the error is the point: an end of
+		// file means the client gave up and closed, a timeout means it never did.
+		buffer := make([]byte, 64)
+		var readErr error
+		for readErr == nil {
+			_, readErr = conn.Read(buffer)
+		}
+		if errors.Is(readErr, os.ErrDeadlineExceeded) {
+			t.Fatal("the dial was never abandoned: the stalled connection is still held")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the proxy was never dialed")
 	}
 }
 

@@ -742,7 +742,7 @@ const statusCheckInterval = 2 * time.Second
 // telling either end.
 const statusKeepAliveInterval = 20 * time.Second
 
-// connectionStatus is the pair of connection states the Web sidebar shows.
+// connectionStatus is the connection states the Web sidebar shows.
 //
 // Every field is a plain string, which is what lets the stream below compare
 // two of these directly: the comparison is the change detector, and "nothing
@@ -751,7 +751,16 @@ const statusKeepAliveInterval = 20 * time.Second
 // whether or not the state moved, so including it would turn every check into a
 // change and every change into a message. The page renders the state, and the
 // state is what it is sent.
+//
+// The Telegram network state is the Bot service's, not the account manager's.
+// The Bot owns the proxy-aware client that already talks to Telegram and probes
+// with it on a timer; asking the same question a second way, so that the
+// sidebar could answer it by itself, would be a second set of requests through
+// the same metered proxy for the same answer.
 type connectionStatus struct {
+	TelegramNetwork struct {
+		Status string `json:"status"`
+	} `json:"telegramNetwork"`
 	Telegram struct {
 		Status string `json:"status"`
 	} `json:"telegram"`
@@ -763,6 +772,7 @@ type connectionStatus struct {
 
 func (s *Server) connectionStatus() connectionStatus {
 	var status connectionStatus
+	status.TelegramNetwork.Status = s.bot.TelegramNetwork()
 	status.Telegram.Status = s.telegram.Status()
 	health := s.downloads.DatabaseHealth()
 	status.Database.Status = health.Status

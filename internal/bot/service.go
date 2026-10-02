@@ -87,6 +87,10 @@ type Service struct {
 	// networkProbe is the last observed reachability of Telegram, kept by its
 	// own background loop and only read by /status.
 	networkProbe telegramProbe
+	// dialTimeout bounds one dial through the proxy; zero means
+	// telegramDialTimeout. It is settable so a test can watch the bound being
+	// enforced without waiting out the real one.
+	dialTimeout time.Duration
 	// dispatch hands commands to workers and tracks which of them the stored
 	// offset may move past. See updateDispatch.
 	dispatch *updateDispatch
@@ -192,24 +196,63 @@ const (
 	// conversation's commands, so an unbounded retry there did not merely fail
 	// to make progress: it blocked every later acknowledge behind it.
 	cursorSaveAttempts = 5
-	// telegramProbeInterval is how often the path to Telegram is re-asked. It is
-	// short enough to catch a proxy that just went away and long enough not to
-	// add load to one that is struggling.
-	telegramProbeInterval = 30 * time.Second
+	// telegramProbeInterval is how often the path to Telegram is re-asked, and
+	// it is a traffic budget as much as a cadence: every probe is bytes through
+	// a proxy that may be metered, so the interval is set as long as the answer
+	// can afford to be stale. Two minutes still turns a proxy that went away
+	// into a "未连接" on the next look, without paying for that look every
+	// thirty seconds forever - which at this probe's measured cost is about
+	// 29 MB a month against about 7.
+	telegramProbeInterval = 2 * time.Minute
 	// telegramProbeTimeout bounds one probe. The probe runs in the background,
 	// so this only decides how quickly the status card stops claiming a
 	// connection that is not there.
 	telegramProbeTimeout = 10 * time.Second
+	// telegramDialTimeout bounds one dial through the proxy.
+	//
+	// The transport does not bound it. It hands the dial a context detached from
+	// the request and carrying no deadline - deliberately, so that a dial can
+	// finish and be reused by the next request - which leaves a proxy that
+	// accepts the connection and then never answers the handshake holding the
+	// socket and its goroutine until TCP gives up on its own. A dial that has
+	// not completed in this long will not serve the request that asked for it,
+	// and abandoning it is what closes the socket.
+	telegramDialTimeout = 15 * time.Second
+	// telegramIdleConnTimeout is how long an idle connection to Telegram is kept
+	// for the next probe to reuse.
+	//
+	// It has to exceed the probe interval. At the transport's default of 90
+	// seconds every probe two minutes apart pays for a fresh TCP and TLS
+	// handshake - some kilobytes instead of a few hundred bytes - which would
+	// make the longer interval save far less traffic than it should.
+	telegramIdleConnTimeout = 5 * time.Minute
 )
 
-// telegramProbeURL is what the probe asks for. It is the Bot API root, which
-// answers without credentials - the reply is not read, because reaching it at
-// all is the whole answer: a completed TLS session with api.telegram.org over
+// telegramProbeURL is what the probe asks for.
+//
+// It is a URL on api.telegram.org that needs no credentials, because reaching
+// it at all is the whole answer: a completed TLS session with that host over
 // the configured proxy means the path carried a handshake, a certificate and a
-// round trip, which is exactly what "the network works" means here. A captive
-// portal or an intercepting proxy fails that handshake rather than answering
-// for Telegram.
-const telegramProbeURL = "https://api.telegram.org/"
+// round trip, which is what "the network works" means here. A captive portal or
+// an intercepting proxy fails that handshake instead of answering for Telegram.
+//
+// Which URL it is decides how much of the user's proxy traffic this costs, and
+// the difference is not small. Measured against the live API, a reused
+// connection to the API root carried 8.2 KB - the root answers 200 with a
+// 25 KB help page - while this one carries 335 bytes. At one probe every two
+// minutes that is about 7 MB a month instead of about 180, for an answer that
+// is the same either way: any HTTP response means the path works, so even a
+// 404 would still be a yes.
+const telegramProbeURL = "https://api.telegram.org/robots.txt"
+
+// telegramProbeBodyLimit is how much of the reply is read before it is
+// discarded.
+//
+// It is generous on purpose, and the size matters more than it looks: a body
+// that is not read to the end leaves the connection unusable for the next
+// probe, which then pays for a fresh handshake - some 26 KB, against the 335
+// bytes this whole exchange otherwise costs.
+const telegramProbeBodyLimit = 64 << 10
 
 // telegramProbe holds the last answer to "can this process reach Telegram right
 // now", asked through the same proxy everything else uses.
@@ -222,17 +265,26 @@ const telegramProbeURL = "https://api.telegram.org/"
 // Bot's own channel: a Bot that cannot answer is a Bot that cannot answer.
 type telegramProbe struct {
 	mu      sync.Mutex
-	status  string // "ok" or "failed"; empty until the first sample
+	status  string // "connected", "not_connected", or empty until the first sample
 	latency time.Duration
 }
 
-func (p *telegramProbe) record(ok bool, latency time.Duration) {
+// telegramNetworkConnected and telegramNetworkDisconnected are the states the
+// probe reports, and they are the connection vocabulary the Web sidebar already
+// speaks for Telegram itself - so one unreachable network is not described in
+// two ways by two surfaces reading the same fact.
+const (
+	telegramNetworkConnected    = "connected"
+	telegramNetworkDisconnected = "not_connected"
+)
+
+func (p *telegramProbe) record(connected bool, latency time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if ok {
-		p.status = "ok"
+	if connected {
+		p.status = telegramNetworkConnected
 	} else {
-		p.status = "failed"
+		p.status = telegramNetworkDisconnected
 	}
 	p.latency = latency
 }
@@ -269,6 +321,15 @@ func (s *Service) probeTelegramNetwork(ctx context.Context) {
 	s.runTelegramProbe(ctx, telegramProbeURL, telegramProbeInterval)
 }
 
+// TelegramNetwork reports whether this process can reach Telegram through the
+// configured proxy: "connected", "not_connected", or empty before the first
+// sample. It is the same state the Bot's /status renders, exposed so the Web
+// sidebar does not have to ask Telegram a second time to say the same thing.
+func (s *Service) TelegramNetwork() string {
+	status, _ := s.networkProbe.snapshot()
+	return status
+}
+
 func (s *Service) runTelegramProbe(ctx context.Context, url string, interval time.Duration) {
 	probe := func() {
 		start := time.Now()
@@ -281,9 +342,16 @@ func (s *Service) runTelegramProbe(ctx context.Context, url string, interval tim
 			if response != nil {
 				// The body carries nothing this needs, but it has to be drained
 				// and closed for the connection to be reusable at all.
-				_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+				_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, telegramProbeBodyLimit))
 				_ = response.Body.Close()
 			}
+		}
+		// A shutdown is not a network failure. Cancelling this context turns the
+		// in-flight probe into a request error, and recording it would print
+		// "not_connected" on the way out of every clean stop - the one line
+		// that would then be in the log of every restart.
+		if ctx.Err() != nil {
+			return
 		}
 		previous, _ := s.networkProbe.snapshot()
 		s.networkProbe.record(err == nil, time.Since(start))
@@ -2802,9 +2870,9 @@ func (s *Service) statusText() string {
 // is what a person watching an unstable proxy is actually trying to see.
 func telegramNetworkLabel(status string, latency time.Duration) string {
 	switch status {
-	case "ok":
+	case telegramNetworkConnected:
 		return fmt.Sprintf("连接正常（%dms）", latency.Milliseconds())
-	case "failed":
+	case telegramNetworkDisconnected:
 		return "连接失败"
 	default:
 		return "检测中"
@@ -3066,6 +3134,9 @@ func (s *Service) httpClient() *http.Client {
 		}
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Held longer than the gap between probes, so the probe reuses the
+	// connection it opened last time instead of paying for the handshake again.
+	transport.IdleConnTimeout = telegramIdleConnTimeout
 	client := &http.Client{Transport: transport}
 	s.clientProxy = raw
 	s.client = client
@@ -3088,7 +3159,24 @@ func (s *Service) httpClient() *http.Client {
 		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
 		if err == nil {
 			transport.Proxy = nil
-			transport.DialContext = func(_ context.Context, network, address string) (net.Conn, error) {
+			dialTimeout := s.dialTimeout
+			if dialTimeout <= 0 {
+				dialTimeout = telegramDialTimeout
+			}
+			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				// The bound is put on here because nothing upstream supplies
+				// one: the transport detaches this context from the request and
+				// gives it no deadline, on purpose, so that a slow dial can
+				// still be reused by a later request. Without this, a proxy that
+				// accepts the connection and never answers the handshake holds
+				// the socket and its goroutine until TCP times out on its own,
+				// which a proxy flapping every few minutes turns into a steady
+				// leak of both.
+				ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+				defer cancel()
+				if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+					return contextDialer.DialContext(ctx, network, address)
+				}
 				return dialer.Dial(network, address)
 			}
 		}

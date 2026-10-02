@@ -440,3 +440,36 @@ func TestStatusStreamEndsWhenTheSessionIsCleared(t *testing.T) {
 		t.Fatal("the status stream outlived the session it was authorized with")
 	}
 }
+
+// The sidebar's network line is the probe's own state, not a second
+// measurement of it. The Web must be able to render it from the stream alone,
+// which means the field has to be on the wire from the first frame - and it has
+// to be the same answer the Bot's /status gives, since both read one probe and
+// the proxy pays for one set of requests.
+func TestStatusStreamCarriesTheTelegramNetworkState(t *testing.T) {
+	server, client, baseURL := sseTestServer(t)
+	response, err := client.Get(baseURL + "/api/status/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	reader := bufio.NewReader(response.Body)
+	first, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("the stream produced no first frame: %v", err)
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(first), "data:"))
+	var status connectionStatus
+	if err := json.Unmarshal([]byte(payload), &status); err != nil {
+		t.Fatalf("the first frame is not a status document: %v\n%s", err, payload)
+	}
+	if !strings.Contains(payload, `"telegramNetwork"`) {
+		// An absent field and an empty one mean different things to the page:
+		// the first leaves the line blank forever, the second renders 检测中.
+		t.Fatalf("the frame does not carry the network state:\n%s", payload)
+	}
+	if status.TelegramNetwork.Status != server.bot.TelegramNetwork() {
+		t.Fatalf("the frame reports network %q while the probe holds %q", status.TelegramNetwork.Status, server.bot.TelegramNetwork())
+	}
+}

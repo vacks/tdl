@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '@/api'
 import { projectVersion } from '@/buildInfo'
 
-type ConnectionStatus = { telegram?: { status?: string }; database?: { status?: string; error?: string } }
+type ConnectionStatus = { telegramNetwork?: { status?: string }; telegram?: { status?: string }; database?: { status?: string; error?: string } }
 
 const status = ref<ConnectionStatus>()
 let stream: EventSource | undefined
@@ -44,8 +44,17 @@ onBeforeUnmount(() => {
   stream = undefined
 })
 
+// The network line answers a different question from the account line below it:
+// whether this host can reach Telegram at all. An account keeps saying it is
+// authorized while the link is dead, so the two are reported apart - and the
+// network state is measured through the configured proxy, so it fails when the
+// proxy does, not only when the internet does.
+const network = computed(() => status.value?.telegramNetwork?.status || '')
 const telegram = computed(() => status.value?.telegram?.status || '')
 const database = computed(() => status.value?.database?.status || '')
+const networkText = computed(() => network.value === 'connected' ? '已连接' : network.value ? '未连接' : '检测中')
+const networkHint = computed(() => network.value === 'connected' ? '当前服务可访问 Telegram 服务器' : network.value ? '无法通过当前代理访问 Telegram，请检查网络与代理设置' : '正在读取状态')
+const networkTone = computed(() => network.value === 'connected' ? 'is-ok' : network.value ? 'is-bad' : 'is-idle')
 const telegramText = computed(() => telegram.value === 'connected' ? '已连接' : telegram.value === 'not_connected' ? '尚未登录' : '检测中')
 const telegramHint = computed(() => telegram.value === 'connected' ? '当前服务可访问 Telegram' : telegram.value === 'not_connected' ? '请先到登录管理页添加并登录账户' : '正在读取状态')
 const databaseText = computed(() => database.value === 'connected' ? '已连接' : database.value ? '连接异常' : '检测中')
@@ -60,6 +69,7 @@ const databaseTone = computed(() => database.value === 'connected' ? 'is-ok' : d
 <template>
   <div class="sidebar-status">
     <p class="sidebar-status-title">服务状态</p>
+    <div class="status-item" :class="networkTone" :title="networkHint"><i class="status-dot"></i><span class="status-label">Telegram 网络</span><span class="status-value">{{ networkText }}</span></div>
     <div class="status-item" :class="telegramTone" :title="telegramHint"><i class="status-dot"></i><span class="status-label">Telegram 账户</span><span class="status-value">{{ telegramText }}</span></div>
     <div class="status-item" :class="databaseTone" :title="databaseHint"><i class="status-dot"></i><span class="status-label">数据库</span><span class="status-value">{{ databaseText }}</span></div>
     <p class="sidebar-version"><span>TDL 版本</span><b>{{ projectVersion }}</b></p>
