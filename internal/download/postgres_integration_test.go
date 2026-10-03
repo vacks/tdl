@@ -614,7 +614,7 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, final_path, status, discovered_at) VALUES ('reconcile-chat','channel:reconcile',7,'published.bin',?,'downloaded',?)`, path, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.reconcileChatPublishedItems(nil); err != nil {
+	if _, err := m.reconcileChatPublishedItems(nil, chatPublishedCursor{}); err != nil {
 		t.Fatal(err)
 	}
 	var itemStatus, mediaStatus, finalPath string
@@ -623,6 +623,83 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	}
 	if err := db.QueryRow(`SELECT status, final_path FROM downloaded_media WHERE dialog_key = 'channel:reconcile' AND message_id = 7`).Scan(&mediaStatus, &finalPath); err != nil || mediaStatus != "completed" || finalPath != path {
 		t.Fatalf("global media=%q/%q err=%v, want completed/%q", mediaStatus, finalPath, err, path)
+	}
+}
+
+// The sweep that repairs a crash mid-publish is bounded, and it resumes where
+// the last pass stopped.
+//
+// Its set is normally empty, so reading all of it costs nothing - but an outage
+// that leaves a backlog in it turns every three-second tick into a full read
+// with a file test per row, and a row whose file is gone can never leave the
+// set, so an unbounded pass would re-read that row from the top for ever and
+// never reach what is behind it. The rows here are arranged so that an
+// unbounded pass is visible: the first page cannot be published, and the rows
+// that can be are behind it.
+func TestPostgresChatPublishedSweepIsBoundedAndResumes(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('bounded-chat','tg://chat','channel','channel:bounded',1,'test','account','downloading','completed','{}',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// A full page of rows that cannot be published: their files are not on disk.
+	missing := t.TempDir() + "/gone.bin"
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, final_path, status, discovered_at)
+SELECT 'bounded-chat', 'channel:bounded', g, 'gone.bin', ?, 'downloaded', ? FROM generate_series(1, ?) g`, missing, now, reconcileBatchSize); err != nil {
+		t.Fatal(err)
+	}
+	// Behind them, two rows that can be, at the highest message ids so that only
+	// a pass which ignores the page bound ever reaches them.
+	published := t.TempDir() + "/published.bin"
+	if err := os.WriteFile(published, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, original_name, final_path, status, discovered_at) VALUES ('bounded-chat','channel:bounded',?, 'published.bin', ?, 'downloaded', ?), ('bounded-chat','channel:bounded',?, 'published.bin', ?, 'downloaded', ?)`, reconcileBatchSize+1, published, now, reconcileBatchSize+2, published, now); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor, err := m.reconcileChatPublishedItems(nil, chatPublishedCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completed int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = 'bounded-chat' AND status = 'completed'`).Scan(&completed); err != nil {
+		t.Fatal(err)
+	}
+	if completed != 0 {
+		t.Fatalf("one pass published %d files, want 0: the pass is meant to read one page, and both publishable rows are behind it", completed)
+	}
+	if cursor.messageID != reconcileBatchSize {
+		t.Fatalf("the pass resumed at message %d, want %d (the last row it read)", cursor.messageID, reconcileBatchSize)
+	}
+
+	next, err := m.reconcileChatPublishedItems(nil, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = 'bounded-chat' AND status = 'completed'`).Scan(&completed); err != nil {
+		t.Fatal(err)
+	}
+	if completed != 2 {
+		t.Fatalf("the second pass published %d files, want the 2 behind the first page", completed)
+	}
+	if next != (chatPublishedCursor{}) {
+		t.Fatalf("the sweep resumed at %#v after a short page, want the start of the set", next)
 	}
 }
 

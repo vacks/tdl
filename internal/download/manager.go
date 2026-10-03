@@ -437,7 +437,7 @@ func Open(dataDir, downloadDir, databaseURL string, store *settings.Store, accou
 		_ = db.Close()
 		return nil, fmt.Errorf("recover message tasks: %w", err)
 	}
-	if err := m.reconcileChatPublishedItems(nil); err != nil {
+	if _, err := m.reconcileChatPublishedItems(nil, chatPublishedCursor{}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("reconcile published chat files: %w", err)
 	}
@@ -568,7 +568,7 @@ func (m *Manager) recoverAfterDatabaseOutage() error {
 	if err := m.reconcilePublishedItems(); err != nil {
 		return err
 	}
-	if err := m.reconcileChatPublishedItems(nil); err != nil {
+	if _, err := m.reconcileChatPublishedItems(nil, chatPublishedCursor{}); err != nil {
 		return err
 	}
 	if err := m.recoverInterruptedMessageTasks("数据库连接恢复，任务等待继续"); err != nil {

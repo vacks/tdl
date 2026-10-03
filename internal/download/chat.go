@@ -701,6 +701,7 @@ func adoptMessageTaskFiles(q querier, adopted map[mediaClaimKey]string, now stri
 func (m *Manager) chatWorker() {
 	// The waiting-item rotation is owned by this single goroutine.
 	var claimCursor chatClaimCursor
+	var publishedCursor chatPublishedCursor
 	for {
 		if !m.DatabaseAvailable() {
 			select {
@@ -716,8 +717,10 @@ func (m *Manager) chatWorker() {
 		// database state update. Reconcile on the regular worker cadence, not
 		// only during restart/database recovery, so such a row cannot leave its
 		// session task permanently in "下载中".
-		if err := m.reconcileChatPublishedItems(nil); err != nil {
+		if next, err := m.reconcileChatPublishedItems(nil, publishedCursor); err != nil {
 			applog.Error("chat_download", "published_file_reconcile_failed", "error", err.Error())
+		} else {
+			publishedCursor = next
 		}
 		claimCursor = m.reconcileChatClaims(claimCursor)
 		m.refreshChatStates()
@@ -1298,7 +1301,9 @@ func (m *Manager) runOneChatBatch() (more bool, err error) {
 	if settleErr != nil {
 		return false, fmt.Errorf("记录文件下载结果: %w", settleErr)
 	}
-	if reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch)); reconcileErr != nil {
+	// The scope names the rows this batch could have left mid-publish, so the
+	// pass is already bounded by the batch and the cursor does not apply.
+	if _, reconcileErr := m.reconcileChatPublishedItems(batchKeys(id, batch), chatPublishedCursor{}); reconcileErr != nil {
 		return false, fmt.Errorf("核对已移动文件: %w", reconcileErr)
 	}
 	if requeued {
@@ -1510,16 +1515,6 @@ func (m *Manager) setChatItem(chatID string, item source, status, path, message 
 	return m.setItemState(chatItems, chatID, item, status, path, message)
 }
 
-// reconcileChatPublishedItems closes the crash window after a final file move
-// but before the media index and global ownership record were committed.
-//
-// scope, when non-nil, limits the pass to the media a caller already knows it
-// may have left mid-publish. Every batch used to run the unrestricted query, so
-// finishing one batch of sixty-four files scanned the global set of
-// published-but-unrecorded rows on a table holding one row per indexed message
-// - work proportional to the whole index rather than to the batch that had just
-// run. The nil scope keeps the periodic and startup passes, which are the ones
-// that must be able to find a row no caller knows about.
 // chatItemIndexed reports whether a session task has already been told about
 // the media at this identity. It is a primary key probe, so it costs one index
 // lookup and saves a Telegram round trip.
@@ -1548,7 +1543,32 @@ func batchKeys(chatID string, batch []source) map[mediaKey]struct{} {
 	return keys
 }
 
-func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error {
+// chatPublishedCursor is where the bounded published-file sweep resumes: the
+// last (chat_job_id, message_id) it read. Both empty means "from the start",
+// which is also where a pass that reached the end of the set leaves it.
+type chatPublishedCursor struct {
+	chatJobID string
+	messageID int
+}
+
+// reconcileChatPublishedItems closes the crash window after a final file move
+// but before the media index and global ownership record were committed.
+//
+// scope, when non-nil, limits the pass to the media a caller already knows it
+// may have left mid-publish, and then cursor is unused and returned unchanged.
+// Every batch used to run the unrestricted query, so finishing one batch of
+// sixty-four files scanned the global set of published-but-unrecorded rows on a
+// table holding one row per indexed message - work proportional to the whole
+// index rather than to the batch that had just run. The nil scope keeps the
+// periodic and startup passes, which are the ones that must be able to find a
+// row no caller knows about - and those are the passes that need the cursor:
+// their set is normally empty, but a database outage can leave a large backlog
+// in it, and the sweep runs on a three-second tick. Without a bound that
+// backlog is read in full every tick, with a file test and a transaction per
+// row, and a row that can never be published - its file is gone - stays in the
+// set, so every later pass re-reads it from the top and never reaches what is
+// behind it.
+func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}, cursor chatPublishedCursor) (chatPublishedCursor, error) {
 	query := `SELECT chat_job_id, dialog_key, message_id, final_path FROM chat_download_items WHERE status = 'downloaded' AND final_path <> ''`
 	args := []any{}
 	if len(scope) > 0 {
@@ -1558,10 +1578,15 @@ func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error
 		}
 		query += ` AND (chat_job_id, dialog_key, message_id) IN (` + strings.TrimSuffix(strings.Repeat("(?,?,?),", len(scope)), ",") + `)`
 		args = keys
+	} else {
+		// Paged by the key the downloaded-rows index is built on, so the pass
+		// resumes where the last one stopped instead of starting over.
+		query += ` AND (chat_job_id, message_id) > (?, ?) ORDER BY chat_job_id, message_id LIMIT ?`
+		args = append(args, cursor.chatJobID, cursor.messageID, reconcileBatchSize)
 	}
 	rows, err := m.db.Query(query, args...)
 	if err != nil {
-		return err
+		return cursor, err
 	}
 	defer rows.Close()
 	type candidate struct {
@@ -1571,17 +1596,27 @@ func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error
 		path      string
 	}
 	items := make([]candidate, 0)
+	scanned := 0
+	next := cursor
 	for rows.Next() {
 		var item candidate
 		if err := rows.Scan(&item.chatID, &item.dialogKey, &item.messageID, &item.path); err != nil {
-			return err
+			return cursor, err
 		}
+		scanned++
+		next = chatPublishedCursor{chatJobID: item.chatID, messageID: item.messageID}
 		if regularFileExists(item.path) {
 			items = append(items, item)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return cursor, err
+	}
+	// A short page means this rotation reached the end of the set, so the next
+	// pass starts over. Decided before any publish, because a pass that returns
+	// early on a publish error has still read these rows.
+	if len(scope) == 0 && scanned < reconcileBatchSize {
+		next = chatPublishedCursor{}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, item := range items {
@@ -1594,7 +1629,7 @@ func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error
 		tx, err := m.db.Begin()
 		if err != nil {
 			lock.Unlock()
-			return err
+			return next, err
 		}
 		_, err = tx.Exec(`UPDATE chat_download_items SET status = 'completed', error = '', finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END WHERE chat_job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'downloaded'`, now, item.chatID, item.dialogKey, item.messageID)
 		if err == nil {
@@ -1603,15 +1638,15 @@ func (m *Manager) reconcileChatPublishedItems(scope map[mediaKey]struct{}) error
 		if err != nil {
 			_ = tx.Rollback()
 			lock.Unlock()
-			return err
+			return next, err
 		}
 		if err := tx.Commit(); err != nil {
 			lock.Unlock()
-			return err
+			return next, err
 		}
 		lock.Unlock()
 	}
-	return nil
+	return next, nil
 }
 
 func (m *Manager) publishChatItem(chatID, path string, item source, config settings.Values) error {
