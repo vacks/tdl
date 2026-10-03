@@ -43,7 +43,7 @@ services:
     restart: unless-stopped
 
   app:
-    image: ghcr.io/vacks/tdl:1.11.40
+    image: ghcr.io/vacks/tdl:1.11.41
     ports:
       - "127.0.0.1:8080:8080"
     environment:

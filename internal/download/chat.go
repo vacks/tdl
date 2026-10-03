@@ -49,6 +49,18 @@ type ChatJob struct {
 	EarliestMediaID int     `json:"earliestMediaId"`
 	ActiveFiles     int     `json:"activeFiles"`
 	SpeedBPS        float64 `json:"speedBps"`
+	// Failures is the newest few failed files, and only the single-task read
+	// fills it. A list read does not: one row shows a count, and a session task
+	// can fail hundreds of thousands of files, so carrying them per row would
+	// put the whole failure history of a page of tasks into one response.
+	Failures []ChatFailure `json:"failures,omitempty"`
+}
+
+// ChatFailure is one file a session task could not download - which file, and
+// why it stopped - in exactly the two parts a task card prints.
+type ChatFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
 }
 
 const savedSourcePrefix = "tg://saved/"
@@ -272,7 +284,51 @@ func (m *Manager) GetChat(id string) (ChatJob, error) {
 	}
 	job.ListenNew = listen != 0
 	job.ActiveFiles, job.SpeedBPS = m.progress.Aggregate(job.ID)
+	// Guarded by the count so the common task - nothing has failed - pays
+	// nothing, and a task that has failures pays one indexed read of at most
+	// three tuples.
+	if job.Failed > 0 {
+		failures, err := m.recentChatFailures(job.ID, chatFailureWindow)
+		if err != nil {
+			return ChatJob{}, err
+		}
+		job.Failures = failures
+	}
 	return job, nil
+}
+
+// chatFailureWindow is how many failed files a task detail carries. A card is
+// a fixed-size message, and the point of showing any of them is to name the
+// thing that went wrong rather than to enumerate it - enumerating it is what
+// the retry button is for.
+const chatFailureWindow = 3
+
+// recentChatFailures returns a task's newest failed files, newest message
+// first, with the reason each one stopped.
+//
+// The order is message order, not completion order, because that is the only
+// order an index can answer for one task. The work index leads with
+// (chat_job_id, status) and carries message_id, so ordering by message is a
+// backward scan that stops after three tuples. Ordering by finished_at has no
+// per-task index to ride: the only index that ends in it is global over every
+// task's failures, so a task whose failures happen to be the oldest would walk
+// every other task's first. On five million rows that was 2.25 million tuples
+// removed by filter and about a second, against four buffers for this.
+func (m *Manager) recentChatFailures(jobID string, limit int) ([]ChatFailure, error) {
+	rows, err := m.db.Query(`SELECT original_name, error FROM chat_download_items WHERE chat_job_id = ? AND status = 'failed' ORDER BY message_id DESC LIMIT ?`, jobID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	failures := make([]ChatFailure, 0, limit)
+	for rows.Next() {
+		var failure ChatFailure
+		if err := rows.Scan(&failure.Name, &failure.Error); err != nil {
+			return nil, err
+		}
+		failures = append(failures, failure)
+	}
+	return failures, rows.Err()
 }
 
 // FindSavedListener returns the account's saved task when it is the one

@@ -26,17 +26,37 @@ func openChatItemTestManager(t *testing.T, jobID, status string, items []chatTes
 	if err := clearPostgresDownloadTestData(db); err != nil {
 		t.Fatal(err)
 	}
+	insertChatJob(t, db, jobID, status)
+	insertChatItems(t, db, jobID, items)
+	return m
+}
+
+// insertChatJob and insertChatItems are split out because a test that checks
+// what one task's detail does NOT contain needs a second task to hold the
+// decoy rows. Both tasks keep the same dialog key: the file table is keyed by
+// (chat_job_id, dialog_key, message_id), so two tasks over one dialog are
+// exactly the shape that has to be told apart.
+func insertChatJob(t *testing.T, db *database, jobID, status string) {
+	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, start_message_id, upper_message_id, created_at, updated_at) VALUES (?, 'tg://x','channel','channel:items',1,'test','account',?,'completed','{}',0,1000,?,?)`, jobID, status, now, now); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func insertChatItems(t *testing.T, db *database, jobID string, items []chatTestItem) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, item := range items {
-		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, dialog_id, message_id, original_name, status, attempts, elapsed_ms, started_at, discovered_at) VALUES (?, 'channel:items', 1, ?, 'f.bin', ?, ?, ?, ?, ?)`,
-			jobID, item.messageID, item.status, item.attempts, item.elapsedMs, item.startedAt, now); err != nil {
+		name := item.name
+		if name == "" {
+			name = "f.bin"
+		}
+		if _, err := db.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, dialog_id, message_id, original_name, status, error, attempts, elapsed_ms, started_at, discovered_at) VALUES (?, 'channel:items', 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			jobID, item.messageID, name, item.status, item.err, item.attempts, item.elapsedMs, item.startedAt, now); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return m
 }
 
 type chatTestItem struct {
@@ -45,6 +65,10 @@ type chatTestItem struct {
 	attempts  int
 	elapsedMs int
 	startedAt string
+	// name and err are optional: a test that does not care about a failure's
+	// wording keeps the placeholder name and the empty reason.
+	name string
+	err  string
 }
 
 // Completion writes the item's terminal state and the global ownership record

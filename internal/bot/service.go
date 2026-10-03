@@ -2349,6 +2349,16 @@ func chatTaskText(job download.ChatJob) string {
 	} else {
 		lines = append(lines, "<b>速率：</b>—（0 个文件）")
 	}
+	// The 失败 line above is a count, and a count is not something anyone can
+	// act on: it says files are stuck without saying which ones or why. The few
+	// newest reasons go under the rate, so a task that has nothing stuck reads
+	// exactly as it did before.
+	if len(job.Failures) > 0 {
+		lines = append(lines, "⚠️<b>失败信息：</b>")
+		for _, failure := range job.Failures {
+			lines = append(lines, fmt.Sprintf("%s：%s", html.EscapeString(short(failure.Name, chatFailureNameWidth)), html.EscapeString(short(chatFailureReason(failure), chatFailureErrorWidth))))
+		}
+	}
 	if job.ListenNew {
 		lines = append(lines, "<b>消息监听：</b>已开启")
 	}
@@ -2356,6 +2366,26 @@ func chatTaskText(job download.ChatJob) string {
 		lines = append(lines, "<b>说明：</b>"+html.EscapeString(short(job.Error, 100)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// A failure line is bounded so three of them cannot crowd the rest of the card
+// out of the message. The name gets more room than a dialog name, because it is
+// what tells two failures apart; the reason shares the 说明 line's budget, which
+// is the other place a server's own words are shown.
+const (
+	chatFailureNameWidth  = 48
+	chatFailureErrorWidth = 100
+)
+
+// chatFailureReason is the reason a failed file shows. A settled failure
+// always carries one, because it is written together with the status; the card
+// still refuses to print an empty half of a line, with the same phrase the Web
+// task list falls back to.
+func chatFailureReason(failure download.ChatFailure) string {
+	if failure.Error == "" {
+		return "下载失败"
+	}
+	return failure.Error
 }
 
 // chatRangeLabel mirrors the Web range display. Before the scanner discovers

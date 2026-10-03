@@ -71,6 +71,59 @@ func TestChatTaskPresentationMirrorsWebRangeRules(t *testing.T) {
 	}
 }
 
+// A count of failures tells a person that files are stuck without telling them
+// what to do about it, so the card names the newest few and why each stopped.
+func TestChatTaskTextNamesTheNewestFailuresUnderTheRate(t *testing.T) {
+	if text := chatTaskText(download.ChatJob{Status: "downloading", Completed: 1, Discovered: 1}); strings.Contains(text, "失败信息") {
+		t.Fatalf("a task with nothing stuck must not grow a failure section:\n%s", text)
+	}
+	text := chatTaskText(download.ChatJob{Status: "listening", Completed: 1, Discovered: 5, Failed: 3, Failures: []download.ChatFailure{
+		{Name: "第一集.mkv", Error: "文件引用已过期"},
+		{Name: "第二集.mkv", Error: "telegram: file reference expired"},
+		// A failure settled without a reason must not print an empty half of a
+		// line; the Web task list stands in with the same phrase.
+		{Name: "第三集.mkv"},
+	}})
+	rate := strings.Index(text, "速率：</b>")
+	header := strings.Index(text, "⚠️<b>失败信息：</b>")
+	if rate < 0 || header < 0 {
+		t.Fatalf("the card must carry both a rate and a failure section:\n%s", text)
+	}
+	if header < rate {
+		t.Fatalf("the failure section belongs under the rate:\n%s", text)
+	}
+	// The order is the order the store handed over - newest message first - and
+	// the card must not reorder it.
+	previous := header
+	for _, line := range []string{"第一集.mkv：文件引用已过期", "第二集.mkv：telegram: file reference expired", "第三集.mkv：下载失败"} {
+		at := strings.Index(text, line)
+		if at < 0 {
+			t.Fatalf("chatTaskText() missing %q:\n%s", line, text)
+		}
+		if at < previous {
+			t.Fatalf("chatTaskText() reordered the failures at %q:\n%s", line, text)
+		}
+		previous = at
+	}
+}
+
+// File names and reasons come from Telegram and from error strings, and the
+// card is HTML: neither may be able to close a tag or run past the card.
+func TestChatTaskTextEscapesAndBoundsFailureLines(t *testing.T) {
+	text := chatTaskText(download.ChatJob{Status: "listening", Failed: 1, Failures: []download.ChatFailure{
+		{Name: "<b>伪造</b>" + strings.Repeat("名", chatFailureNameWidth+20), Error: "x"},
+	}})
+	if strings.Contains(text, "<b>伪造</b>") {
+		t.Fatalf("a file name reached the card as markup:\n%s", text)
+	}
+	if !strings.Contains(text, "&lt;b&gt;伪造&lt;/b&gt;") {
+		t.Fatalf("the file name was not escaped:\n%s", text)
+	}
+	if !strings.Contains(text, "…") {
+		t.Fatalf("a name longer than the card's room must be shortened:\n%s", text)
+	}
+}
+
 func TestChatTaskKeyboardExposesPurgeForTerminalTask(t *testing.T) {
 	keys := chatTaskKeyboard(download.ChatJob{ID: "chat-1", Status: "completed"}, "‹ 返回会话列表")
 	joined := ""
