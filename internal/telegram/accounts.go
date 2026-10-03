@@ -960,7 +960,17 @@ func (m *Manager) acquireSession(id string) (*accountSession, error) {
 		m.mu.RLock()
 		account, ok := m.accountLocked(id)
 		m.mu.RUnlock()
-		if !ok || account.State != "authorized" {
+		// An account that is not there and an account that is still signing in
+		// are different answers, and the difference is the whole of what a
+		// reader can act on. Account ids are minted per sign-in, so removing an
+		// account and adding it back leaves every task it created pointing at an
+		// id nothing can serve; reporting that as "尚未登录完成" sent the reader
+		// looking for a login that had already finished, on a task that will
+		// never run.
+		if !ok {
+			return nil, ErrNotFound
+		}
+		if account.State != "authorized" {
 			return nil, ErrNotAuthorized
 		}
 		proxy := m.proxyURL()
@@ -995,7 +1005,7 @@ func (m *Manager) acquireSession(id string) (*accountSession, error) {
 			m.mu.RUnlock()
 			if !stillPresent {
 				m.cancelSession(session)
-				return nil, ErrNotAuthorized
+				return nil, ErrNotFound
 			}
 			go m.runSession(ctx, session)
 			return session, nil

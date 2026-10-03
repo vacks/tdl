@@ -305,6 +305,30 @@ func TestStopSessionEndsTheConnectionAndClearsTheRegistry(t *testing.T) {
 	}
 }
 
+// An operation for an account the store no longer has says so, instead of
+// reporting a login that has already finished.
+//
+// Account ids are minted per sign-in, so removing an account and adding it back
+// leaves every task it created pointing at an id nothing can serve - the shape
+// a user reaches by revoking a session and signing in again. Both halves of the
+// answer matter: the operation must fail rather than wait for a session that
+// will never be built, and what it fails with has to name the account, because
+// "尚未登录完成" is advice to go and finish a login that is not the problem.
+func TestRunNamesAnAccountThatIsNoLongerThere(t *testing.T) {
+	m, accountID := openSessionTestManager(t, unreachableProxy)
+
+	err := m.Run(context.Background(), accountID+"-gone", func(context.Context, *gotd.Client, kv.Storage) error {
+		t.Fatal("the operation ran against an account that does not exist")
+		return nil
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Run() = %v; want it to name the missing account, not a login still in progress", err)
+	}
+	if errors.Is(err, ErrNotAuthorized) {
+		t.Fatal("a missing account reported itself as an unfinished login")
+	}
+}
+
 // A connection that cannot be constructed has to reach the caller as an error
 // rather than become a wait.
 //
