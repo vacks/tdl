@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -228,29 +229,46 @@ func (m *Manager) setItemState(t itemTable, ownerID string, item source, status,
 // for that file, and 恢复 - which asks for paused rows - would never look at it
 // again. When the attempts are spent the same statement writes "failed", which
 // is how a pause came to cost a file outright.
-func (t itemTable) retryStatement() string {
+func (t itemTable) retryStatement(files int) string {
 	// RETURNING is how the caller learns which branch the CASE took. A row count
 	// cannot say it: the statement writes either way, and "was a row touched" is
 	// not the question - a file that just spent its last attempt is finished,
 	// not waiting. Asking with a second read would be a round trip on a path
 	// that runs once per lost file.
-	return fmt.Sprintf(`UPDATE %[1]s
-SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'queued' END,
-    error = CASE WHEN attempts >= ? THEN ? ELSE ? END,
+	return fmt.Sprintf(`UPDATE %[1]s AS i
+SET status = CASE WHEN i.attempts >= ? THEN 'failed' ELSE 'queued' END,
+    error = CASE WHEN i.attempts >= ? THEN v.stopped ELSE v.reason END,
     started_at = '',
-    finished_at = CASE WHEN attempts >= ? AND finished_at = '' THEN ? ELSE finished_at END
-WHERE %[2]s = ? AND dialog_key = ? AND message_id = ?
-  AND status NOT IN ('completed', 'downloaded', 'paused', 'cancelled')
-RETURNING status`, t.items, t.owner)
+    finished_at = CASE WHEN i.attempts >= ? AND i.finished_at = '' THEN ? ELSE i.finished_at END
+FROM (VALUES %[3]s) AS v(dialog_key, message_id, reason, stopped)
+WHERE i.%[2]s = ? AND i.dialog_key = v.dialog_key AND i.message_id = v.message_id
+  AND i.status NOT IN ('completed', 'downloaded', 'paused', 'cancelled')
+RETURNING i.dialog_key, i.message_id, i.status`, t.items, t.owner, failureValueRows(files, true))
 }
 
 // terminalStatement is the same write for a failure no attempt can clear, and
-// it refuses the same rows for the same reasons - see retryStatement.
-func (t itemTable) terminalStatement() string {
-	return fmt.Sprintf(`UPDATE %[1]s
-SET status = 'failed', error = ?, finished_at = ?
-WHERE %[2]s = ? AND dialog_key = ? AND message_id = ?
-  AND status NOT IN ('completed', 'downloaded', 'paused', 'cancelled')`, t.items, t.owner)
+// it refuses the same rows for the same reasons - see retryStatement. The rows
+// it refused come back, so the caller clears live progress for exactly the
+// files it settled rather than for every file it asked about.
+func (t itemTable) terminalStatement(files int) string {
+	return fmt.Sprintf(`UPDATE %[1]s AS i
+SET status = 'failed', error = v.reason, finished_at = ?
+FROM (VALUES %[3]s) AS v(dialog_key, message_id, reason)
+WHERE i.%[2]s = ? AND i.dialog_key = v.dialog_key AND i.message_id = v.message_id
+  AND i.status NOT IN ('completed', 'downloaded', 'paused', 'cancelled')
+RETURNING i.dialog_key, i.message_id`, t.items, t.owner, failureValueRows(files, false))
+}
+
+// failureValueRows renders the row values one failure statement joins against.
+// message_id is cast because a parameter's type is decided by the server before
+// any cast on the column it lands in, and a VALUES list has no column to imply
+// one from.
+func failureValueRows(files int, withStopped bool) string {
+	row := "(?, ?::integer, ?, ?), "
+	if !withStopped {
+		row = "(?, ?::integer, ?), "
+	}
+	return strings.TrimSuffix(strings.Repeat(row, files), ", ")
 }
 
 // applyItemFailures writes back every file a batch could not deliver.
@@ -259,40 +277,98 @@ WHERE %[2]s = ? AND dialog_key = ? AND message_id = ?
 // queue. Both matter to the caller: a file waiting for another attempt is work
 // the task still has, and a file that was given its own reason must not have
 // that reason overwritten by a task-level one.
+//
+// The files go in as a set, one statement per chunk per verdict. The message
+// path hands this a whole dialog's pending files at once, and a batch that fails
+// together - a flood, a disconnected account, a source that was deleted - fails
+// every one of them together, so the per-file form turned one bad batch into as
+// many round trips as the task had files, on the path that exists to record that
+// the batch went wrong.
 func (m *Manager) applyItemFailures(table itemTable, ownerID string, failures []itemFailure) (settled int, requeued bool, err error) {
 	if len(failures) == 0 {
 		return 0, false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	retries := make([]itemFailure, 0, len(failures))
+	terminals := make([]itemFailure, 0, len(failures))
 	for _, failure := range failures {
 		if failure.retry {
-			var status string
-			queryErr := m.db.QueryRow(table.retryStatement(),
-				maxStalledAttempts, // attempts >= ? -> the budget is spent
-				maxStalledAttempts, // attempts >= ? -> which of the two messages
-				fmt.Sprintf("下载中断，已停止自动重试: %s", failure.detail),
-				failure.message,
-				maxStalledAttempts, now,
-				ownerID, failure.item.DialogKey, failure.item.MessageID).Scan(&status)
-			// No row means the guard refused it, which is not an error: a pause,
-			// a cancel or an adoption by another task has already settled it.
-			if errors.Is(queryErr, sql.ErrNoRows) {
-				continue
-			}
-			if queryErr != nil {
-				return settled, requeued, queryErr
-			}
-			settled++
-			requeued = requeued || status == "queued"
+			retries = append(retries, failure)
 			continue
 		}
-		if _, execErr := m.db.Exec(table.terminalStatement(),
-			failure.message, now,
-			ownerID, failure.item.DialogKey, failure.item.MessageID); execErr != nil {
-			return settled, requeued, execErr
+		terminals = append(terminals, failure)
+	}
+	// dialog_key, message_id, reason, and the sentence a file that has spent its
+	// attempts is given instead.
+	retryRows := make([][]any, 0, len(retries))
+	for _, failure := range retries {
+		retryRows = append(retryRows, []any{failure.item.DialogKey, failure.item.MessageID,
+			failure.message,
+			fmt.Sprintf("下载中断，已停止自动重试: %s", failure.detail)})
+	}
+	if err := forEachRowChunk(retryRows, func(chunk [][]any) error {
+		args := []any{
+			maxStalledAttempts, // attempts >= ? -> the budget is spent
+			maxStalledAttempts, // attempts >= ? -> which of the two messages
+			maxStalledAttempts, now,
 		}
-		settled++
-		m.progress.ClearItem(ownerID, failure.item.Item)
+		for _, values := range chunk {
+			args = append(args, values...)
+		}
+		args = append(args, ownerID)
+		rows, queryErr := m.db.Query(table.retryStatement(len(chunk)), args...)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var dialogKey, status string
+			var messageID int
+			if scanErr := rows.Scan(&dialogKey, &messageID, &status); scanErr != nil {
+				return scanErr
+			}
+			// A row the guard refused is simply absent, which is not an error: a
+			// pause, a cancel or an adoption by another task has settled it.
+			settled++
+			requeued = requeued || status == "queued"
+		}
+		return rows.Err()
+	}); err != nil {
+		return settled, requeued, err
+	}
+
+	terminalRows := make([][]any, 0, len(terminals))
+	terminalItems := make(map[mediaClaimKey]Item, len(terminals))
+	for _, failure := range terminals {
+		terminalRows = append(terminalRows, []any{failure.item.DialogKey, failure.item.MessageID, failure.message})
+		terminalItems[mediaClaimKey{dialogKey: failure.item.DialogKey, messageID: failure.item.MessageID}] = failure.item.Item
+	}
+	if err := forEachRowChunk(terminalRows, func(chunk [][]any) error {
+		args := []any{now}
+		for _, values := range chunk {
+			args = append(args, values...)
+		}
+		args = append(args, ownerID)
+		rows, queryErr := m.db.Query(table.terminalStatement(len(chunk)), args...)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var dialogKey string
+			var messageID int
+			if scanErr := rows.Scan(&dialogKey, &messageID); scanErr != nil {
+				return scanErr
+			}
+			settled++
+			// Cleared for the files this statement actually settled, not for
+			// every file it was asked about: a paused file keeps its progress
+			// until the control action decides what happens to it.
+			m.progress.ClearItem(ownerID, terminalItems[mediaClaimKey{dialogKey: dialogKey, messageID: messageID}])
+		}
+		return rows.Err()
+	}); err != nil {
+		return settled, requeued, err
 	}
 	if settled > 0 {
 		m.touch()

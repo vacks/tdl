@@ -17,6 +17,77 @@ import (
 	"github.com/vacks/tdl/internal/tmsg"
 )
 
+// Recording what a failed batch did costs a statement per chunk, not one per
+// file, and it settles every file the same way it did one at a time.
+//
+// This is the write-back for a whole batch, and a batch fails as a batch: a
+// flood, a disconnected account or a source that was deleted takes every file in
+// it, so the per-file form made the cost of one bad batch the size of the task,
+// on the path whose entire job is to record that something went wrong.
+func TestPostgresSettlingABatchOfFailuresCostsAFixedNumberOfStatements(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, counter := openCountingDatabase(t, url)
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, status, created_at, updated_at) VALUES ('bulk-job','tg://x','channel','channel:bulk','test','account','running',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// More files than one chunk holds, so the count would grow if the statement
+	// were built per file rather than per chunk.
+	const total = 300
+	for id := 1; id <= total; id++ {
+		if _, err := db.Exec(`INSERT INTO download_items(job_id, dialog_key, dialog_id, message_id, original_name, status, attempts, started_at) VALUES ('bulk-job','channel:bulk',1,?,'f.bin','running',?,'')`, id, maxStalledAttempts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other file is a permanent failure, so both verdicts are exercised
+	// with enough rows to fill a chunk of their own.
+	byMessage := map[int]source{}
+	outcomes := make([]transfer.FileOutcomeUpdate, 0, total)
+	for id := 1; id <= total; id++ {
+		byMessage[id] = source{Item: Item{DialogKey: "channel:bulk", MessageID: id}}
+		if id%2 == 0 {
+			outcomes = append(outcomes, transfer.FileOutcomeUpdate{MessageID: id, Err: tmsg.ErrMessageDeleted})
+			continue
+		}
+		outcomes = append(outcomes, transfer.FileOutcomeUpdate{MessageID: id, Err: errors.New("read tcp: connection reset by peer")})
+	}
+
+	before := counter.count()
+	settled, _, err := m.applyItemFailures(messageItems, "bulk-job", planItemFailures(outcomes, byMessage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := counter.count() - before
+	if settled != total {
+		t.Fatalf("settled %d of %d files", settled, total)
+	}
+	t.Logf("settling %d failures cost %d statements", total, sent)
+	if sent > 6 {
+		t.Fatalf("settling %d failures cost %d statements, want at most 6: the per-file form this replaced spent one or more for each", total, sent)
+	}
+	// The verdicts still land where they did: a permanent failure is failed, a
+	// retryable one with its budget spent is failed too, and none is left
+	// running - which is the stall this write-back exists to prevent.
+	var failed, running int
+	if err := db.QueryRow(`SELECT COUNT(1) FILTER (WHERE status = 'failed'), COUNT(1) FILTER (WHERE status = 'running') FROM download_items WHERE job_id = 'bulk-job'`).Scan(&failed, &running); err != nil {
+		t.Fatal(err)
+	}
+	if failed != total || running != 0 {
+		t.Fatalf("after settling: failed=%d running=%d, want %d and 0", failed, running, total)
+	}
+}
+
 // A file that produced nothing has to leave the row in a state the rest of the
 // system understands, and which state that is depends on whether another
 // attempt could change the answer.

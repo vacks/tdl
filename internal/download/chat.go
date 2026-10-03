@@ -615,8 +615,7 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 	// by what the server returns, so the per-file form made the indexing rate of
 	// a channel with a million posts depend on how many of them carried media:
 	// the claim beside it was already set-based, and this was not.
-	for start := 0; start < len(rows); start += mediaClaimChunk {
-		chunk := rows[start:min(start+mediaClaimChunk, len(rows))]
+	if err := forEachRowChunk(rows, func(chunk [][]any) error {
 		placeholders := strings.TrimSuffix(strings.Repeat("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), ", len(chunk)), ", ")
 		args := make([]any, 0, len(chunk)*chatItemColumns)
 		for _, row := range chunk {
@@ -629,6 +628,9 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 		if changed, _ := result.RowsAffected(); changed > 0 {
 			inserted += changed
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if startTransfers && inserted > 0 {
 		if _, err := tx.Exec(`UPDATE chat_download_jobs SET status = ?, error = '', updated_at = ? WHERE id = ? AND status = ?`, ChatStatusDownloading, now, chatID, ChatStatusListening); err != nil {

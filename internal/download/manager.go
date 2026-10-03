@@ -1304,8 +1304,7 @@ func insertTaskItems(tx *databaseTx, jobID string, items []source) (int, error) 
 		rows = append(rows, []any{jobID, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size})
 	}
 	inserted := 0
-	for start := 0; start < len(rows); start += mediaClaimChunk {
-		chunk := rows[start:min(start+mediaClaimChunk, len(rows))]
+	if err := forEachRowChunk(rows, func(chunk [][]any) error {
 		placeholders := strings.TrimSuffix(strings.Repeat("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued'), ", len(chunk)), ", ")
 		args := make([]any, 0, len(chunk)*taskItemColumns)
 		for _, row := range chunk {
@@ -1313,11 +1312,14 @@ func insertTaskItems(tx *databaseTx, jobID string, items []source) (int, error) 
 		}
 		result, err := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, status) VALUES `+placeholders+` ON CONFLICT(dialog_key, message_id) DO NOTHING`, args...)
 		if err != nil {
-			return inserted, err
+			return err
 		}
 		if changed, _ := result.RowsAffected(); changed > 0 {
 			inserted += int(changed)
 		}
+		return nil
+	}); err != nil {
+		return inserted, err
 	}
 	return inserted, nil
 }
@@ -2620,6 +2622,22 @@ func mediaKeys(items []source) []mediaClaimKey {
 func forEachKeyChunk(keys []mediaClaimKey, run func([]mediaClaimKey) error) error {
 	for start := 0; start < len(keys); start += mediaClaimChunk {
 		if err := run(keys[start:min(start+mediaClaimChunk, len(keys))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// forEachRowChunk runs one set-based statement per bounded slice of rows.
+//
+// It exists for the same reason forEachKeyChunk does - a statement built from a
+// caller-supplied set must not grow past the parameter limit - and for one more:
+// the step and the bound are the same number, so a loop that spells them out
+// twice can be changed in one place and silently overlap its chunks, which
+// rewrites the earliest rows once per later statement instead of failing.
+func forEachRowChunk(rows [][]any, run func([][]any) error) error {
+	for start := 0; start < len(rows); start += mediaClaimChunk {
+		if err := run(rows[start:min(start+mediaClaimChunk, len(rows))]); err != nil {
 			return err
 		}
 	}
