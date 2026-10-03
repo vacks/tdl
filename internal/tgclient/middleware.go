@@ -96,13 +96,39 @@ var internalErrors = []string{
 	"memory limit exit",
 }
 
+const (
+	// retryBackoffBase is the wait before the first resend, doubled per
+	// attempt up to retryBackoffMax: 200ms, 400ms, 800ms, 1.6s, which is three
+	// seconds spent on a request the server refused five times.
+	retryBackoffBase = 200 * time.Millisecond
+	retryBackoffMax  = 2 * time.Second
+)
+
 // retryMiddleware resends a request Telegram refused because it was busy.
+//
+// The resends are spaced. Every error it retries is the server saying it has no
+// capacity at the moment - "no workers running", "worker busy too long",
+// a call that timed out inside the server - so resending as fast as the loop can
+// go is the one response certain to make that worse: five immediate attempts per
+// call, multiplied by every file downloading at once, arrive as a burst aimed at
+// a server that has just reported being overloaded. The wait is short enough
+// that a refusal which clears still costs far less than failing the file, whose
+// alternative on this path is the whole task going back on the queue.
+//
+// sleep exists so a test can observe the spacing without spending it; nil is the
+// real wait.
 type retryMiddleware struct {
-	max int
+	max   int
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 func (r retryMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
+	sleep := r.sleep
+	if sleep == nil {
+		sleep = waitBeforeRetry
+	}
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		delay := retryBackoffBase
 		for attempt := 0; attempt < r.max; attempt++ {
 			err := next.Invoke(ctx, input, output)
 			if err == nil {
@@ -119,7 +145,33 @@ func (r retryMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 				// move of this code.
 				return errors.Wrap(err, "retry middleware skip")
 			}
+			if attempt+1 == r.max {
+				break
+			}
+			if err := sleep(ctx, delay); err != nil {
+				// The caller's context ended while waiting, so this request is
+				// over. Returned unwrapped because the callers that matter match
+				// on it: a batch stopped by a pause must not report its in-flight
+				// files as failures.
+				return err
+			}
+			if delay *= 2; delay > retryBackoffMax {
+				delay = retryBackoffMax
+			}
 		}
 		return errors.Errorf("retry limit reached after %d attempts", r.max)
+	}
+}
+
+// waitBeforeRetry waits out one retry delay, or gives up when the caller's
+// context ends - a shutdown or a pause must not have to sit through the backoff.
+func waitBeforeRetry(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
