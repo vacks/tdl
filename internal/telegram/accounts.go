@@ -418,6 +418,13 @@ func (m *Manager) TransferPool(accountID string, client *gotd.Client, size int) 
 	return pool
 }
 
+// reconnectTimeout is how long a broken connecturage is worth retrying, and it
+// is deliberately the same value the session's own client is built with
+// (tgclient.New is called without one, so both are zero - which the backoff
+// reads as "no deadline"). One value, so a pool connection and the session
+// cannot disagree about when to give up.
+const reconnectTimeout = 0
+
 // releaseAccountConnections drops an account's pool and its peer manager. It is
 // called wherever the account stops having a session, because both are built on
 // that session's authorization and are useless without it.

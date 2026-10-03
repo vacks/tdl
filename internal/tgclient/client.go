@@ -81,6 +81,7 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		// A new backoff per reconnection, because a backoff carries its own
 		// attempt state and a shared one would keep growing across reconnects.
 		ReconnectionBackoff: func() backoff.BackOff { return reconnectBackoff(o.ReconnectTimeout) },
+		Logger:              gotdLogger(),
 		UpdateHandler:       o.UpdateHandler,
 		OnSelfSuccess:       o.OnSelfSuccess,
 		Device:              device,
