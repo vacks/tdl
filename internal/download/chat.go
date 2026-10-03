@@ -593,6 +593,7 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 	if err != nil {
 		return err
 	}
+	rows := make([][]any, 0, len(candidates))
 	for _, item := range candidates {
 		key := mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}
 		status, finalPath := "queued", ""
@@ -607,7 +608,21 @@ func (m *Manager) registerChatMedia(chatID string, candidates []source, startTra
 			// and this is the only verdict that leaves the row alone.
 			status = "waiting"
 		}
-		result, err := tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, final_path, status, discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, chatID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size, finalPath, status, now)
+		rows = append(rows, []any{chatID, item.DialogKey, item.MessageID, item.DialogType, item.DialogID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size, finalPath, status, now})
+	}
+	// One statement per chunk rather than one per file. This runs in the
+	// transaction that indexes a page of a channel, and the page is bounded only
+	// by what the server returns, so the per-file form made the indexing rate of
+	// a channel with a million posts depend on how many of them carried media:
+	// the claim beside it was already set-based, and this was not.
+	for start := 0; start < len(rows); start += mediaClaimChunk {
+		chunk := rows[start:min(start+mediaClaimChunk, len(rows))]
+		placeholders := strings.TrimSuffix(strings.Repeat("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), ", len(chunk)), ", ")
+		args := make([]any, 0, len(chunk)*chatItemColumns)
+		for _, row := range chunk {
+			args = append(args, row...)
+		}
+		result, err := tx.Exec(`INSERT INTO chat_download_items(chat_job_id, dialog_key, message_id, dialog_type, dialog_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, final_path, status, discovered_at) VALUES `+placeholders+` ON CONFLICT(chat_job_id, dialog_key, message_id) DO NOTHING`, args...)
 		if err != nil {
 			return err
 		}
@@ -1542,6 +1557,10 @@ func batchKeys(chatID string, batch []source) map[mediaKey]struct{} {
 	}
 	return keys
 }
+
+// chatItemColumns is the width of one chat_download_items row as the ingest
+// path writes it. It only sizes the argument slice.
+const chatItemColumns = 18
 
 // chatPublishedCursor is where the bounded published-file sweep resumes: the
 // last (chat_job_id, message_id) it read. Both empty means "from the start",

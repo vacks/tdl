@@ -57,8 +57,15 @@ func (r *databaseRow) Scan(dest ...any) error {
 	return r.row.Scan(dest...)
 }
 
+// postgresDriverName is the driver this package opens. It is a variable for one
+// reason: a test that has to count the statements a path sends - because the
+// path builds its own transactions and cannot be handed a counting handle -
+// registers a driver that wraps this one and points this at it. Nothing else
+// assigns to it.
+var postgresDriverName = "pgx"
+
 func openPostgresDatabase(ctx context.Context, url string) (*database, error) {
-	db, err := sql.Open("pgx", url)
+	db, err := sql.Open(postgresDriverName, url)
 	if err != nil {
 		return nil, err
 	}

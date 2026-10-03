@@ -626,6 +626,67 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	}
 }
 
+// Indexing a page of media costs a handful of statements whatever the page
+// holds, measured through the call the scan actually makes.
+//
+// The claim test beside this one measures the pipeline by handing its helpers a
+// counting handle, which cannot see the statements the same function writes
+// afterwards - and those were one INSERT per file, inside the transaction that
+// indexes the page. A page is whatever the server returned, so the indexing rate
+// of a channel with a million posts was set by how many of them carried media.
+// This opens the database through a driver that counts, so the whole ingest is
+// measured as the scan runs it.
+func TestPostgresIngestingAPageCostsAFixedNumberOfStatements(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, counter := openCountingDatabase(t, url)
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db, events: newEventBus(), wake: make(chan struct{}, 1), chatWake: make(chan struct{}, 1), progress: newProgressStore()}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO chat_download_jobs(id, source_url, dialog_type, dialog_key, dialog_id, dialog_name, account_id, status, scan_state, config_json, created_at, updated_at) VALUES ('ingest-chat','tg://x','channel','channel:ingest',1,'test','account','scanning','indexing','{}',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same page twice, at two sizes: the count must be the same, because
+	// what it measures is the page, not the files in it.
+	for _, size := range []int{64, 200} {
+		items := make([]source, 0, size)
+		for id := 1; id <= size; id++ {
+			items = append(items, source{Item: Item{DialogType: "channel", DialogKey: "channel:ingest", DialogID: 1, MessageID: id, OriginalName: fmt.Sprintf("f%d.bin", id)}, DialogName: "test", MediaType: "image"})
+		}
+		before := counter.count()
+		if err := m.registerChatMedia("ingest-chat", items, false); err != nil {
+			t.Fatal(err)
+		}
+		sent := counter.count() - before
+		if sent == 0 {
+			t.Fatal("the ingest sent no statements at all, so the count below means nothing")
+		}
+		t.Logf("ingesting %d media cost %d statements", size, sent)
+		// One read of the message task's rows, one claim, one insert of the
+		// page's rows. The bound is loose on purpose; what it has to catch is a
+		// return to a statement per file, which is sixty-four here.
+		if sent > 6 {
+			t.Fatalf("ingesting %d media cost %d statements, want at most 6: the per-file form this replaced spent one for each", size, sent)
+		}
+		var stored int
+		if err := db.QueryRow(`SELECT COUNT(1) FROM chat_download_items WHERE chat_job_id = 'ingest-chat'`).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != size {
+			t.Fatalf("after a page of %d, %d rows are indexed", size, stored)
+		}
+	}
+}
+
 // The sweep that repairs a crash mid-publish is bounded, and it resumes where
 // the last pass stopped.
 //
