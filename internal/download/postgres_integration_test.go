@@ -2631,6 +2631,70 @@ func TestPostgresSubmissionExtendsTheTaskThatHoldsPartOfTheRequest(t *testing.T)
 	}
 }
 
+// A task is displayed as the request that produced it, not as its first file.
+//
+// A channel post with no media of its own yields no item of its own either -
+// only its comments, which live in the linked discussion group and carry that
+// group's name and one commenter's text. Taking the name and the text from the
+// first source therefore showed the discussion group and a comment where the
+// person had asked for a channel post: the same task was named 在花🎗️科技圈 in
+// the directory it wrote into and 在花小茶馆 on its card, and its card showed a
+// commenter's sentence instead of the post being downloaded.
+func TestPostgresTaskShowsTheOriginDialogAndPostText(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := newSubmissionTestManager(t, db)
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+	// Two comments of a post that has no media of its own.
+	comment := func(id int, text string) source {
+		return source{
+			Item: Item{
+				DialogType: "chat", DialogKey: "channel:777", DialogID: 777,
+				MessageID: id, MessageText: text, IsComment: true,
+				OriginDialogName: "在花🎗️科技圈", OriginMessageID: 43466,
+				OriginMessageText: "原帖的文字",
+			},
+			DialogName: "在花小茶馆",
+		}
+	}
+	sources := []source{comment(413217, "哈哈哈"), comment(413218, "有多少人点看链接")}
+	submission, err := m.enqueueIntent(DownloadIntent{Source: SourceReaction, AccountID: "account", URL: "tg://reaction/channel/1125107539/43466"}, sources, directPeer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialogName, messageText string
+	if err := db.QueryRow(`SELECT dialog_name, message_text FROM download_jobs WHERE id = ?`, submission.Job.ID).Scan(&dialogName, &messageText); err != nil {
+		t.Fatal(err)
+	}
+	if dialogName != "在花🎗️科技圈" {
+		t.Fatalf("the task is displayed as %q; want the channel the post is in, not the discussion group its comments live in", dialogName)
+	}
+	if messageText != "原帖的文字" {
+		t.Fatalf("the task's text is %q; want the post's, not a commenter's", messageText)
+	}
+	// The files themselves keep the album rule: a comment with its own caption
+	// is named from it. That is a different field on a different row.
+	var itemText string
+	if err := db.QueryRow(`SELECT message_text FROM download_items WHERE job_id = ? AND message_id = 413217`, submission.Job.ID).Scan(&itemText); err != nil {
+		t.Fatal(err)
+	}
+	if itemText != "哈哈哈" {
+		t.Fatalf("the file's own text is %q; want the comment's own caption", itemText)
+	}
+}
+
 // Pausing a message task must release the media it holds, exactly as PauseChat
 // does. A parked task transfers nothing, and a claim it keeps is released by
 // nothing else, so every other task wanting that media waits until the user

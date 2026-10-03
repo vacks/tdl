@@ -2782,7 +2782,7 @@ func (m *Manager) handleNewChatMessage(event telegram.NewMessageEvent) error {
 		if originID := originByJob[id]; originID > 0 {
 			items = make([]source, len(resolved[false]))
 			copy(items, resolved[false])
-			items = setOrigin(items, target.DialogName, originID, true)
+			items = setOrigin(items, target.DialogName, originID, "", true)
 		}
 		if err := m.registerChatMedia(id, items, true); err != nil {
 			applog.Error("chat_download", "new_media_register_failed", "chat_job_id", id, "message_id", event.MessageID, "error", err.Error())

@@ -10,14 +10,14 @@ import (
 
 func TestDiscussionOriginIsStableAndDoesNotReplaceTelegramIdentity(t *testing.T) {
 	items := []source{{Item: Item{DialogKey: "channel:1", MessageID: 102, GroupedID: 999}, DialogName: "频道"}}
-	items = setOrigin(items, "频道", 100, false)
+	items = setOrigin(items, "频道", 100, "原帖文字", false)
 	if items[0].DialogKey != "channel:1" || items[0].MessageID != 102 || items[0].GroupedID != 999 {
 		t.Fatal("origin assignment must not alter physical Telegram identity")
 	}
 	if items[0].OriginDialogName != "频道" || items[0].OriginMessageID != 100 || items[0].IsComment {
 		t.Fatalf("unexpected origin context: %#v", items[0].Item)
 	}
-	comment := setOrigin([]source{{Item: Item{DialogKey: "channel:discussion", MessageID: 9}}}, "频道", 100, true)[0]
+	comment := setOrigin([]source{{Item: Item{DialogKey: "channel:discussion", MessageID: 9}}}, "频道", 100, "原帖文字", true)[0]
 	path, err := renderName("{{ .OriginDialogName }}/{{ .OriginMessageID }}_{{ if .IsComment }}c_{{ end }}{{ .MessageID }}{{ .FileExt }}", source{Item: Item{DialogKey: comment.DialogKey, MessageID: comment.MessageID, OriginDialogName: comment.OriginDialogName, OriginMessageID: comment.OriginMessageID, IsComment: comment.IsComment, OriginalName: "reply.jpg"}, DialogName: "讨论组"})
 	if err != nil {
 		t.Fatal(err)

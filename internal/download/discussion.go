@@ -15,13 +15,28 @@ import (
 
 // setOrigin records presentation context without changing the true Telegram
 // identity used by the downloader and database uniqueness constraints.
-func setOrigin(items []source, name string, messageID int, related bool) []source {
+func setOrigin(items []source, name string, messageID int, text string, related bool) []source {
 	for i := range items {
 		items[i].OriginDialogName = name
 		items[i].OriginMessageID = messageID
+		items[i].OriginMessageText = text
 		items[i].IsComment = related
 	}
 	return items
+}
+
+// albumCaption is the text an album's files are named from.
+//
+// The album's own caption first: Telegram attaches one caption to one member of
+// a group and leaves the others empty, so a caption belongs to the album and
+// every member of it is named from that one sentence. An album with none at all
+// - a comment posted as a bare photo or video - takes the post's caption, which
+// is the text the person downloading a post's comments is reading.
+func albumCaption(album, origin []*tg.Message) string {
+	if caption := groupDisplayText(album); caption != "" {
+		return caption
+	}
+	return groupDisplayText(origin)
 }
 
 func firstMessageID(messages []*tg.Message, fallback int) int {
@@ -183,7 +198,14 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 					messages = group
 				}
 			}
-			caption := groupDisplayText(messages)
+			// The caption belongs to the album, not to the message: Telegram
+			// attaches a caption to one member of a group and leaves the others
+			// empty, and every member of that album is named from it. What is
+			// missing here is the album without one at all - a comment posted as
+			// a bare photo or video - and those take the post's caption, which is
+			// what the person downloading the post's comments is reading.
+			originCaption := groupDisplayText(originMessages)
+			caption := albumCaption(messages, originMessages)
 			for _, member := range messages {
 				if member == nil {
 					continue
@@ -197,7 +219,7 @@ func relatedSources(m *Manager, ctx context.Context, api *tg.Client, accountID s
 				}
 				seen[member.ID] = struct{}{}
 				direct := makeDirectPeer(threadPeer)
-				item := sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageText: caption, OriginDialogName: originName, OriginMessageID: originMessageID, IsComment: true, SourcePeerType: direct.kind, SourcePeerID: direct.id, SourcePeerHash: direct.hash, ReplyRootID: threadMessageID}, member, media, dialogName)
+				item := sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageText: caption, OriginDialogName: originName, OriginMessageID: originMessageID, OriginMessageText: originCaption, IsComment: true, SourcePeerType: direct.kind, SourcePeerID: direct.id, SourcePeerHash: direct.hash, ReplyRootID: threadMessageID}, member, media, dialogName)
 				item.Direct = direct
 				items = append(items, item)
 			}

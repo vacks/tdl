@@ -120,21 +120,28 @@ type Item struct {
 	// a post and its replies together in the originating channel directory.
 	OriginDialogName string `json:"originDialogName,omitempty"`
 	OriginMessageID  int    `json:"originMessageId,omitempty"`
-	IsComment        bool   `json:"isComment,omitempty"`
-	SourcePeerType   string `json:"-"`
-	SourcePeerID     int64  `json:"-"`
-	SourcePeerHash   int64  `json:"-"`
-	ReplyRootID      int    `json:"-"`
-	MessageText      string `json:"messageText,omitempty"`
-	OriginalName     string `json:"originalName"`
-	Size             int64  `json:"size"`
-	FinalPath        string `json:"finalPath,omitempty"`
-	StartedAt        string `json:"startedAt,omitempty"`
-	FinishedAt       string `json:"finishedAt,omitempty"`
-	ElapsedMS        int64  `json:"elapsedMs"`
-	Attempts         int    `json:"attempts"`
-	Status           string `json:"status"`
-	Error            string `json:"error,omitempty"`
+	// OriginMessageText is the caption of the message the request was made for
+	// - the channel post - as opposed to MessageText, which belongs to the
+	// album this file is in. A task displays the origin's: a post with no media
+	// of its own produces no item of its own, so every item of such a task is a
+	// comment, and the post's caption would otherwise be lost from the card.
+	// Carried in memory only; no statement writes or reads it.
+	OriginMessageText string `json:"-"`
+	IsComment         bool   `json:"isComment,omitempty"`
+	SourcePeerType    string `json:"-"`
+	SourcePeerID      int64  `json:"-"`
+	SourcePeerHash    int64  `json:"-"`
+	ReplyRootID       int    `json:"-"`
+	MessageText       string `json:"messageText,omitempty"`
+	OriginalName      string `json:"originalName"`
+	Size              int64  `json:"size"`
+	FinalPath         string `json:"finalPath,omitempty"`
+	StartedAt         string `json:"startedAt,omitempty"`
+	FinishedAt        string `json:"finishedAt,omitempty"`
+	ElapsedMS         int64  `json:"elapsedMs"`
+	Attempts          int    `json:"attempts"`
+	Status            string `json:"status"`
+	Error             string `json:"error,omitempty"`
 }
 
 type Job struct {
@@ -1526,8 +1533,25 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	// The task's display text is one message's caption and is identical for every
 	// file of the task, so it is stored once on the task rather than repeated on
 	// every file row. The task list then never has to read download_items for it.
-	messageText := taskMessageText(sources)
-	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, parent_chat_id, config_json, message_text, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, sources[0].DialogName, intent.AccountID, direct.kind, direct.id, direct.hash, parentChatID, configJSON, messageText, now, now); err != nil {
+	// The task is displayed as the request that produced it, not as the first
+	// file it happens to hold. A post with no downloadable media of its own
+	// yields no item of its own either - only its comments, which live in the
+	// linked discussion group and carry that group's name and one commenter's
+	// text. Taking the name and the text from the first source therefore showed
+	// the discussion group and a comment where the person asked for a channel
+	// post: the same task named 在花🎗️科技圈 in its download path and 在花小茶馆
+	// on its card. Both are now the origin's, which every source carries.
+	// The caption falls back to the old rule only when the post has no text at
+	// all, so a card never loses the only text the task has to show.
+	messageText := sources[0].OriginMessageText
+	if messageText == "" {
+		messageText = taskMessageText(sources)
+	}
+	jobDialogName := sources[0].DialogName
+	if sources[0].OriginDialogName != "" {
+		jobDialogName = sources[0].OriginDialogName
+	}
+	if _, err = tx.Exec(`INSERT INTO download_jobs(id, source_url, dialog_type, dialog_key, dialog_name, account_id, direct_peer_type, direct_peer_id, direct_peer_hash, parent_chat_id, config_json, message_text, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`, id, intent.URL, sources[0].DialogType, sources[0].DialogKey, jobDialogName, intent.AccountID, direct.kind, direct.id, direct.hash, parentChatID, configJSON, messageText, now, now); err != nil {
 		return Submission{}, false, err
 	}
 	inserted, insertErr := insertTaskItems(tx, id, sources)
@@ -1549,7 +1573,7 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	}
 	m.jobBecameVisible(parentChatID)
 	m.touch()
-	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: sources[0].DialogName, MessageText: messageText, AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
+	job := Job{ID: id, SourceURL: intent.URL, DialogType: sources[0].DialogType, DialogKey: sources[0].DialogKey, DialogName: jobDialogName, MessageText: messageText, AccountID: intent.AccountID, DirectPeerType: direct.kind, DirectPeerID: direct.id, DirectPeerHash: direct.hash, ConfigJSON: configJSON, Status: "queued", CreatedAt: now, UpdatedAt: now, TotalItems: len(sources)}
 	job.SourceLink = MessageJumpURL(job)
 	m.emit(id, requestID, "job_created", "queued")
 	m.signal()
@@ -3175,7 +3199,7 @@ func (m *Manager) resolve(ctx context.Context, accountID, sourceURL string) ([]s
 			result = append(result, sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: dialogID, MessageText: messageText}, msg, media, peer.VisibleName()))
 		}
 		originID := firstMessageID(messages, message.ID)
-		result = setOrigin(result, peer.VisibleName(), originID, false)
+		result = setOrigin(result, peer.VisibleName(), originID, messageText, false)
 		result = setSourcePeer(result, peer.InputPeer())
 		if m.settings.Get().Download.IncludeReplies {
 			related, relatedErr := relatedSources(m, ctx, client.API(), accountID, peer.InputPeer(), peer.VisibleName(), messages, message.ID, originID, false, "")
@@ -3310,7 +3334,7 @@ func (m *Manager) resolveSourcesFor(ctx context.Context, target resolveTarget) (
 			result = append(result, sourceFromMessage(Item{DialogType: dialogType, DialogKey: dialogKey, DialogID: resolvedDialogID, MessageText: messageText}, msg, media, dialogName))
 		}
 		originID := firstMessageID(messages, message.ID)
-		result = setOrigin(result, dialogName, originID, false)
+		result = setOrigin(result, dialogName, originID, messageText, false)
 		result = setSourcePeer(result, target.Peer)
 		if target.IncludeReplies {
 			related, relatedErr := relatedSources(m, ctx, client.API(), target.AccountID, target.Peer, dialogName, messages, message.ID, originID, eagerDiscussionRoot(target.LearnRoot, broadcastOf(resolved)), target.ChatJobID)
