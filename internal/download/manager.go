@@ -2026,6 +2026,24 @@ func (m *Manager) run(job Job, sources []source) {
 		m.signal()
 		return
 	}
+	// A run the caller stopped must not decide the task's outcome once a newer
+	// run has taken the task over.
+	//
+	// Pausing cancels this run's context, and a resume can put the task back to
+	// "running" before this run has finished unwinding - the batch it stopped is
+	// the last element of its list, so it returns without an error as often as
+	// with one. The run then finds a running task, reports its own cancellation as
+	// a transfer failure or settles the task from a batch that published nothing,
+	// and fails a download the user is watching. What happened is that this run
+	// stopped, and a stopped run says nothing about the task - the same rule the
+	// engine already follows when it refuses to report per-file outcomes for one.
+	//
+	// The two stops that do own the outcome are excepted: a transfer the watchdog
+	// aborted has to surface as the failure it is, and a child whose parent was
+	// paused or cancelled is settled by the parent.
+	supersededRun := func() bool {
+		return transferCtx.Err() != nil && !watchdog.Stalled() && !m.stopForInactiveParent(job.ID)
+	}
 	if err != nil {
 		if m.status(job.ID) == "paused" {
 			for _, item := range pending {
@@ -2034,6 +2052,9 @@ func (m *Manager) run(job Job, sources []source) {
 			return
 		}
 		if m.status(job.ID) == "cancelled" {
+			return
+		}
+		if supersededRun() {
 			return
 		}
 		// A database outage cancels the upstream context. Recovery may already
@@ -2068,6 +2089,9 @@ func (m *Manager) run(job Job, sources []source) {
 				m.pauseItem(item)
 			}
 		}
+		return
+	}
+	if supersededRun() {
 		return
 	}
 	requeuedMu.Lock()
