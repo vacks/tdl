@@ -1293,19 +1293,38 @@ func taskLogFiles(sources []source) []string {
 // differ in what they do about it: the create path rolls back rather than leave
 // a task holding part of its request and asks the duplicate path to look again,
 // and the extend path simply does not claim credit for a file it did not place.
+// The rows go in one statement per chunk. A request's file set is not a small
+// set: a post's media comments are one file each, so a link to a popular post
+// names thousands, and the per-row form made that many round trips inside one
+// open transaction - while the rest of this function's callers were already
+// writing their sets as sets.
 func insertTaskItems(tx *databaseTx, jobID string, items []source) (int, error) {
-	inserted := 0
+	rows := make([][]any, 0, len(items))
 	for _, item := range items {
-		result, err := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued') ON CONFLICT(dialog_key, message_id) DO NOTHING`, jobID, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size)
+		rows = append(rows, []any{jobID, item.DialogType, item.DialogKey, item.DialogID, item.MessageID, item.GroupedID, item.MessageText, item.OriginDialogName, item.OriginMessageID, boolInt(item.IsComment), item.SourcePeerType, item.SourcePeerID, item.SourcePeerHash, item.OriginalName, item.Size})
+	}
+	inserted := 0
+	for start := 0; start < len(rows); start += mediaClaimChunk {
+		chunk := rows[start:min(start+mediaClaimChunk, len(rows))]
+		placeholders := strings.TrimSuffix(strings.Repeat("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued'), ", len(chunk)), ", ")
+		args := make([]any, 0, len(chunk)*taskItemColumns)
+		for _, row := range chunk {
+			args = append(args, row...)
+		}
+		result, err := tx.Exec(`INSERT INTO download_items(job_id, dialog_type, dialog_key, dialog_id, message_id, grouped_id, message_text, origin_dialog_name, origin_message_id, is_comment, source_peer_type, source_peer_id, source_peer_hash, original_name, size, status) VALUES `+placeholders+` ON CONFLICT(dialog_key, message_id) DO NOTHING`, args...)
 		if err != nil {
 			return inserted, err
 		}
-		if changed, _ := result.RowsAffected(); changed == 1 {
-			inserted++
+		if changed, _ := result.RowsAffected(); changed > 0 {
+			inserted += int(changed)
 		}
 	}
 	return inserted, nil
 }
+
+// taskItemColumns is how many bound parameters one download_items row of the
+// insert above carries; it only sizes the argument slice.
+const taskItemColumns = 15
 
 // taskMessageText picks the text shown for a whole task. Every file of one
 // message or album carries the same caption, and a first file without one must
@@ -1374,12 +1393,32 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 	// request can ask for beyond a task it already has; see the extend branch
 	// below for the shape that produces them.
 	unowned := make([]source, 0, len(sources))
-	for _, item := range sources {
-		var jobID string
-		err = tx.QueryRow(`SELECT job_id FROM download_items WHERE dialog_key = ? AND message_id = ? LIMIT 1`, item.DialogKey, item.MessageID).Scan(&jobID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return Submission{}, false, err
+	// Who owns the files this request names, asked once for the whole set rather
+	// than once per file: the answer is a lookup on the unique index the table
+	// already has for that identity, and a request that names a thousand
+	// comments was making a thousand of them.
+	owners := make(map[mediaClaimKey]string, len(sources))
+	if err := forEachKeyChunk(mediaKeys(sources), func(chunk []mediaClaimKey) error {
+		list, args := tupleInList(chunk)
+		rows, queryErr := tx.Query(`SELECT dialog_key, message_id, job_id FROM download_items WHERE (dialog_key, message_id) IN (`+list+`)`, args...)
+		if queryErr != nil {
+			return queryErr
 		}
+		defer rows.Close()
+		for rows.Next() {
+			var key mediaClaimKey
+			var owner string
+			if scanErr := rows.Scan(&key.dialogKey, &key.messageID, &owner); scanErr != nil {
+				return scanErr
+			}
+			owners[key] = owner
+		}
+		return rows.Err()
+	}); err != nil {
+		return Submission{}, false, err
+	}
+	for _, item := range sources {
+		jobID := owners[mediaClaimKey{dialogKey: item.DialogKey, messageID: item.MessageID}]
 		if jobID == "" {
 			unowned = append(unowned, item)
 			continue
@@ -1459,10 +1498,21 @@ func (m *Manager) enqueueIntentParentSnapshotAttempt(intent DownloadIntent, sour
 			if err := rows.Close(); err != nil {
 				return Submission{}, false, err
 			}
+			// The same set-based shape as the rest of this function: a reopened
+			// task can hold thousands of completed files, and the ones whose
+			// published copies are gone are commonly all of them - the user
+			// moved or deleted the directory.
+			missingKeys := make([]mediaClaimKey, 0, len(missing))
 			for _, item := range missing {
-				if _, err := tx.Exec(`UPDATE download_items SET status = 'queued', final_path = '', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND dialog_key = ? AND message_id = ? AND status = 'completed'`, existingID, item.dialogKey, item.messageID); err != nil {
-					return Submission{}, false, err
-				}
+				missingKeys = append(missingKeys, mediaClaimKey{dialogKey: item.dialogKey, messageID: item.messageID})
+			}
+			if err := forEachKeyChunk(missingKeys, func(chunk []mediaClaimKey) error {
+				list, args := tupleInList(chunk)
+				args = append([]any{existingID}, args...)
+				_, execErr := tx.Exec(`UPDATE download_items SET status = 'queued', final_path = '', error = '', started_at = '', finished_at = '', elapsed_ms = 0 WHERE job_id = ? AND (dialog_key, message_id) IN (`+list+`) AND status = 'completed'`, args...)
+				return execErr
+			}); err != nil {
+				return Submission{}, false, err
 			}
 			var pending int
 			if err := tx.QueryRow(`SELECT COUNT(1) FROM download_items WHERE job_id = ? AND status != 'completed'`, existingID).Scan(&pending); err != nil {

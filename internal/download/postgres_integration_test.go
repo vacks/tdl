@@ -626,6 +626,54 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	}
 }
 
+// Submitting a link costs a fixed number of statements, not one per file it
+// names.
+//
+// A link to a post with comments names one file per media comment, so the
+// request itself decides how many rows are written, and the per-file form made
+// the submission's cost a round trip per file inside one open transaction. The
+// counts below are taken through enqueueIntent, so they cover the lookup, the
+// insert and the reactivation writes as the submission path actually runs them.
+func TestPostgresSubmittingALinkCostsAFixedNumberOfStatements(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, counter := openCountingDatabase(t, url)
+	t.Cleanup(func() { _ = db.Close() })
+	m := newSubmissionTestManager(t, db)
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPostgresDownloadTestData(db); err != nil {
+		t.Fatal(err)
+	}
+
+	// A dialog of its own per size, so the second submission creates a task
+	// rather than matching the one the first left behind.
+	for _, size := range []int{8, 200} {
+		dialogKey := fmt.Sprintf("channel:batch-%d", size)
+		sources := make([]source, 0, size)
+		for id := 1; id <= size; id++ {
+			sources = append(sources, source{Item: Item{DialogType: "channel", DialogKey: dialogKey, DialogID: 700, MessageID: id, OriginalName: fmt.Sprintf("f%d.bin", id)}, DialogName: "频道"})
+		}
+		before := counter.count()
+		if _, err := m.enqueueIntent(DownloadIntent{Source: SourceWeb, AccountID: "account", URL: fmt.Sprintf("https://t.me/c/700/%d", size)}, sources, directPeer{}); err != nil {
+			t.Fatal(err)
+		}
+		sent := counter.count() - before
+		if sent == 0 {
+			t.Fatal("the submission sent no statements at all, so the count means nothing")
+		}
+		t.Logf("submitting %d files cost %d statements", size, sent)
+		// A read of the owners, the insert of the task's rows, and the job and
+		// request rows. The bound is loose; a statement per file is 200 here.
+		if sent > 12 {
+			t.Fatalf("submitting %d files cost %d statements, want at most 12: the per-file form this replaced spent one for each", size, sent)
+		}
+	}
+}
+
 // Indexing a page of media costs a handful of statements whatever the page
 // holds, measured through the call the scan actually makes.
 //
