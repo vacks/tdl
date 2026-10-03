@@ -211,7 +211,7 @@ func TestTaskFileLinesKeepFieldOrder(t *testing.T) {
 	}}
 	text := taskText(job, []download.FileProgress{{DialogKey: "channel:1", MessageID: 2, Downloaded: 5242880, Total: 10485760, SpeedBPS: 1048576}})
 	for _, want := range []string{
-		"✅ 6091201217548719525.jpg · 3.31MB · 100% · 评论/回复",
+		"✅ 6091201217548719525.jpg · 3.31MB · 100% · 评论",
 		"⬇️ clip.mp4 · 10.00MB · 50% · 1.00MB/s",
 	} {
 		if !strings.Contains(text, want) {

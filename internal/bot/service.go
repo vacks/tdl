@@ -3048,7 +3048,10 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 			fields = append(fields, speed)
 		}
 		if item.IsComment {
-			fields = append(fields, "评论/回复")
+			// The card cannot tell a comment from a reply: ReplyRootID is not
+			// among the item columns a card reads, so both are labelled the
+			// same short way rather than claiming a distinction it lacks.
+			fields = append(fields, "评论")
 		}
 		lines = append(lines, statusIcon(item.Status)+" "+html.EscapeString(short(item.OriginalName, 26))+" · "+strings.Join(fields, " · "))
 	}
