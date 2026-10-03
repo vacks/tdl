@@ -24,6 +24,19 @@ import (
 
 // maxPartSize is Telegram's part size for upload.getFile, and the unit the
 // progress callback counts in.
+//
+// One megabyte, which is the largest a single request may ask for and what this
+// has always used. The official clients ask for 128KB instead, and the
+// difference was measured rather than assumed: on the same account, network and
+// file, 128KB downloaded a 345MB file in 588 seconds against 40 for 1MB, and a
+// 74MB file in 167 against 40. Both sizes completed without a single transfer
+// error either way, so the smaller requests buy nothing here - the official
+// clients use them for streaming, where a 128KB granularity is what a player
+// can start on, and pay for it with a connection manager that re-issues a
+// request after a reconnect and a file they can resume from any offset. This
+// engine wants whole files, and a request that is retried from the part it was
+// on (see the pool's middlewares in internal/telegram) does not need the
+// smaller unit to survive a connection that drops.
 const maxPartSize = 1024 * 1024
 
 // engine runs one batch: it pulls elements from the iterator and hands each to
