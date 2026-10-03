@@ -571,11 +571,11 @@ func pacedRequest(input bin.Encoder) bool {
 // access hash with channels.getChannels, which no caller ever paced, and a
 // ?comment link resolution spends two requests under one token.
 //
-// Note the boundary: this wraps the invoker behind Client.API(). The downloader
-// pool that performs the byte transfers builds its own invoker chain
-// (dcpool.NewPool) and does not pass through here, so the per-message metadata
-// reads it makes are still un-paced. Closing that needs the pool to receive a
-// middleware of its own.
+// Note the boundary: this wraps the invoker behind Client.API(). The transfer
+// pool does not go through that invoker either, but it is not a gap - its chain
+// is built with these middlewares by TransferPool, so the metadata reads a file
+// transfer makes are paced in the same gate.
+//
 // noteSlowRPC reports a paced request that took far longer than its own cost.
 //
 // It exists because a flood window is invisible from inside this process. The
@@ -586,8 +586,11 @@ func pacedRequest(input bin.Encoder) bool {
 // exactly like a reaction that was never received. Timing what the gate already
 // sees turns that silence into a line naming the request being refused.
 //
-// The gap that remains is the download pool, which builds its own invoker chain
-// inside the upstream downloader and does not pass through here at all.
+// There is no gap left beside this one: the transfer pool is built here too, by
+// TransferPool, and its chain ends in these same middlewares, so a file transfer
+// is paced and reported like any other request. It used to build its own chain
+// inside the downloader, which is what this comment used to say - reading that
+// as still true would have someone close a gap that was closed in v1.11.28.
 func (m *Manager) noteSlowRPC(accountID string, input bin.Encoder, elapsed time.Duration, err error) {
 	if elapsed < slowRPCThreshold {
 		return
