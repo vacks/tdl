@@ -186,3 +186,61 @@
 ⚠️ 造数三个坑：`docker exec` 必须带 `-i` 否则 heredoc 不进 psql；`download_items.id` 是序列，
 晚插入的行自然落在末尾，想造"分散"必须显式指定 id；灌数据前要
 `ALTER TABLE ... DISABLE TRIGGER USER` 并去掉 `download_item_stats` 的外键。
+
+## 六、第二轮 DB / RPC 审查（v1.11.32–v1.11.39）
+
+一次性库 `tdl_scale`（真实 schema + 合成数据：`download_items` 500 万、`downloaded_media`
+500 万、`chat_download_items` 300 万、两张 inbox 各 30 万），`EXPLAIN (ANALYZE, BUFFERS)`。
+本轮**已修**的记在各自的提交里，下面是**查出来但有意不做**的三条。
+
+### 1. inbox 的"该重试了吗"谓词不可索引（不做，留此备查）
+
+```sql
+WHERE status = 'pending' AND next_attempt_at::timestamptz <= ?::timestamptz ORDER BY next_attempt_at, id LIMIT ?
+```
+
+索引是**文本列** `(status, next_attempt_at, id)`（`reaction_inbox_ready` /
+`chat_message_inbox_ready`），加了这个 cast 之后 `next_attempt_at` 就只是扫描后的
+`Filter`，不是 Index Cond，所以**扫描无法在"第一个未到期"处停下**。实测：30 万个未到期的
+pending 行（退避中的积压就是这形状），**没有任何一条到期**时探测查询是 21 ms / 11907 buffers，
+取批查询 11.7 ms / 11964 buffers，而且**每次轮询都重来一遍**——reaction 侧 1 秒一次、
+会话侧 3 秒一次。代价随**开启态积压**线性增长，与 5000 万行目标冲突。
+
+**cast 是对的、不能删**：`time.RFC3339Nano` 会裁掉小数秒末尾的 0，于是 `T00:00:00Z` 与
+`T00:00:00.5Z` 的**文本序与时间序相反**，直接比文本会把同一秒内到期的行判成没到期。
+
+想两头都要只能动存储，两条路都带迁移 + 回填：
+
+- 列改 `timestamptz`（干净，但 `updated_at` 等列同理，要一起评估）；
+- 写入时用**定宽**小数秒（如永远 9 位）并回填旧行，之后纯文本比较即正确，
+  索引恢复成能用范围条件、扫描能在边界停下。
+
+另有一个不改存储的取巧办法（未验证、未采用）：在谓词里加一条**可索引的文本上界**
+（`next_attempt_at < 截断到秒的 now+1s`）作为超集，再把 cast 条件留作精确过滤。
+它依赖"同一秒内文本序反转但都小于下一秒"这个性质，够用但脆，读代码的人很难看出为什么成立。
+
+相关语句：`chat_inbox.go`（探测 + 取批）、`reaction_inbox.go`（同）、
+`manager.go` 的 `reapStaleInboxLeases`、`chat_inbox.go` 的 `reviveExhaustedInboxEvents`
+（后两处的注释已写明"表会保持很小，所以丢掉 updated_at 上的索引支持不要紧"——
+**上面这组数字就是那个假设失效的位置**）。
+
+### 2. 相册链接解析要读两次历史（不做）
+
+`manager.go` 的 `resolve`：先 `tmsg.GetSingleMessage`（1 条）判断是不是相册，
+是再用 `tmsg.GetGroupedMessages` 读一个 20 条的窗口。而那个窗口
+（`OffsetID(id+11)`、batch 20）**本来就包含目标消息**，所以第二次读已经覆盖第一次的答案。
+
+省下的只有"每个相册链接 1 次请求"，代价却是重做"消息已删除"的判定：窗口里没有目标消息
+**不等于**它被删了（更新的消息可能占满窗口）。这个项目在"空页 vs 请求失败"上已经付过学费
+（见 `tmsg.GetSingleMessage` 的注释），1 次请求不值得再冒一次。`?single` 链接已经正确地只花 1 次。
+
+### 3. 会话历史的多趟扫描（维持不做，但算式要写对）
+
+默认配置（`image`+`video`、`IncludeReplies=true`）确实开 **3 趟**：
+`photo_video`、`round_voice`（`messages.search`，每页 100 条**匹配**）+ `reply_candidates`
+（**全量** `messages.getHistory`，每页 100 条**消息**）。
+
+看起来"合并成一趟全量"能省掉两趟 search 的页数，但**顺序是故意的**：媒体趟在前，
+所以第一页回来就能开始下载；全量趟放最后，超大文本历史不会挡住首批下载。
+合并会把媒体发现的速度从"每页 100 个媒体"降到"每页 100 条消息"。
+省的是请求数，付的是首字节时间，而首字节时间才是用户看得见的东西。
