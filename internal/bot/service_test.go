@@ -180,7 +180,7 @@ func TestTaskPresentationContainsEscapedProgressAndActions(t *testing.T) {
 		{DialogKey: "channel:1", MessageID: 2, OriginalName: "two.mp4", Status: "running"},
 	}}
 	text := taskText(job, []download.FileProgress{{DialogKey: "channel:1", MessageID: 2, Downloaded: 50, Total: 100, SpeedBPS: 1024}})
-	for _, want := range []string{"下载中", "&lt;unsafe&gt;", "1/2 文件", "100%", "50%", "1.00 KB/s", "&lt;one&gt;.mp4"} {
+	for _, want := range []string{"下载中", "&lt;unsafe&gt;", "1/2 文件", "100%", "50%", "1.00KB/s", "&lt;one&gt;.mp4"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("taskText missing %q: %s", want, text)
 		}
@@ -195,6 +195,27 @@ func TestTaskPresentationContainsEscapedProgressAndActions(t *testing.T) {
 	for _, want := range []string{"t:job-1:pause", "t:job-1:cancel", "t:job-1:view", "l:back"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("taskKeyboard missing %q: %s", want, joined)
+		}
+	}
+}
+
+// A file line is read column by column, so each field sits in a fixed place:
+// icon, name, size, progress, and then the rate and the origin when they apply.
+// The line is pinned exactly, because a dropped separator or a swapped pair is
+// the whole defect this format exists to prevent - and "contains the filename"
+// would pass either of them.
+func TestTaskFileLinesKeepFieldOrder(t *testing.T) {
+	job := download.Job{ID: "job-1", DialogName: "频道", Status: "running", CompletedItems: 1, TotalItems: 2, Items: []download.Item{
+		{DialogKey: "channel:1", MessageID: 1, OriginalName: "6091201217548719525.jpg", Status: "completed", Size: 3470786, IsComment: true},
+		{DialogKey: "channel:1", MessageID: 2, OriginalName: "clip.mp4", Status: "running", Size: 10485760},
+	}}
+	text := taskText(job, []download.FileProgress{{DialogKey: "channel:1", MessageID: 2, Downloaded: 5242880, Total: 10485760, SpeedBPS: 1048576}})
+	for _, want := range []string{
+		"✅ 6091201217548719525.jpg · 3.31MB · 100% · 评论/回复",
+		"⬇️ clip.mp4 · 10.00MB · 50% · 1.00MB/s",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("taskText missing %q:\n%s", want, text)
 		}
 	}
 }

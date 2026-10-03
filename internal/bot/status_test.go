@@ -58,7 +58,7 @@ func TestStatusTextReadsEveryAccountFromTheManager(t *testing.T) {
 		"最近下载失败：暂时无法读取",
 		"CPU：0.0%",
 		"内存：0.0%",
-		"网络：↓ 0 B/s · ↑ 0 B/s",
+		"网络：↓ 0B/s · ↑ 0B/s",
 	}, "\n")
 	if got != want {
 		t.Fatalf("the assembled status card is wrong:\n--- got ---\n%s\n--- want ---\n%s", got, want)
@@ -189,7 +189,7 @@ func TestStatusCardLayout(t *testing.T) {
 		"最近下载失败：0",
 		"CPU：0.2%",
 		"内存：5.4%",
-		"网络：↓ 1.04 KB/s · ↑ 2.56 KB/s",
+		"网络：↓ 1.04KB/s · ↑ 2.56KB/s",
 	}, "\n")
 	if got != want {
 		t.Fatalf("the status card does not match the documented layout:\n--- got ---\n%s\n--- want ---\n%s", got, want)

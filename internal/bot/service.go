@@ -3027,14 +3027,30 @@ func taskText(job download.Job, progress []download.FileProgress) string {
 		} else if p.Total > 0 {
 			percent = fmt.Sprintf("%.0f%%", float64(p.Downloaded)*100/float64(p.Total))
 			if p.SpeedBPS > 0 {
-				speed = " · " + bytesLabel(int64(p.SpeedBPS)) + "/s"
+				speed = bytesLabel(int64(p.SpeedBPS)) + "/s"
 			}
 		}
-		origin := ""
-		if item.IsComment {
-			origin = " · 评论/回复"
+		// The size the message declares, not the bytes received so far: it is
+		// known before the first byte is written, and it is what a finished line
+		// is read for. The live total is the fallback for a file whose media
+		// carried no size of its own.
+		size := item.Size
+		if size <= 0 {
+			size = p.Total
 		}
-		lines = append(lines, fmt.Sprintf("%s %s  %s%s%s", statusIcon(item.Status), html.EscapeString(short(item.OriginalName, 26)), percent, speed, origin))
+		// One field per thing, separated the same way everywhere, so a line can
+		// be read column by column: name · size · progress · rate · origin.
+		fields := []string{percent}
+		if size > 0 {
+			fields = append([]string{bytesLabel(size)}, fields...)
+		}
+		if speed != "" {
+			fields = append(fields, speed)
+		}
+		if item.IsComment {
+			fields = append(fields, "评论/回复")
+		}
+		lines = append(lines, statusIcon(item.Status)+" "+html.EscapeString(short(item.OriginalName, 26))+" · "+strings.Join(fields, " · "))
 	}
 	// Counted from the task's own total rather than from the rows this read
 	// returned. A task's files are unbounded, so a read carries one bounded
@@ -3431,10 +3447,12 @@ func bytesLabel(value int64) string {
 		n /= 1024
 		i++
 	}
+	// Unit tight against the number: every card renders the same way, so a size
+	// and the rate printed beside it do not disagree about where the unit goes.
 	if i == 0 {
-		return fmt.Sprintf("%d B", value)
+		return fmt.Sprintf("%dB", value)
 	}
-	return fmt.Sprintf("%.2f %s", n, units[i])
+	return fmt.Sprintf("%.2f%s", n, units[i])
 }
 
 func (s *Service) call(token, method string, body any, out any) error {
