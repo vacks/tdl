@@ -410,7 +410,8 @@ func (m *Manager) TransferPool(accountID string, client *gotd.Client, size int) 
 		// connections are its own, and the session keeps running.
 		_ = existing.pool.Close()
 	}
-	pool := tgclient.NewPool(client, int64(size), m.accountMiddlewares(accountID)...)
+	chain := append(tgclient.DefaultMiddlewares(m.ctx, reconnectTimeout), m.accountMiddlewares(accountID)...)
+	pool := tgclient.NewPool(client, int64(size), chain...)
 	if m.pools == nil {
 		m.pools = make(map[string]*accountPool)
 	}
