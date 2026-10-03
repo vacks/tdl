@@ -2,7 +2,9 @@ package bot
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,6 +123,25 @@ func TestChatTaskTextEscapesAndBoundsFailureLines(t *testing.T) {
 	}
 	if !strings.Contains(text, "…") {
 		t.Fatalf("a name longer than the card's room must be shortened:\n%s", text)
+	}
+}
+
+// A read that failed is not a task that is gone. The card may only say the
+// task is missing when the store actually said so.
+func TestChatTaskReadFailureDoesNotClaimTheTaskIsGone(t *testing.T) {
+	if got := chatTaskReadFailureText(download.ErrChatJobNotFound); !strings.Contains(got, "不存在") {
+		t.Errorf("a task that is really gone reads as %q", got)
+	}
+	// Wrapped, because the store's errors travel through callers that wrap them.
+	if got := chatTaskReadFailureText(fmt.Errorf("get chat: %w", download.ErrChatJobNotFound)); !strings.Contains(got, "不存在") {
+		t.Errorf("a wrapped not-found reads as %q", got)
+	}
+	// Everything else is about the read, and must not borrow the task's fate.
+	for _, err := range []error{errors.New("connection reset by peer"), context.DeadlineExceeded, fmt.Errorf("query: %w", sql.ErrConnDone)} {
+		got := chatTaskReadFailureText(err)
+		if strings.Contains(got, "不存在") || strings.Contains(got, "已删除") {
+			t.Errorf("a failed read (%v) is reported as %q", err, got)
+		}
 	}
 }
 

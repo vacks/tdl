@@ -2330,13 +2330,29 @@ func (s *Service) editChatTask(cfg settings.Bot, chatID, messageID int64, id str
 		if fromList {
 			buttons = [][]button{{{Text: back, CallbackData: "c:l:back"}}}
 		}
-		s.edit(cfg.Token, chatID, messageID, "会话任务不存在或已删除。", buttons)
+		s.edit(cfg.Token, chatID, messageID, chatTaskReadFailureText(err), buttons)
 		return
 	}
 	s.edit(cfg.Token, chatID, messageID, chatTaskText(job), chatTaskKeyboard(job, back))
 	if active(job.Status) {
 		s.trackChat(job.ID, messageRef{ChatID: chatID, MessageID: messageID})
 	}
+}
+
+// chatTaskReadFailureText is what a session card says when the task could not
+// be read.
+//
+// Only one of the two answers is a statement about the task. The other is a
+// statement about the read, and reporting it as the first is the mistake this
+// codebase has paid for twice: a failed parent-status read once became "the
+// task has stopped", and a failed message read became a permanent verdict of
+// "the message was deleted". A card is the one place a person cannot check, so
+// it says which of the two happened.
+func chatTaskReadFailureText(err error) string {
+	if errors.Is(err, download.ErrChatJobNotFound) {
+		return "会话任务不存在或已删除。"
+	}
+	return "读取会话任务失败，请稍后重试。"
 }
 
 func chatTaskText(job download.ChatJob) string {
