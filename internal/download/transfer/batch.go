@@ -125,7 +125,7 @@ func (s *batchSource) Message(ctx context.Context, id int) (*tg.Message, error) 
 	return nil, tmsg.ErrMessageDeleted
 }
 
-// Refresh reads one message past the cache.
+// Refresh reads the message again, past the cache.
 //
 // It is the repair for an expired file reference: the media this batch holds
 // was read up to TTL ago - or, for a task that waited in the queue, much
@@ -134,19 +134,57 @@ func (s *batchSource) Message(ctx context.Context, id int) (*tg.Message, error) 
 // task-level retry it replaces, which re-reads every message of the task and
 // costs a round of database writes besides.
 //
-// It is deliberately the single-message read and not a window: the point is to
-// get a reference that is new *now*, and a window would hand out the same
-// mixture of ages the cache already holds.
+// It reads the message's window rather than the message alone, because
+// references expire by age and the messages of a window were all read at the
+// same moment: a task that waited in the queue has every reference in that
+// window spent at once, so repairing them one at a time costs a request per
+// file - the per-message path this source exists to replace, arriving at the
+// moment the task has the most left to get through. One request refreshes the
+// window, and the files behind this one find a reference that is already new.
+//
+// This is not the stale mixture the cache exists to avoid: those entries were
+// read at different moments and handed out until they expired. These were all
+// read now.
+//
+// An id this source was not built for, and a source that has fallen back to
+// single reads, still get the one-message read: neither has a window to re-read.
 func (s *batchSource) Refresh(ctx context.Context, id int) (*tg.Message, error) {
-	message, err := tmsg.GetSingleMessage(ctx, s.pool.Default(ctx), s.peer, id)
+	s.mu.Lock()
+	degraded := s.degraded
+	s.mu.Unlock()
+	position, known := s.index[id]
+	if degraded || !known {
+		message, err := tmsg.GetSingleMessage(ctx, s.pool.Default(ctx), s.peer, id)
+		if err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.cached[id] = cachedMessage{message: message, fetched: time.Now()}
+		s.stats.singleCalls++
+		s.mu.Unlock()
+		return message, nil
+	}
+
+	window := s.windowAt(position)
+	messages, err := s.fetch(ctx, window)
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	s.mu.Lock()
-	s.cached[id] = cachedMessage{message: message, fetched: time.Now()}
-	s.stats.singleCalls++
+	// Merged into the cache rather than replacing it: the entries of the window
+	// currently being handed out are still in use, and a file in flight must not
+	// lose the message it is transferring.
+	for _, windowID := range window {
+		s.cached[windowID] = cachedMessage{missing: true, fetched: now}
+	}
+	for _, message := range messages {
+		s.cached[message.ID] = cachedMessage{message: message, fetched: now}
+	}
+	s.stats.batchCalls++
+	entry := s.cached[id]
 	s.mu.Unlock()
-	return message, nil
+	return s.entry(entry)
 }
 
 func (s *batchSource) entry(entry cachedMessage) (*tg.Message, error) {
@@ -156,13 +194,18 @@ func (s *batchSource) entry(entry cachedMessage) (*tg.Message, error) {
 	return entry.message, nil
 }
 
-// loadWindow reads the ids at and after position, and caches them.
-func (s *batchSource) loadWindow(ctx context.Context, position int) error {
+// windowAt is the ids one read at position covers.
+func (s *batchSource) windowAt(position int) []int {
 	end := position + batchSize
 	if end > len(s.ids) {
 		end = len(s.ids)
 	}
-	window := s.ids[position:end]
+	return s.ids[position:end]
+}
+
+// loadWindow reads the ids at and after position, and caches them.
+func (s *batchSource) loadWindow(ctx context.Context, position int) error {
+	window := s.windowAt(position)
 	if len(window) == 0 {
 		return nil
 	}

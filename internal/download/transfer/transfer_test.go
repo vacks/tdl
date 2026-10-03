@@ -236,10 +236,15 @@ func TestRunRenewsAnExpiredFileReference(t *testing.T) {
 	if len(completed) != 1 {
 		t.Fatalf("%d files were published, want 1", len(completed))
 	}
-	// One read of the message to renew the reference, and the file itself
-	// retried rather than abandoned.
-	if got := api.count("MessagesGetHistoryRequest"); got != 1 {
-		t.Fatalf("the refresh cost %d message reads, want 1 (all: %v)", got, api.names())
+	// The window the message belongs to is read again - one request, the batch
+	// form - and the file itself is retried rather than abandoned. A refresh
+	// that fell back to reading the message on its own would show up here as a
+	// MessagesGetHistoryRequest.
+	if got := api.count("MessagesGetMessagesRequest"); got != 2 {
+		t.Fatalf("the run made %d batch reads, want 2: one for the window, one to renew it (all: %v)", got, api.names())
+	}
+	if got := api.count("MessagesGetHistoryRequest"); got != 0 {
+		t.Fatalf("the refresh read a single message instead of the window (all: %v)", api.names())
 	}
 	if got := api.count("UploadGetFileRequest"); got < 2 {
 		// One refused, then the retry. A transfer that gave up would have asked

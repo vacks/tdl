@@ -42,6 +42,89 @@ func TestBatchSourceReadsOneRequestPerHundredMessages(t *testing.T) {
 	}
 }
 
+// Renewing an expired reference costs one request for the window, not one for
+// each file in it.
+//
+// A file reference expires by age, and the messages of a window were all read at
+// the same moment, so a task that waited in the queue has every reference in
+// that window spent at once. Repairing them one at a time is a request per file
+// - the per-message path this source exists to replace - and it arrives at the
+// moment the task has the most left to get through. The test states the saving
+// as the next file costing nothing: the window was read again, so the file
+// behind the repaired one is already fresh.
+func TestBatchSourceRenewsAWholeWindowInOneRequest(t *testing.T) {
+	ids := idsFrom(1, 5)
+	api := newFakeAPI()
+	api.file = byteFile(4000)
+	fillMessages(api, ids)
+
+	source := newBatchSource(&fakePool{client: tg.NewClient(api)}, testPeer, ids)
+	if _, err := source.Message(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	requireCount(t, api, "MessagesGetMessagesRequest", 1)
+	loaded := source.cachedAt(t, 1)
+
+	// The clock has to move for a rewritten entry to be distinguishable from
+	// the one the first read left.
+	time.Sleep(2 * time.Millisecond)
+	if _, err := source.Refresh(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	requireCount(t, api, "MessagesGetMessagesRequest", 2)
+	requireCount(t, api, "MessagesGetHistoryRequest", 0)
+
+	// Every message of the window was read again. This is the assertion that
+	// separates one request for the window from one request for the message:
+	// the files behind this one are handed out from the cache, so a repair that
+	// only rewrote the message asked for would leave them holding the reference
+	// that just expired and would send them to the network one by one.
+	for _, id := range ids {
+		if rewritten := source.cachedAt(t, id); !rewritten.After(loaded) {
+			t.Errorf("message %d still holds the entry from before the repair (%s, loaded %s)", id, rewritten, loaded)
+		}
+	}
+	if counts := source.counts(); counts.batchCalls != 2 || counts.singleCalls != 0 {
+		t.Fatalf("the source reports %+v, want two batch reads and no single reads", counts)
+	}
+}
+
+// cachedAt is when the source read this message, for a test that has to tell a
+// rewritten entry from the one an earlier read left behind.
+func (s *batchSource) cachedAt(t *testing.T, id int) time.Time {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.cached[id]
+	if !ok {
+		t.Fatalf("message %d is not cached", id)
+	}
+	return entry.fetched
+}
+
+// A source that has fallen back to single reads has no window to re-read, so
+// the repair stays the one-message read it has always been on that path.
+func TestBatchSourceRefreshesOneMessageWhenDegraded(t *testing.T) {
+	ids := idsFrom(1, 5)
+	api := newFakeAPI()
+	api.file = byteFile(4000)
+	fillMessages(api, ids)
+	api.failBatch = true
+
+	source := newBatchSource(&fakePool{client: tg.NewClient(api)}, testPeer, ids)
+	if _, err := source.Message(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	api.failBatch = false
+	if _, err := source.Refresh(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	// One refused batch attempt, then the per-message read for the first fetch
+	// and another for the repair.
+	requireCount(t, api, "MessagesGetMessagesRequest", 1)
+	requireCount(t, api, "MessagesGetHistoryRequest", 2)
+}
+
 // A message that is not in the response is a message that is gone. It has to
 // read as the same answer the per-message reader gives, because that answer is
 // what makes a task skip the post instead of failing.
