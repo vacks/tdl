@@ -626,6 +626,79 @@ func TestPostgresChatPublishedFileIsReconciledWithoutRestart(t *testing.T) {
 	}
 }
 
+// The index set a database ends up with is the one the file declares: the
+// superseded names are gone, and what replaced them is there.
+//
+// The two superseded ones below were not unused - each was cheap to keep and
+// expensive to carry, which is exactly how an index nobody chooses survives: a
+// full index on downloaded_media held an entry for every file ever published to
+// answer questions about the few rows currently claimed, and
+// download_items_job_id was a prefix of download_items_job_id_id on the table
+// with the most writes in the application. Both are dropped by name at startup,
+// so this is the only thing that would notice the drop disappearing.
+func TestPostgresIndexSetIsTheDeclaredOne(t *testing.T) {
+	url := os.Getenv("TDL_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("set TDL_TEST_POSTGRES_URL to run PostgreSQL integration tests")
+	}
+	db, err := openPostgresDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	m := &Manager{db: db}
+
+	// First put the database in the state an existing deployment is in: the
+	// superseded indexes present, their replacements absent. Asserting on
+	// whatever the previous run left behind would prove nothing about either
+	// half - and a definition changed under a name the database already holds
+	// is invisible to CREATE INDEX IF NOT EXISTS, which is the trap the v21
+	// migration documents.
+	for _, statement := range []string{
+		`DROP INDEX IF EXISTS downloaded_media_claim`,
+		`CREATE INDEX IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS download_items_job_id ON download_items(job_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.migratePostgres(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every name the drop list carries has to be absent, so a drop that stops
+	// working - or a rebuild that recreates one - fails here rather than by
+	// quietly costing writes for months.
+	assertAbsent := func(names []string) {
+		t.Helper()
+		for _, name := range names {
+			var exists bool
+			if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = ?)`, name).Scan(&exists); err != nil {
+				t.Fatal(err)
+			}
+			if exists {
+				t.Errorf("index %s is superseded and dropped at startup, but the database still has it", name)
+			}
+		}
+	}
+	assertAbsent(postgresIndexDrops)
+	// Named once more on purpose: deleting the entry from the list is how this
+	// change would be undone, and that is the one thing the loop above cannot
+	// see - it checks the list, not what the list was supposed to contain.
+	assertAbsent([]string{"downloaded_media_status", "download_items_job_id"})
+	var definition string
+	if err := db.QueryRow(`SELECT indexdef FROM pg_indexes WHERE indexname = 'downloaded_media_claim'`).Scan(&definition); err != nil {
+		t.Fatalf("the index that replaced downloaded_media_status is missing: %v", err)
+	}
+	if !strings.Contains(definition, "WHERE (status = 'claimed'::text)") {
+		t.Fatalf("downloaded_media_claim carries rows it will never be asked about: %s", definition)
+	}
+	if err := db.QueryRow(`SELECT indexdef FROM pg_indexes WHERE indexname = 'download_items_job_id_id'`).Scan(&definition); err != nil {
+		t.Fatalf("the index that answers download_items_job_id's queries is missing: %v", err)
+	}
+}
+
 // Submitting a link costs a fixed number of statements, not one per file it
 // names.
 //

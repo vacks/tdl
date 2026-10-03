@@ -282,7 +282,15 @@ var postgresIndexStatements = []string{
 	// event list, restricted to the queue the list is allowed to show.
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_message_inbox_open_created_id ON chat_message_inbox(created_at DESC, id DESC) WHERE ` + openEventStatuses,
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_reply_roots_lookup ON chat_reply_roots(account_id, discussion_dialog_key, root_message_id)`,
-	`CREATE INDEX CONCURRENTLY IF NOT EXISTS downloaded_media_status ON downloaded_media(status, updated_at)`,
+	// Every statement that reads this table by status asks for 'claimed' rows
+	// and then for one owner's, so the index is built on the owner and holds
+	// nothing else. As a full (status, updated_at) index it carried an entry for
+	// every file ever published - at 50M rows that is hundreds of megabytes
+	// maintained on every completion - and nothing ranged over updated_at or
+	// over any other status. Measured on 5M rows: 31MB before, and a claim
+	// release that went from an index scan on status alone (0.27ms, 3 buffers)
+	// to a seek on the owner (0.016ms, 2 buffers).
+	`CREATE INDEX CONCURRENTLY IF NOT EXISTS downloaded_media_claim ON downloaded_media(owner_kind, owner_id) WHERE status = 'claimed'`,
 	`CREATE INDEX CONCURRENTLY IF NOT EXISTS telegram_rate_limits_blocked_until ON telegram_rate_limits(blocked_until)`,
 }
 
@@ -790,6 +798,18 @@ END $$`,
 // replaced by something narrower in postgresIndexStatements; they are dropped
 // after it, so no query is ever left without a usable index.
 var postgresIndexDrops = []string{
+	// Replaced by downloaded_media_claim. This one held a row for every file
+	// ever published, to answer questions only ever asked about the handful of
+	// rows currently claimed.
+	`downloaded_media_status`,
+	// A strict prefix of download_items_job_id_id, on the table with the most
+	// writes in the application. Every statement that filters download_items by
+	// job_id is a seek whether it is served by this or by the wider index - it
+	// was measured on 5M rows, where the count, the completed-file read, the
+	// page read and the per-task grouping all still took download_items_job_id_id
+	// with this one dropped - so what it cost was 40MB per 5M rows and one more
+	// index to maintain on every insert and every state change.
+	`download_items_job_id`,
 	// A full index holding an entry for every file ever indexed, when the only
 	// statement that reads it asks for a single status. Its successor,
 	// chat_download_items_work, carries the same leading columns and holds no
